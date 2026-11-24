@@ -19,7 +19,7 @@ except ImportError:
     print("Требуется psycopg2:  python -m pip install psycopg2-binary"); sys.exit(1)
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -1943,7 +1943,14 @@ def main():
     ap.add_argument("--migrate", action="store_true", help="применить миграции БД и выйти")
     ap.add_argument("--backup-now", action="store_true", help="создать резервную копию и выйти")
     ap.add_argument("--health", action="store_true", help="диагностика: БД, файловое хранилище, порт")
+    ap.add_argument("--version", action="store_true", help="показать версию и выйти")
+    ap.add_argument("--selftest", action="store_true", help="проверка целостности поставки (без БД): клиент, зависимости, ресурсы")
     args = ap.parse_args()
+    if args.version:
+        print("%s %s (%s, Python %s)" % (APP_NAME, VERSION, "EXE" if getattr(sys, "frozen", False) else "script", platform.python_version()))
+        sys.exit(0)
+    if args.selftest:
+        sys.exit(selftest())
     if args.config: CONFIG_PATH = os.path.abspath(args.config)
     if args.install or args.install_auto:
         sys.exit(run_install(args.install_auto))
@@ -2269,6 +2276,39 @@ def socket_bind_probe(bind, port):
         return False
     finally:
         s.close()
+
+def selftest():
+    """Проверка целостности поставки без обращения к БД (ТЗ §15.3: испытания установки).
+       Используется сборкой EXE и мастером установки: SUP-IP.exe --selftest."""
+    ok = True
+    print("СУП-ИП %s — самотестирование поставки" % VERSION)
+    idx = os.path.join(STATIC_DIR, "index.html")
+    try:
+        size = os.path.getsize(idx)
+        body = open(idx, encoding="utf-8").read(4096)
+        good = size > 100_000 and "<html" in body.lower()
+        print("  Веб-клиент static/index.html: %s (%.0f КБ)" % ("OK" if good else "ПОВРЕЖДЁН", size / 1024))
+        ok = ok and good
+    except Exception as e:
+        print("  Веб-клиент: ОШИБКА %s" % e); ok = False
+    print("  psycopg2: OK (%s)" % psycopg2.__version__)
+    for mod, need, why in (("cryptography", False, "HTTPS без openssl"),
+                           ("win32serviceutil", sys.platform == "win32", "служба Windows"),
+                           ("docgen", False, "экспорт DOCX/XLSX/PDF")):
+        try:
+            __import__(mod); print("  %s: OK — %s" % (mod, why))
+        except ImportError:
+            print("  %s: %s — %s" % (mod, "ОШИБКА" if need else "нет (необязательно)", why))
+            ok = ok and not need
+    try:
+        os.makedirs(FILES_DIR, exist_ok=True)
+        probe = os.path.join(FILES_DIR, ".selftest")
+        open(probe, "w").write("ok"); os.remove(probe)
+        print("  Каталог данных: OK (%s)" % DATA_DIR)
+    except Exception as e:
+        print("  Каталог данных: ОШИБКА %s" % e); ok = False
+    print("ИТОГ: %s" % ("поставка исправна" if ok else "ЕСТЬ ОШИБКИ"))
+    return 0 if ok else 1
 
 # ---------------- Служба Windows (ТЗ §7.4: автозапуск, контролируемый перезапуск) ----------------
 def service_command(action, cfg=None):

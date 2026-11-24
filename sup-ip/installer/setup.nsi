@@ -20,6 +20,8 @@ SetCompressor /SOLID lzma
 !include "nsDialogs.nsh"
 !include "LogicLib.nsh"
 !include "WinVer.nsh"
+!include "x64.nsh"
+!include "FileFunc.nsh"
 !define MUI_ABORTWARNING
 !insertmacro MUI_PAGE_DIRECTORY
 Page custom ConfigPage ConfigPageLeave
@@ -34,6 +36,7 @@ Var Port
 Var AdminPass
 Var UseHttps
 Var PgInstaller
+Var PgService
 
 Section "Проверки" SEC_CHECK
   ; ТЗ §7.2: версия Windows, разрядность, дисковое пространство
@@ -80,19 +83,51 @@ SectionEnd
 
 Section "PostgreSQL" SEC_PG
   ; ТЗ §7.3: установка и инициализация PostgreSQL (офлайн-установщик, если включён в пакет)
-  nsExec::ExecToLog 'sc query postgresql-x64-16'
-  Pop $0
-  ${If} $0 == 0
+  StrCpy $PgService ""
+  ${For} $1 14 17
+    nsExec::ExecToLog 'sc query postgresql-x64-$1'
+    Pop $0
+    ${If} $0 == 0
+      StrCpy $PgService "postgresql-x64-$1"
+      DetailPrint "Найдена служба PostgreSQL: $PgService"
+      ${Break}
+    ${EndIf}
+  ${Next}
+  ${If} $PgService != ""
+    nsExec::ExecToLog 'sc start $PgService'
     DetailPrint "Служба PostgreSQL уже установлена."
     Goto pg_done
   ${EndIf}
   ${If} $PgInstaller != ""
     DetailPrint "Установка PostgreSQL (автономно, ~2 мин)…"
     nsExec::ExecToLog '"$PgInstaller" --mode unattended --unattendedmodeui none --superpassword "$PgPass" --serverport 5432 --servicename postgresql-x64-16'
+    Pop $0
+    ${If} $0 != 0
+      MessageBox MB_ICONSTOP "Установка PostgreSQL завершилась с кодом $0.$\nУстановите PostgreSQL 15/16 вручную и повторите установку СУП-ИП."
+      Abort
+    ${EndIf}
+    StrCpy $PgService "postgresql-x64-16"
   ${Else}
-    MessageBox MB_ICONINFORMATION "PostgreSQL не найден и не включён в пакет.$\nУстановите PostgreSQL 15/16 офлайн-установщиком, затем повторите установку СУП-ИП.$\n(Скачать заранее: enterprisedb.com/downloads/postgres-postgresql-downloads)"
+    MessageBox MB_ICONSTOP "PostgreSQL не найден и не включён в пакет.$\nУстановите PostgreSQL 15/16 офлайн-установщиком, затем повторите установку СУП-ИП.$\n(Скачать заранее: enterprisedb.com/downloads/postgres-postgresql-downloads)"
+    Abort
   ${EndIf}
   pg_done:
+  ; ожидание готовности СУБД (ТЗ §7.3 п.7)
+  StrCpy $2 0
+  pg_wait:
+    nsExec::ExecToLog 'sc query $PgService'
+    Pop $0
+    ${If} $0 == 0
+      Goto pg_ready
+    ${EndIf}
+    IntOp $2 $2 + 1
+    ${If} $2 > 30
+      MessageBox MB_ICONSTOP "Служба PostgreSQL не запускается. Проверьте службы Windows."
+      Abort
+    ${EndIf}
+    Sleep 2000
+    Goto pg_wait
+  pg_ready:
 SectionEnd
 
 Section "Настройка" SEC_CONFIG
@@ -175,6 +210,14 @@ Function ConfigPageLeave
   ${EndIf}
   ${If} $AdminPass == ""
     StrCpy $AdminPass "demo"
+  ${EndIf}
+  ${If} $Port < 1
+    MessageBox MB_ICONEXCLAMATION "Некорректный порт."
+    Abort
+  ${EndIf}
+  ${If} $Port > 65535
+    MessageBox MB_ICONEXCLAMATION "Порт должен быть в диапазоне 1–65535."
+    Abort
   ${EndIf}
 FunctionEnd
 

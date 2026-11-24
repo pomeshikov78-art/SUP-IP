@@ -1,0 +1,135 @@
+name: Сборка и испытания СУП-ИП
+
+# ТЗ §7 (развёртывание одним EXE) и §15 (приёмочные испытания).
+# jobs.tests  — интеграционные испытания API на PostgreSQL (Linux).
+# jobs.windows — сборка SUP-IP.exe (PyInstaller) и SUP-IP-Setup-x.y.z.exe (NSIS),
+#                публикация артефактов и Release с готовыми EXE.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      bundle_postgres:
+        description: 'Включить офлайн-установщик PostgreSQL в пакет (~350 МБ)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  tests:
+    name: Интеграционные испытания (PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: supip
+          POSTGRES_PASSWORD: supip
+          POSTGRES_DB: supip
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Зависимости
+        run: python -m pip install --upgrade pip psycopg2-binary
+      - name: Запуск сервера
+        working-directory: sup-ip
+        env:
+          SUPIP_DSN: host=127.0.0.1 port=5432 dbname=supip user=supip password=supip
+        run: |
+          python server.py --host 127.0.0.1 --port 8000 > server.log 2>&1 &
+          for i in $(seq 1 30); do
+            if python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=2)" 2>/dev/null; then exit 0; fi
+            sleep 1
+          done
+          cat server.log; exit 1
+      - name: Испытания API
+        working-directory: sup-ip
+        run: python tests/api_test.py --base http://127.0.0.1:8000
+      - name: Журнал сервера (при сбое)
+        if: failure()
+        run: cat sup-ip/server.log
+
+  windows:
+    name: Сборка EXE и установщика (Windows x64)
+    runs-on: windows-latest
+    needs: tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+      - name: Зависимости сборки
+        run: python -m pip install --upgrade pip pyinstaller psycopg2-binary pywin32 cryptography
+      - name: Определение версии
+        id: ver
+        shell: pwsh
+        run: |
+          $m = Select-String -Path sup-ip/server.py -Pattern '^VERSION = "([0-9.]+)"'
+          $v = $m.Matches.Groups[1].Value
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Версия: $v"
+      - name: Сборка SUP-IP.exe (PyInstaller, one-file)
+        working-directory: sup-ip
+        shell: pwsh
+        run: |
+          $args = @('--onefile','--name','SUP-IP','--clean','--noconfirm',
+                    '--add-data','static;static',
+                    '--hidden-import','win32timezone','--hidden-import','win32serviceutil',
+                    '--hidden-import','win32service','--hidden-import','servicemanager',
+                    '--hidden-import','psycopg2','--hidden-import','cryptography')
+          if (Test-Path 'assets') { $args += @('--add-data','assets;assets') }
+          if (Test-Path 'docgen.py') { $args += @('--hidden-import','docgen') }
+          python -m PyInstaller @args server.py
+      - name: Самотестирование EXE (без БД)
+        shell: pwsh
+        run: |
+          .\sup-ip\dist\SUP-IP.exe --version
+          .\sup-ip\dist\SUP-IP.exe --selftest
+      - name: Офлайн-пакет PostgreSQL (опционально)
+        if: github.event_name == 'workflow_dispatch' && inputs.bundle_postgres
+        shell: pwsh
+        run: |
+          $url = 'https://get.enterprisedb.com/postgresql/postgresql-16.4-1-windows-x64.exe'
+          Invoke-WebRequest -Uri $url -OutFile sup-ip/installer/postgresql-setup.exe
+          Write-Host ("PostgreSQL: {0:N0} МБ" -f ((Get-Item sup-ip/installer/postgresql-setup.exe).Length/1MB))
+      - name: Сборка установщика (NSIS)
+        shell: pwsh
+        working-directory: sup-ip
+        run: |
+          $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (-not (Test-Path $nsis)) { choco install nsis -y --no-progress; $nsis = "makensis" }
+          & $nsis /DVERSION=${{ steps.ver.outputs.version }} installer\setup.nsi
+          if ($LASTEXITCODE -ne 0) { throw "NSIS завершился с кодом $LASTEXITCODE" }
+          Get-ChildItem dist | Format-Table Name,Length
+      - name: Артефакты
+        uses: actions/upload-artifact@v4
+        with:
+          name: SUP-IP-windows-x64
+          path: |
+            sup-ip/dist/SUP-IP.exe
+            sup-ip/dist/SUP-IP-Setup-*.exe
+          if-no-files-found: error
+      - name: Публикация Release (по тегу версии)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          gh release create "v$v" --title "СУП-ИП v$v" --notes-file CHANGELOG.md `
+            "sup-ip/dist/SUP-IP.exe" `
+            "sup-ip/dist/SUP-IP-Setup-$v.exe" `
+            "SUP-IP_server.zip"
+          if ($LASTEXITCODE -ne 0) { gh release upload "v$v" "sup-ip/dist/SUP-IP.exe" "sup-ip/dist/SUP-IP-Setup-$v.exe" --clobber }

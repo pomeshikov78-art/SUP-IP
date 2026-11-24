@@ -4,6 +4,9 @@
 копия README сохраняется в `versions/README-vX.Y.Z.md`, изменения пушатся в
 https://github.com/pomeshikov78-art/SUP-IP.
 
+## v1.2.0 — 2026-11-24
+- Автосборка и испытания: workflow GitHub Actions (испытания API на PostgreSQL → PyInstaller EXE → NSIS-установщик → Release), --selftest/--version, исправлен и проверен компиляцией сценарий установщика (x64.nsh, поиск службы PostgreSQL 14–17, ожидание запуска, проверка порта), опциональный офлайн-пакет PostgreSQL
+
 ## v1.1.0 — 2026-11-24
 - Установка и настройка через EXE (ТЗ §7): мастер --install/--install-auto, supip.ini, служба Windows с автозапуском/автоперезапуском, миграции БД, --health/--backup-now, NSIS-установщик (обновление с бэкапом, деинсталляция с сохранением данных), автосборка EXE в GitHub Actions
 
