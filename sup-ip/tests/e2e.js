@@ -243,6 +243,24 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
  ok('внеочередной цикл планировщика отработал', (await page.evaluate(()=>document.getElementById('toasts').textContent)).includes('Планировщик отработал'));
  await page.screenshot({path:'/tmp/e2e/shot_notif_admin.png'});
 
+ console.log('== M14: файловые журналы ==');
+ ok('карточка файловых журналов', (await page.evaluate(()=>document.getElementById('view').textContent)).includes('Файловые журналы'));
+ await page.evaluate(()=>App.logs('supip.log'));
+ await sleep(700);
+ const logTxt = await page.evaluate(()=>document.getElementById('modal-root').textContent);
+ ok('журнал работы открыт в окне', logTxt.includes('Файловые журналы') && logTxt.includes('supip.log'));
+ ok('строки журнала отображаются', /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(logTxt));
+ ok('есть ссылка скачивания журнала', await page.$('a[href="/api/logs/supip.log"]')!==null);
+ await page.screenshot({path:'/tmp/e2e/shot_logs.png'});
+ await page.evaluate(()=>App.logs('setup.log'));
+ await sleep(600);
+ ok('переключение на журнал настройки', (await page.evaluate(()=>document.getElementById('modal-root').textContent)).includes('setup.log'));
+ await page.evaluate(()=>App.closeModal(true));
+ await page.evaluate(()=>App.clientLog());
+ await sleep(400);
+ ok('журнал клиента (буфер браузера)', (await page.evaluate(()=>document.getElementById('modal-root').textContent)).includes('Журнал клиента'));
+ await page.evaluate(()=>App.closeModal(true));
+
  console.log('== Сессия и выход ==');
  await page.evaluate(()=>App.logout());
  await sleep(300);

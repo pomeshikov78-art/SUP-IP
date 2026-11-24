@@ -239,6 +239,7 @@ svg.ic{width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:1.8;str
 .field .fh{font-size:11px;color:var(--mut2);margin-top:3px}
 .field input.err,.field select.err{border-color:var(--err)}
 .fmsg{font-size:12px;color:var(--err);min-height:16px}
+.logbox{background:#0f1b2d;color:#d7e3f4;border-radius:10px;padding:12px 14px;font-family:Consolas,'Courier New',monospace;font-size:11.5px;line-height:1.5;max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-word}
 .checkline{display:flex;align-items:center;gap:8px;font-size:12.5px;cursor:pointer}
 .checkline input{width:15px;height:15px;accent-color:var(--acc)}
 
@@ -738,10 +739,11 @@ async function rpc(action, payload){
  try{
   r = await fetch('/api/rpc', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action, payload:payload||{}})});
   j = await r.json();
- }catch(e){ toast('err','Сервер недоступен','Проверьте подключение к серверу СУП-ИП: '+e.message); return false; }
+ }catch(e){ clog('error','Сервер недоступен при '+action+': '+e.message); toast('err','Сервер недоступен','Проверьте подключение к серверу СУП-ИП: '+e.message); return false; }
  if(j.state){ DB=j.state; if(DB.me) App.user=DB.users.find(u=>u.id===DB.me)||App.user; }
  if(!j.ok){
   const e=j.error||{};
+  clog('warn','Операция '+action+' отклонена: '+(e.code||'')+' '+(e.message||''));
   if(r.status===401){ stopPolling(); App.user=null; renderLogin(); toast('info','Требуется вход', e.message||'Сессия завершена'); return false; }
   toast('err', e.title||'Операция отклонена', e.message||'');
   return false;
@@ -750,8 +752,24 @@ async function rpc(action, payload){
  dbSave(); renderView(); updateNotifBadge();
  return j.result===undefined ? true : j.result;
 }
+/* Клиентский кольцевой журнал (ТЗ §15): последние 300 событий браузера — доступен и выгружается
+   даже при недоступности сервера, когда серверный журнал записать невозможно. */
+App._clog=[];
+function clog(level, text){
+ App._clog.push({ts:Date.now(), level, text:String(text).slice(0,500)});
+ while(App._clog.length>300) App._clog.shift();
+}
+function clogText(){
+ return App._clog.map(e=>new Date(e.ts).toLocaleString('ru-RU')+'  '+e.level.toUpperCase()+'  '+e.text).join('\n');
+}
+function downloadText(name, text){
+ const blob=new Blob([text],{type:'text/plain;charset=utf-8'});
+ const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name;
+ document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+}
 /* журналирование клиентских событий (экспорт, печать, ошибки UI) — категории TECH/INTEGRATION/AUDIT */
 function log(cat, level, module, action, obj, objId, details){
+ clog(level||'info', module+' · '+action);
  if(!DB||!App.user) return;
  if(!['TECH','INTEGRATION','AUDIT'].includes(cat)) return; // BUSINESS/SECURITY пишет только сервер
  fetch('/api/rpc',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -2985,6 +3003,16 @@ Views.admin=function(){
    '<div class="flexw mt14"><button class="btn" onclick="App.notifTick()">'+ic('refresh')+' Внеочередной цикл планировщика</button></div>'+
    '<p class="small mut mt8">Доставка напоминаний, контроль сроков задач и поручений, очереди утверждения, пересмотр рисков. Повторная доставка одного события исключена (ТЗ M12 §8.4, M16 §2.11.1).</p>'+
   '</div></div>'+
+  '<div class="card mt14"><div class="ch">'+ic('file')+'Файловые журналы (контроль и разбор ошибок)</div><div class="cb">'+
+   '<p class="small mut">Журналы пишутся на сервере независимо от БД — причины сбоя видны даже при отказе PostgreSQL. Ротация: 10 МБ × 5 файлов.</p>'+
+   '<div class="flexw mt8">'+
+    '<button class="btn" onclick="App.logs(\'supip.log\')">'+ic('journal')+' Журнал работы</button>'+
+    '<button class="btn" onclick="App.logs(\'setup.log\')">'+ic('wrench')+' Журнал настройки</button>'+
+    '<button class="btn" onclick="App.logs(\'installer.log\')">'+ic('download')+' Журнал установщика</button>'+
+    '<button class="btn" onclick="App.clientLog()">'+ic('info')+' Журнал клиента</button>'+
+   '</div>'+
+   '<p class="small mut mt8">Каталог: data\logs · ярлыки журналов — в меню «Пуск» → СУП-ИП. Уровень журнала задаётся в supip.ini ([logs] level) или ключом --log-level.</p>'+
+  '</div></div>'+
   '<div class="help-note mt14">'+ic('info')+'<div>Развёртывание: сервер СУП-ИП (Python + PostgreSQL) на Windows 10/11 x64 или Linux; автономный EXE собирается PyInstaller (build_exe.bat). Резервная копия — JSON-дамп всех таблиц; восстановление полностью заменяет данные и рассылается всем клиентам.</div></div>';
  }
  return '<div class="page-head"><div><h2>Администрирование</h2><div class="desc">Пользователи, роли и матрица прав, справочники, workflow и системные параметры. Все изменения фиксируются в журнале M14→M15.</div></div></div>'+
@@ -3051,6 +3079,29 @@ App.restore=function(input){
 };
 App.diag=function(){ rpc('admin.diag'); };
 App.notifTick=function(){ if(!guard('admin','edit'))return; rpc('notif.tick'); };
+App.logs=function(name){
+ if(!guard('admin','view'))return;
+ rpc('admin.logs',{name:name||'supip.log',lines:400}).then(r=>{
+  if(!r)return;
+  const files=r.files||[];
+  openModal(mh('Файловые журналы · '+esc(r.name),'file')+
+   '<div class="mb">'+
+    '<div class="flexw mb8">'+files.map(f=>'<button class="btn sm'+(f.name===r.name?' pri':'')+'" onclick="App.logs(\''+f.name+'\')">'+esc(f.name)+' · '+Math.max(1,Math.round(f.size/1024))+' КБ</button>').join('')+
+     '<span class="spacer"></span><button class="btn sm" onclick="App.logs(\''+r.name+'\')">'+ic('refresh')+' Обновить</button>'+
+     '<a class="btn sm" href="/api/logs/'+encodeURIComponent(r.name)+'" download>'+ic('download')+' Скачать</a></div>'+
+    '<p class="small mut">Каталог: '+esc(r.dir)+' · уровень: '+esc(r.level)+' · показаны последние '+r.lines.length+' строк'+(r.exists?'':' · файл ещё не создан')+'</p>'+
+    '<pre class="logbox">'+esc(r.lines.join('\n')||'Журнал пуст')+'</pre>'+
+   '</div>'+
+   '<div class="mf"><span class="left small mut">Журнал сервера пишется при каждой операции, входе, ошибке и цикле планировщика</span><button class="btn pri" onclick="App.closeModal(true)">Закрыть</button></div>', {wide:true});
+ });
+};
+App.clientLog=function(){
+ const txt=clogText();
+ openModal(mh('Журнал клиента (буфер браузера)','info')+
+  '<div class="mb"><p class="small mut">Последние '+App._clog.length+' событий этого браузера: ошибки интерфейса, отказы операций, недоступность сервера. Буфер хранится только в памяти вкладки и доступен, даже когда сервер не отвечает.</p>'+
+  '<pre class="logbox">'+esc(txt||'Событий пока нет')+'</pre></div>'+
+  '<div class="mf"><button class="btn" onclick="downloadText(\'supip-client.log\',clogText())">'+ic('download')+' Скачать</button><button class="btn pri" onclick="App.closeModal(true)">Закрыть</button></div>', {wide:true});
+};
 
 /* ---------- M15: журнал событий ---------- */
 Views.journal=function(){
@@ -3099,7 +3150,13 @@ App.jrExport=function(){ if(!guard('journal','export'))return;
 
 /* ---------- Запуск приложения: bootstrap, поллинг состояния ---------- */
 window.addEventListener('error',ev=>{
+ clog('error','Ошибка интерфейса: '+ev.message+' ('+(ev.filename||'')+':'+(ev.lineno||0)+')');
  try{ if(DB&&App.user){ log('TECH','error',App.view||'dash','Ошибка интерфейса: '+ev.message,'Web UI','',{}); } }catch(e){}
+});
+window.addEventListener('unhandledrejection',ev=>{
+ const m=(ev.reason&&ev.reason.message)||String(ev.reason||'');
+ clog('error','Необработанное отклонение промиса: '+m);
+ try{ if(DB&&App.user){ log('TECH','error',App.view||'dash','Необработанное отклонение: '+m,'Web UI','',{}); } }catch(e){}
 });
 document.addEventListener('keydown',e=>{
  App._lastAct=Date.now();

@@ -68,6 +68,9 @@ jobs:
       - name: Испытания центра уведомлений и напоминаний
         working-directory: sup-ip
         run: python tests/notif_test.py --base http://127.0.0.1:8000
+      - name: Испытания файлового журналирования
+        working-directory: sup-ip
+        run: python tests/log_test.py --base http://127.0.0.1:8000
       - name: Журнал сервера (при сбое)
         if: failure()
         run: cat sup-ip/server.log

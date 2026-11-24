@@ -44,7 +44,7 @@ SetCompressor /SOLID lzma
 Page custom PgPage PgPageLeave
 Page custom ConfigPage ConfigPageLeave
 !insertmacro MUI_PAGE_INSTFILES
-!define MUI_FINISHPAGE_TEXT "Установка завершена.$\r$\n$\r$\nЖурнал установки: $INSTDIR\data\logs\installer.log$\r$\nОтчёт мастера настройки: $INSTDIR\data\install-report.txt$\r$\nЖурнал мастера настройки: $INSTDIR\data\install-report.txt"
+!define MUI_FINISHPAGE_TEXT "Установка завершена.$\r$\n$\r$\nЖурнал установки: $INSTDIR\data\logs\installer.log$\r$\nОтчёт мастера настройки: $INSTDIR\data\install-report.txt$\r$\nЖурнал настройки: $INSTDIR\data\logs\setup.log$\r$\nЖурнал работы сервера: $INSTDIR\data\logs\supip.log"
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
@@ -487,7 +487,7 @@ Section "Настройка" SEC_CONFIG
   !insertmacro RUN "Мастер настройки: БД · схема · HTTPS · служба · брандмауэр" '"$INSTDIR\SUP-IP.exe" --install-auto "$INSTDIR\install.ini"'
   ${If} $0 != 0
     !insertmacro LOG "ОТКАЗ: мастер настройки · код $0"
-    MessageBox MB_ICONSTOP "Настройка не завершена (код $0).$\r$\n$\r$\nОтчёт: $INSTDIR\data\install-report.txt$\r$\nЖурнал установки: $INSTDIR\data\logs\installer.log$\r$\n$\r$\nПришлите эти файлы для разбора ошибки."
+    MessageBox MB_ICONSTOP "Настройка не завершена (код $0).$\r$\n$\r$\nОтчёт: $INSTDIR\data\install-report.txt$\r$\nЖурнал установки: $INSTDIR\data\logs\installer.log$\r$\nЖурнал настройки: $INSTDIR\data\logs\setup.log$\r$\n$\r$\nПришлите эти файлы для разбора ошибки."
     Abort
   ${EndIf}
   Delete "$INSTDIR\install.ini" ; пароль суперпользователя не хранится на диске
@@ -503,6 +503,8 @@ Section "Настройка" SEC_CONFIG
   CreateShortcut "$SMPROGRAMS\SUP-IP\СУП-ИП (открыть клиент).lnk" "https://localhost:$Port"
   CreateShortcut "$SMPROGRAMS\SUP-IP\Отчёт об установке.lnk" "$INSTDIR\data\install-report.txt"
   CreateShortcut "$SMPROGRAMS\SUP-IP\Журнал установки.lnk" "$INSTDIR\data\logs\installer.log"
+  CreateShortcut "$SMPROGRAMS\SUP-IP\Журнал настройки.lnk" "$INSTDIR\data\logs\setup.log"
+  CreateShortcut "$SMPROGRAMS\SUP-IP\Журнал работы сервера.lnk" "$INSTDIR\data\logs\supip.log"
   CreateShortcut "$SMPROGRAMS\SUP-IP\Удалить СУП-ИП.lnk" "$INSTDIR\uninstall.exe"
   WriteRegStr HKLM "Software\SUP-IP" "InstallDir" "$INSTDIR"
   WriteRegStr HKLM "Software\SUP-IP" "Version" "${VERSION}"

@@ -9,7 +9,7 @@
 Запуск:  python server.py --host 0.0.0.0 --port 80
 БД:      параметры подключения — аргументы --pg-* или переменные SUPIP_PG* / стандартные PG*.
 """
-import argparse, base64, configparser, datetime, hashlib, hmac, json, math, os, platform, re, secrets, shutil, ssl, subprocess, sys, threading, time, urllib.parse
+import argparse, base64, configparser, datetime, hashlib, hmac, json, logging, logging.handlers, math, os, platform, re, secrets, shutil, ssl, subprocess, sys, threading, time, traceback, urllib.parse
 import http.server, socketserver
 from http.cookies import SimpleCookie
 
@@ -39,7 +39,7 @@ except ImportError:
     docgen = None
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -1546,6 +1546,16 @@ def h_admin_sys(db, cur, u, p):
     db.audit(cur, "AUDIT", "info", u["id"], "admin", "Системные параметры изменены", "Система", "", {"wip": s["wip"], "sessionMin": s["sessionMin"]})
     return True, msg("Параметры сохранены", "WIP-лимит и пороги загрузки применяются немедленно")
 
+@reg("admin.logs")
+def h_admin_logs(db, cur, u, p):
+    """Файловые журналы для M14: список, последние строки, каталог и уровень (ТЗ §15)."""
+    guard(db, cur, u, "admin", "view")
+    files = log_files()
+    name = p.get("name") or "supip.log"
+    lines = log_tail(name, p.get("lines", 300)) if any(f["name"] == name for f in files) else []
+    return {"files": files, "name": name, "lines": lines, "dir": LOG_DIR,
+            "level": LOG_STATE["level"], "exists": any(f["name"] == name for f in files)}, None
+
 @reg("admin.diag")
 def h_admin_diag(db, cur, u, p):
     guard(db, cur, u, "admin", "view")
@@ -2367,6 +2377,7 @@ def notification_cycle(db):
                 conn.commit()
         except Exception as e:
             conn.rollback()
+            LOG.error("Планировщик уведомлений: сбой цикла: %s\n%s", e, traceback.format_exc())
             try:
                 with conn.cursor() as cur2:
                     db.audit(cur2, "TECH", "error", "system", "calendar", "Ошибка планировщика уведомлений: %s" % e,
@@ -2375,19 +2386,24 @@ def notification_cycle(db):
             except Exception: pass
         finally:
             db.put(conn)
+    if delivered: LOG.info("Планировщик уведомлений: доставлено %d", delivered)
     return delivered
 
 def notification_worker(db, period=30):
     """Фоновый планировщик уведомлений (автономно, без внешних служб)."""
+    LOG.info("Планировщик уведомлений запущен (интервал %d с)", period)
     while True:
         try: notification_cycle(db)
-        except Exception: pass
+        except Exception as e: LOG.error("Планировщик: необработанная ошибка: %s", e)
         time.sleep(period)
 
 # ---------------- Диспетчер RPC ----------------
 def dispatch(db, user, action, payload):
     h = HANDLERS.get(action)
-    if not h: raise RpcError("Неизвестная операция: %s" % action, "Неизвестная операция", 404, "UNKNOWN_ACTION")
+    if not h:
+        LOG.warning("RPC %s: неизвестная операция (пользователь %s)", action, user.get("login"))
+        raise RpcError("Неизвестная операция: %s" % action, "Неизвестная операция", 404, "UNKNOWN_ACTION")
+    t0 = time.time()
     with db.wlock:
         conn = db.get()
         try:
@@ -2397,9 +2413,11 @@ def dispatch(db, user, action, payload):
                     db.bump(cur)
                     conn.commit()
                     state = db.state(cur, user["id"])
+                    LOG.info("RPC %s · %s · OK · %.0f мс", action, user.get("login"), (time.time() - t0) * 1000)
                     return {"ok": True, "result": result, "msg": m, "state": state}
                 except PermError as e:
                     conn.rollback()
+                    LOG.warning("RPC %s · %s · ОТКАЗ ПРАВ (%s/%s)", action, user.get("login"), e.mod, e.op)
                     db.audit(cur, "SECURITY", "warning", user["id"], e.mod, "Отказано в операции (недостаточно прав)",
                              "Операция", action, {"op": e.op, "role": user["role"], "action": action})
                     conn.commit()
@@ -2407,10 +2425,12 @@ def dispatch(db, user, action, payload):
                     return {"ok": False, "error": {"code": e.code, "title": e.title, "message": str(e)}, "state": state, "status": 403}
                 except RpcError as e:
                     conn.rollback()
+                    LOG.warning("RPC %s · %s · ошибка %s: %s", action, user.get("login"), e.code, e)
                     state = db.state(cur, user["id"])
                     return {"ok": False, "error": {"code": e.code, "title": e.title, "message": str(e)}, "state": state, "status": e.status}
                 except Exception as e:
                     conn.rollback()
+                    LOG.error("RPC %s · %s · ВНУТРЕННЯЯ ОШИБКА: %s\n%s", action, user.get("login"), e, traceback.format_exc())
                     db.audit(cur, "TECH", "error", user["id"], "dash", "Ошибка операции %s: %s" % (action, e), "Операция", action, {})
                     conn.commit()
                     state = db.state(cur, user["id"])
@@ -2423,6 +2443,84 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 FILES_DIR = os.path.join(DATA_DIR, "files")
 COOKIE = "supip_sid"
 TLS_ON = False
+
+# ---------------- Файловые журналы (ТЗ §15: контроль, разбор ошибок и противоречий) ----------------
+# Журнал не зависит от БД: он пишется и тогда, когда PostgreSQL недоступен, — поэтому причины
+# сбоя установки/запуска видны даже при отказе СУБД. Файлы: supip.log (работа), setup.log
+# (мастер установки), installer.log (журнал NSIS-установщика, копируется им же).
+LOG_DIR = os.path.join(DATA_DIR, "logs")
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_KEEP = 5
+LOG = logging.getLogger("supip")
+SETUP_LOG = logging.getLogger("supip.setup")
+LOG_STATE = {"ready": False, "dir": LOG_DIR, "level": "INFO"}
+LOG_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}\.log(\.[0-9]{1,2})?$")
+
+def log_init(level=None, log_dir=None, max_mb=None, keep=None):
+    """Инициализация файловых журналов с ротацией. Вызывается при любом режиме запуска."""
+    global LOG_DIR
+    LOG_DIR = os.path.abspath(log_dir or LOG_DIR)
+    level = (level or LOG_STATE["level"] or "INFO").upper()
+    if level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"): level = "INFO"
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+    except Exception as e:
+        sys.stderr.write("Не удалось создать каталог журналов %s: %s\n" % (LOG_DIR, e))
+        return None
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s [%(name)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+    for logger, fname in ((LOG, "supip.log"), (SETUP_LOG, "setup.log")):
+        for h in list(logger.handlers):
+            logger.removeHandler(h); h.close()
+        logger.setLevel(level); logger.propagate = False
+        try:
+            fh = logging.handlers.RotatingFileHandler(os.path.join(LOG_DIR, fname),
+                                                      maxBytes=int((max_mb or LOG_MAX_BYTES / 1048576) * 1048576),
+                                                      backupCount=int(keep or LOG_KEEP), encoding="utf-8")
+            fh.setFormatter(fmt); logger.addHandler(fh)
+        except Exception as e:
+            sys.stderr.write("Не удалось открыть журнал %s: %s\n" % (fname, e))
+        ch = logging.StreamHandler(sys.stderr)      # в консоль — только предупреждения и ошибки
+        ch.setLevel(logging.WARNING); ch.setFormatter(fmt); logger.addHandler(ch)
+    LOG_STATE.update(ready=True, dir=LOG_DIR, level=level)
+    return os.path.join(LOG_DIR, "supip.log")
+
+def log_mask(dsn):
+    """Пароли в журнал не пишутся."""
+    return re.sub(r"(password=)\S+", r"\1***", dsn or "")
+
+def log_files():
+    """Список доступных журналов (только каталог журналов, без обхода путей)."""
+    out = []
+    try:
+        for n in sorted(os.listdir(LOG_DIR)):
+            if not LOG_NAME_RE.match(n): continue
+            p = os.path.join(LOG_DIR, n)
+            if not os.path.isfile(p): continue
+            st = os.stat(p)
+            out.append({"name": n, "size": st.st_size, "mtime": int(st.st_mtime * 1000)})
+    except Exception:
+        pass
+    return out
+
+def log_tail(name, lines=300):
+    """Последние строки журнала (защита от обхода каталога и от чтения произвольных файлов)."""
+    if not LOG_NAME_RE.match(name or ""): raise RpcError("Недопустимое имя журнала", "Журналы", 400, "BAD_LOG_NAME")
+    p = os.path.join(LOG_DIR, name)
+    if not os.path.isfile(p): raise RpcError("Журнал не найден: %s" % name, "Журналы", 404, "NO_LOG")
+    n = max(1, min(int(lines or 300), 5000))
+    with open(p, "rb") as f:
+        f.seek(0, os.SEEK_END); size = f.tell()
+        block = min(size, 512 * 1024)
+        f.seek(size - block)
+        data = f.read(block)
+    text = data.decode("utf-8", "replace")
+    return text.splitlines()[-n:]
+
+class ReportList(list):
+    """Отчёт мастера установки: каждая строка сразу пишется в setup.log."""
+    def append(self, s):
+        super().append(s)
+        SETUP_LOG.info("%s", s)
 
 def session_user(db, token):
     """Возвращает публичную запись пользователя по токену сессии; продлевает idle-таймер."""
@@ -2451,7 +2549,9 @@ def do_login(db, login, password, ip):
                 u = cur.fetchone()
                 if not u:
                     db.audit(cur, "SECURITY", "warning", "system", "admin", "Неуспешный вход: неизвестный логин", "Сессия", "", {"login": login, "ip": ip})
-                    conn.commit(); raise RpcError("Неверный логин или пароль", "Вход отклонён", 401, "BAD_CREDENTIALS")
+                    conn.commit()
+                    LOG.warning("ВХОД отклонён: неизвестный логин '%s' с %s", login, ip)
+                    raise RpcError("Неверный логин или пароль", "Вход отклонён", 401, "BAD_CREDENTIALS")
                 if u["blocked"]:
                     db.audit(cur, "SECURITY", "warning", u["id"], "admin", "Вход отклонён: учётная запись заблокирована", "Сессия", u["id"], {"ip": ip})
                     conn.commit(); raise RpcError("Учётная запись заблокирована администратором", "Вход отклонён", 403, "BLOCKED")
@@ -2465,6 +2565,7 @@ def do_login(db, login, password, ip):
                     db.audit(cur, "SECURITY", "warning", u["id"], "admin",
                              "Неуспешный вход: неверный пароль" + (" · блокировка 60 с" if lock else ""), "Сессия", u["id"], {"ip": ip, "attempt": failed or 3})
                     conn.commit()
+                    LOG.warning("ВХОД отклонён: неверный пароль '%s' с %s%s", login, ip, " · блокировка 60 с" if lock else "")
                     raise RpcError("Неверный логин или пароль" + (" · вход заблокирован на 60 с" if lock else " · осталось попыток: %d" % (3 - failed)),
                                    "Вход отклонён", 401, "BAD_CREDENTIALS")
                 s = db.settings(cur) or {}
@@ -2479,6 +2580,7 @@ def do_login(db, login, password, ip):
                 cur.execute("INSERT INTO sessions(token,user_id,created,last_seen) VALUES(%s,%s,%s,%s)", (token, u["id"], now_ms(), now_ms()))
                 cur.execute("UPDATE users SET failed=0, lock_until=0 WHERE id=%s", (u["id"],))
                 db.audit(cur, "SECURITY", "info", u["id"], "admin", "Вход в систему", "Сессия", u["id"], {"ip": ip, "role": u["role"]})
+                LOG.info("ВХОД: %s (%s) с %s", u["login"], u["role"], ip)
                 db.bump(cur); conn.commit()
                 state = db.state(cur, u["id"])
                 return token, state
@@ -2560,6 +2662,7 @@ def make_backup(db, user):
                 for t in BACKUP_TABLES:
                     cur.execute("SELECT * FROM " + t)
                     data["tables"][t] = [dict(r) for r in cur.fetchall()]
+                LOG.info("Резервная копия создана пользователем %s (%d таблиц)", user.get("login"), len(BACKUP_TABLES))
                 db.audit(cur, "TECH", "info", user["id"], "admin", "Создана резервная копия БД (JSON)", "БД", "",
                          {"rows": {t: len(data["tables"][t]) for t in BACKUP_TABLES}})
                 db.bump(cur); conn.commit()
@@ -2601,6 +2704,7 @@ def restore_backup(db, user, data, token=None):
                 for t in ["docs","doc_versions","calcs","time_entries","cal_events","reports","events","settings","reminders","notifications"]:
                     for row in tables[t]: ins(t, row)
                 cur.execute("UPDATE meta SET v=(v::bigint+1)::text WHERE k='rev'")
+                LOG.warning("БД ВОССТАНОВЛЕНА из копии пользователем %s (копия от %s)", user.get("login"), data.get("ts"))
                 db.audit(cur, "SECURITY", "warning", user["id"], "admin", "БД восстановлена из резервной копии", "БД", "",
                          {"backupTs": data.get("ts"), "rows": {t: len(tables[t]) for t in BACKUP_TABLES}})
                 conn.commit()
@@ -2611,8 +2715,10 @@ def restore_backup(db, user, data, token=None):
                                 (token, user["id"], now_ms(), now_ms()))
                     conn.commit()
                 return {"relogin": not alive}
-        except Exception:
-            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback()
+            LOG.error("Восстановление БД не выполнено: %s\n%s", e, traceback.format_exc())
+            raise
         finally:
             db.put(conn)
 
@@ -2629,8 +2735,11 @@ class App(http.server.BaseHTTPRequestHandler):
     db = None
 
     def log_message(self, fmt, *args):
-        if "/api/state" not in (args[0] if args else ""):
-            sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+        line = "%s - %s" % (self.address_string(), fmt % args)
+        if "/api/state" in (args[0] if args else ""):
+            LOG.debug("HTTP %s", line)          # поллинг состояния — только в режиме DEBUG
+        else:
+            LOG.info("HTTP %s", line)
 
     # --- утилиты ответа ---
     def _headers(self, status, ctype, length, extra=None):
@@ -2685,6 +2794,7 @@ class App(http.server.BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": {"code": e.code, "title": e.title, "message": str(e)}}, e.status)
         except (BrokenPipeError, ConnectionResetError): pass
         except Exception as e:
+            LOG.error("GET %s · ВНУТРЕННЯЯ ОШИБКА: %s\n%s", self.path, e, traceback.format_exc())
             self.send_json({"ok": False, "error": {"code": "INTERNAL", "title": "Ошибка сервера", "message": str(e)}}, 500)
 
     def do_POST(self):
@@ -2765,6 +2875,37 @@ class App(http.server.BaseHTTPRequestHandler):
 
     def api_get(self, path):
         db = self.db
+        if path == "/api/logs":
+            u = self.need_user()
+            conn = db.get()
+            try:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    guard(db, cur, u, "admin", "view")
+                conn.commit()
+            finally: db.put(conn)
+            return self.send_json({"ok": True, "dir": LOG_DIR, "level": LOG_STATE["level"], "files": log_files()})
+        if path.startswith("/api/logs/"):
+            u = self.need_user()
+            conn = db.get()
+            try:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    guard(db, cur, u, "admin", "export")
+                conn.commit()
+            finally: db.put(conn)
+            name = urllib.parse.unquote(path[len("/api/logs/"):])
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            tail = int((q.get("tail") or ["0"])[0])
+            if tail:
+                body = "\n".join(log_tail(name, tail)).encode("utf-8")
+            else:
+                if not LOG_NAME_RE.match(name or ""): raise RpcError("Недопустимое имя журнала", "Журналы", 400, "BAD_LOG_NAME")
+                fp = os.path.join(LOG_DIR, name)
+                if not os.path.isfile(fp): raise RpcError("Журнал не найден", "Журналы", 404, "NO_LOG")
+                with open(fp, "rb") as f: body = f.read()
+            LOG.info("Журнал %s выгружен пользователем %s (%d байт)", name, u.get("login"), len(body))
+            self._headers(200, "text/plain; charset=utf-8", len(body),
+                          {"Content-Disposition": 'attachment; filename="%s"' % name})
+            return self.wfile.write(body)
         if path == "/api/formats":
             self.need_user()
             av = docgen.available() if docgen else {}
@@ -2870,7 +3011,12 @@ def main():
     ap.add_argument("--health", action="store_true", help="диагностика: БД, файловое хранилище, порт")
     ap.add_argument("--version", action="store_true", help="показать версию и выйти")
     ap.add_argument("--selftest", action="store_true", help="проверка целостности поставки (без БД): клиент, зависимости, ресурсы")
+    ap.add_argument("--log-level", metavar="LEVEL", help="уровень файлового журнала: DEBUG|INFO|WARNING|ERROR")
+    ap.add_argument("--log-dir", metavar="DIR", help="каталог журналов (по умолчанию data/logs)")
     args = ap.parse_args()
+    log_init(args.log_level, args.log_dir)
+    LOG.info("Режим запуска: %s · версия %s · Python %s · %s",
+             " ".join(sys.argv[1:]) or "сервер", VERSION, platform.python_version(), platform.platform())
     if args.version:
         print("%s %s (%s, Python %s)" % (APP_NAME, VERSION, "EXE" if getattr(sys, "frozen", False) else "script", platform.python_version()))
         sys.exit(0)
@@ -2882,18 +3028,25 @@ def main():
     if args.service:
         sys.exit(service_command(args.service))
     cfg = load_config()
+    if not args.log_level and (cfg.get("log_level") or cfg.get("log_dir")):
+        log_init(cfg.get("log_level"), args.log_dir or cfg.get("log_dir"),
+                 float(cfg.get("log_max_mb") or 10), int(cfg.get("log_keep") or 5))
     host = args.host or cfg["host"]
     port = args.port or int(os.environ.get("SUPIP_PORT", cfg["port"]))
     dsn = args.dsn or os.environ.get("SUPIP_DSN", cfg["dsn"])
     cert = args.cert or cfg["cert"] or None
     key = args.key or cfg["key"] or None
     os.makedirs(FILES_DIR, exist_ok=True)
+    LOG.info("Подключение к PostgreSQL: %s", log_mask(dsn))
     try:
         db = DB(dsn)
     except Exception as e:
+        LOG.critical("PostgreSQL недоступен: %s\n%s", e, traceback.format_exc())
         print("Не удалось подключиться к PostgreSQL: %s\nЗапустите мастер установки: SUP-IP.exe --install (или run.bat)." % e)
+        print("Журнал: %s" % os.path.join(LOG_DIR, "supip.log"))
         sys.exit(2)
-    migrate(db)
+    applied = migrate(db)
+    LOG.info("Схема БД: версия %s%s", SCHEMA_VERSION, "; применены миграции %s" % applied if applied else "")
     if args.health:
         ok = True
         conn = db.get()
@@ -2948,14 +3101,22 @@ def main():
     print("  Адрес: %s://%s:%d  (веб-клиенты ЛВС — по IP этого ПК)" % (scheme, host, port))
     print("  Демо-вход: u1…u8, пароль demo (u1 — администратор)")
     print("  Центр уведомлений: планировщик запущен (интервал 30 с)")
+    print("  Журнал работы: %s" % os.path.join(LOG_DIR, "supip.log"))
     print("=" * 62)
+    LOG.info("СЕРВЕР ЗАПУЩЕН: %s://%s:%d · файловое хранилище %s · журнал %s (уровень %s)",
+             scheme, host, port, FILES_DIR, LOG_DIR, LOG_STATE["level"])
     threading.Thread(target=notification_worker, args=(db,), daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nОстановка сервера…")
+        LOG.info("Остановка сервера по сигналу пользователя")
+    except Exception as e:
+        LOG.critical("Аварийная остановка сервера: %s\n%s", e, traceback.format_exc())
+        raise
     finally:
         srv.server_close()
+        LOG.info("СЕРВЕР ОСТАНОВЛЕН")
 
 # ================= Установка и настройка через EXE (ТЗ §7) =================
 CONFIG_PATH = os.path.join(BASE_DIR, "supip.ini")
@@ -3001,21 +3162,29 @@ def load_config(path=None):
     """Конфигурация supip.ini (рядом с EXE/скриптом). CLI и env имеют приоритет."""
     cfg = {"host": "0.0.0.0", "port": "8000",
            "dsn": "host=127.0.0.1 port=5432 dbname=supip user=supip password=supip",
-           "cert": "", "key": "", "seed": "1"}
+           "cert": "", "key": "", "seed": "1",
+           "log_level": "INFO", "log_dir": "", "log_max_mb": "10", "log_keep": "5"}
     p = path or CONFIG_PATH
     if os.path.isfile(p):
         cp = configparser.ConfigParser()
         cp.read(p, encoding="utf-8")
         if cp.has_section("server"):
-            for k in cfg:
+            for k in ("host", "port", "dsn", "cert", "key", "seed"):
                 if cp.has_option("server", k): cfg[k] = cp.get("server", k)
+        if cp.has_section("logs"):
+            for k in ("log_level", "log_dir", "log_max_mb", "log_keep"):
+                opt = k[4:]
+                if cp.has_option("logs", opt): cfg[k] = cp.get("logs", opt)
     return cfg
 
 def save_config(cfg, path=None):
     cp = configparser.ConfigParser()
-    cp["server"] = cfg
+    cp["server"] = {k: v for k, v in cfg.items() if not k.startswith("log_")}
+    cp["logs"] = {"level": cfg.get("log_level", "INFO"), "dir": cfg.get("log_dir", ""),
+                  "max_mb": str(cfg.get("log_max_mb", "10")), "keep": str(cfg.get("log_keep", "5"))}
     with open(path or CONFIG_PATH, "w", encoding="utf-8") as f:
         f.write("# СУП-ИП — конфигурация сервера (создана мастером установки)\n")
+        f.write("# [logs] — файловые журналы: level=DEBUG|INFO|WARNING|ERROR, dir, max_mb, keep\n")
         cp.write(f)
 
 def _gen_cert(cert_path, key_path, cn):
@@ -3079,8 +3248,12 @@ def install_report_write(lines):
     return p
 
 def run_install(auto_path=None):
-    """Мастер установки/настройки (ТЗ §7.3). Интерактивный или автоматический (--install-auto ini)."""
-    report = []
+    """Мастер установки/настройки (ТЗ §7.3). Интерактивный или автоматический (--install-auto ini).
+       Каждая строка отчёта сразу пишется в data/logs/setup.log — журнал сохраняется и при сбое."""
+    if not LOG_STATE["ready"]: log_init()
+    report = ReportList()
+    SETUP_LOG.info("=== Мастер установки СУП-ИП v%s (режим: %s) ===", VERSION, "автоматический" if auto_path else "интерактивный")
+    report.append("Версия: %s · Python %s · %s" % (VERSION, platform.python_version(), platform.platform()))
     print("=" * 64)
     print("  СУП-ИП v%s — мастер установки и настройки" % VERSION)
     print("=" * 64)
@@ -3124,7 +3297,9 @@ def run_install(auto_path=None):
     try:
         _pg_ensure(dsn_super, app_db, app_user, app_pass, report)
     except Exception as e:
+        SETUP_LOG.error("PostgreSQL: %s\n%s", e, traceback.format_exc())
         report.append("ОШИБКА PostgreSQL: %s" % e)
+        report.append("Журнал настройки: %s" % os.path.join(LOG_DIR, "setup.log"))
         print("\n".join(report)); print("\nПроверьте, что служба PostgreSQL запущена и пароль суперпользователя верен.")
         install_report_write(report); return 3
     # 4. Схема, миграции, демо-данные
@@ -3169,9 +3344,11 @@ def run_install(auto_path=None):
     else:
         report.append("HTTPS: отключён мастером (включите: --cert/--key или supip.ini)")
     # 8. Конфигурация
-    cfg = {"host": bind, "port": str(port), "dsn": dsn, "cert": cert, "key": key, "seed": "1"}
+    cfg = {"host": bind, "port": str(port), "dsn": dsn, "cert": cert, "key": key, "seed": "1",
+           "log_level": LOG_STATE["level"], "log_dir": LOG_DIR}
     save_config(cfg)
     report.append("Конфигурация сохранена: %s" % CONFIG_PATH)
+    report.append("Файловые журналы: %s (уровень %s)" % (LOG_DIR, LOG_STATE["level"]))
     # 9. Брандмауэр и служба (Windows)
     if sys.platform == "win32":
         try:
@@ -3203,9 +3380,11 @@ def run_install(auto_path=None):
     report.append("ГОТОВО. Запуск: %s" % ("SUP-IP.exe (служба)" if sys.platform == "win32" else "python3 server.py"))
     report.append("Клиенты в ЛВС: %s://<IP-этого-ПК>:%s" % (scheme, port))
     report.append("Вход: admin / %s" % ("(пароль мастера)" if admin_pass != "demo" else "demo"))
+    report.append("Журнал настройки: %s" % os.path.join(LOG_DIR, "setup.log"))
     p = install_report_write(report)
     print("\n".join(report))
     print("\nОтчёт об установке: %s" % p)
+    SETUP_LOG.info("=== Установка завершена успешно ===")
     return 0
 
 def socket_bind_probe(bind, port):
@@ -3223,6 +3402,8 @@ def selftest():
     """Проверка целостности поставки без обращения к БД (ТЗ §15.3: испытания установки).
        Используется сборкой EXE и мастером установки: SUP-IP.exe --selftest."""
     ok = True
+    if not LOG_STATE["ready"]: log_init()
+    SETUP_LOG.info("=== Самотестирование поставки СУП-ИП v%s ===", VERSION)
     print("СУП-ИП %s — самотестирование поставки" % VERSION)
     idx = os.path.join(STATIC_DIR, "index.html")
     try:
@@ -3255,10 +3436,14 @@ def selftest():
     except Exception as e:
         print("  Каталог данных: ОШИБКА %s" % e); ok = False
     print("ИТОГ: %s" % ("поставка исправна" if ok else "ЕСТЬ ОШИБКИ"))
+    print("Журнал: %s" % os.path.join(LOG_DIR, "setup.log"))
+    SETUP_LOG.info("Самотестирование: %s", "поставка исправна" if ok else "ЕСТЬ ОШИБКИ")
     return 0 if ok else 1
 
 # ---------------- Служба Windows (ТЗ §7.4: автозапуск, контролируемый перезапуск) ----------------
 def service_command(action, cfg=None):
+    if not LOG_STATE["ready"]: log_init()
+    LOG.info("Служба Windows: команда '%s'", action)
     if sys.platform != "win32":
         print("Служба Windows доступна только на Windows. На Linux используйте systemd или run.sh."); return 1
     try:
@@ -3305,9 +3490,13 @@ def service_command(action, cfg=None):
             _svc_display_name_ = "СУП-ИП — сервер управления проектами"
             def SvcStop(self):
                 self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+                LOG.info("Служба Windows: получен запрос остановки")
                 if self._srv: threading.Thread(target=self._srv.shutdown, daemon=True).start()
             def SvcDoRun(self):
                 self._srv = None
+                log_init(cfg.get("log_level"), cfg.get("log_dir"),
+                         float(cfg.get("log_max_mb") or 10), int(cfg.get("log_keep") or 5))
+                LOG.info("Служба Windows: запуск сервера СУП-ИП v%s", VERSION)
                 try:
                     db = DB(cfg["dsn"])
                     migrate(db)
@@ -3322,9 +3511,11 @@ def service_command(action, cfg=None):
                         TLS_ON = True
                     self._srv = srv
                     threading.Thread(target=notification_worker, args=(db,), daemon=True).start()
+                    LOG.info("Служба Windows: сервер слушает %s:%s", cfg["host"], cfg["port"])
                     srv.serve_forever()
                 except Exception as e:
-                    servicemanager.LogErrorMsg("СУП-ИП: %s" % e)
+                    LOG.critical("Служба Windows: аварийное завершение: %s\n%s", e, traceback.format_exc())
+                    servicemanager.LogErrorMsg("СУП-ИП: %s (журнал: %s)" % (e, os.path.join(LOG_DIR, "supip.log")))
         servicemanager.PrepareToHostSingle(SupipService)
         servicemanager.StartServiceCtrlDispatcher()
         return 0
