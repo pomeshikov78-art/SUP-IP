@@ -74,6 +74,9 @@ jobs:
       - name: Испытания маршрута согласования и версий протокола
         working-directory: sup-ip
         run: python tests/protocol_test.py --base http://127.0.0.1:8000
+      - name: Испытания поручений из решений совещаний
+        working-directory: sup-ip
+        run: python tests/directive_test.py --base http://127.0.0.1:8000
       - name: Журнал сервера (при сбое)
         if: failure()
         run: cat sup-ip/server.log

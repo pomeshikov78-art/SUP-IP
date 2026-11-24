@@ -265,7 +265,7 @@ def main():
     s, payload = adm.req("GET", "/api/backup")
     backup = payload if isinstance(payload, dict) else json.loads(payload.decode())
     check("backup скачан", s == 200 and "tables" in backup and len(backup["tables"].get("users", [])) >= 8)
-    check("backup содержит 15 таблиц", len(backup["tables"]) == 15)
+    check("backup содержит 16 таблиц", len(backup["tables"]) == 16, len(backup["tables"]))
     s, j = pm.req("POST", "/api/restore", backup)
     check("restore не-админом → 403", s == 403)
     s, j = adm.req("POST", "/api/restore", backup)

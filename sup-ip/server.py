@@ -39,7 +39,7 @@ except ImportError:
     docgen = None
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -299,7 +299,13 @@ CREATE TABLE IF NOT EXISTS tasks(
   result TEXT NOT NULL DEFAULT '', block_reason TEXT NOT NULL DEFAULT '',
   deps JSONB NOT NULL DEFAULT '[]', comments JSONB NOT NULL DEFAULT '[]', descr TEXT NOT NULL DEFAULT '',
   created_at BIGINT NOT NULL, created_by TEXT, meeting_id TEXT REFERENCES meetings(id) ON DELETE SET NULL,
-  risk_id TEXT REFERENCES risks(id) ON DELETE SET NULL);
+  risk_id TEXT REFERENCES risks(id) ON DELETE SET NULL, directive JSONB NOT NULL DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS meeting_tasks(
+  id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  decision_id TEXT NOT NULL, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  ts BIGINT NOT NULL, by_user TEXT, UNIQUE(decision_id, task_id));
+CREATE INDEX IF NOT EXISTS ix_meeting_tasks_m ON meeting_tasks(meeting_id);
+CREATE INDEX IF NOT EXISTS ix_meeting_tasks_t ON meeting_tasks(task_id);
 CREATE INDEX IF NOT EXISTS ix_tasks_proj ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS ix_tasks_assignee ON tasks(assignee);
 CREATE TABLE IF NOT EXISTS docs(
@@ -356,7 +362,8 @@ ENT = {
    ("title","title","t"),("type","type","t"),("status","status","t"),("priority","priority","t"),("assignee","assignee","t"),
    ("start","start","t"),("end",'"end"',"t"),("planHours","plan_hours","i"),("progress","progress","i"),
    ("result","result","t"),("blockReason","block_reason","t"),("deps","deps","j"),("comments","comments","j"),
-   ("desc","descr","t"),("createdAt","created_at","i"),("createdBy","created_by","t"),("meetingId","meeting_id","t"),("riskId","risk_id","t")]),
+   ("desc","descr","t"),("createdAt","created_at","i"),("createdBy","created_by","t"),("meetingId","meeting_id","t"),("riskId","risk_id","t"),
+   ("directive","directive","j")]),
  "risk": ("risks", [("id","id","t"),("code","code","t"),("title","title","t"),("cat","cat","t"),("projectId","project_id","t"),
    ("p","p","i"),("i","i","i"),("strategy","strategy","t"),("owner","owner","t"),("status","status","t"),("review","review","t"),
    ("residual","residual","j"),("desc","descr","t"),("measures","measures","j"),("history","history","j"),("events","risk_events","j")]),
@@ -472,6 +479,8 @@ class DB:
         s["notifUnread"] = unread
         cur.execute("SELECT id,owner_type,owner_id,user_id,offset_min,fire_at,sent_at FROM reminders ORDER BY fire_at")
         s["reminders"] = [dict(r) for r in cur.fetchall()]
+        cur.execute("SELECT id,meeting_id,decision_id,task_id,ts,by_user FROM meeting_tasks ORDER BY ts")
+        s["meetingTasks"] = [dict(r) for r in cur.fetchall()]
         return s
 
 # ---------------- Демо-данные (эталонный набор) ----------------
@@ -543,13 +552,23 @@ def seed(db):
                 T(projectId="p5",title="Проработка облика МУС-5",status="Новая",priority="Средний",assignee="u3",start=D(14),end=D(35),planHours=120),
                 T(projectId="p6",title="Модернизация рабочих мест (12 АРМ)",status="Закрыта",priority="Высокий",assignee="u5",start=D(-160),end=D(-40),planHours=420,progress=100,result="Все АРМ модернизированы"),
                 T(projectId="p6",title="Обучение диспетчерского состава",status="Закрыта",priority="Средний",assignee="u4",start=D(-38),end=D(-22),planHours=60,progress=100,result="Проведено 4 группы, ведомости подписаны"),
-                T(projectId="p1",title="Подготовить сравнительную таблицу поставщиков ППМ",status="В работе",priority="Высокий",assignee="u5",start=D(-7),end=D(2),planHours=16,progress=50,type="directive",meetingId="m1"),
-                T(projectId="p3",title="Уточнить требования по ЭМС для МПП-7",status="Готова к выполнению",priority="Высокий",assignee="u6",start=D(-7),end=D(-1),planHours=12,type="directive",meetingId="m1"),
+                T(projectId="p1",title="Подготовить сравнительную таблицу поставщиков ППМ",status="В работе",priority="Высокий",assignee="u5",start=D(-7),end=D(2),planHours=16,progress=50,type="directive",meetingId="m1",
+                  desc="Поручение по решению совещания СОВ-2026-041.\nФормулировка решения: подготовить сравнительную таблицу поставщиков ППМ к техническому совету.",
+                  directive={"source":"Решение №1 совещания СОВ-2026-041 · пункт 3 повестки","criteria":"Таблица содержит не менее 3 поставщиков, сроки, цены и риски поставки; согласована с РП.",
+                             "coassignees":["u3"],"postedAt":now-7*DAY*1000,"postedBy":"u2","postedDate":D(-7),
+                             "meetingId":"m1","meetingCode":"СОВ-2026-041","decisionId":"md1","decisionN":1,"agendaN":3,
+                             "protocolV":1,"protocolDoc":None,"dueHistory":[],"acceptance":None,"docs":[],"factDate":None,"comment":""}),
+                T(projectId="p3",title="Уточнить требования по ЭМС для МПП-7",status="Готова к выполнению",priority="Высокий",assignee="u6",start=D(-7),end=D(-1),planHours=12,type="directive",meetingId="m1",
+                  desc="Поручение по решению совещания СОВ-2026-041.\nФормулировка решения: уточнить требования по ЭМС для МПП-7 и направить в НИИ-экспертизы.",
+                  directive={"source":"Решение №2 совещания СОВ-2026-041 · пункт 2 повестки","criteria":"Получены письменные требования по ЭМС, направлены в НИИ-экспертизы.",
+                             "coassignees":[],"postedAt":now-7*DAY*1000,"postedBy":"u2","postedDate":D(-7),
+                             "meetingId":"m1","meetingCode":"СОВ-2026-041","decisionId":"md2","decisionN":2,"agendaN":2,
+                             "protocolV":1,"protocolDoc":None,"dueHistory":[],"acceptance":None,"docs":[],"factDate":None,"comment":""}),
             ]
             meetings=[
                 dict(id="m1",code="СОВ-2026-041",title="Еженедельное планирование подразделения",type="Оперативное",date=D(-7),time="10:00",chair="u2",secretary="u3",attendees=["u2","u3","u4","u5","u6"],status="Протокол утверждён",
                      agenda=[{"n":1,"title":"Статус проектов портфеля","reporter":"u3"},{"n":2,"title":"Отклонение по алгоритму МПП-7","reporter":"u6"},{"n":3,"title":"Загрузка на ближайшие 2 недели","reporter":"u2"}],
-                     decisions=[{"id":"md1","text":"Подготовить сравнительную таблицу поставщиков ППМ к техническому совету","resp":"u5","due":D(2),"taskId":"t27"},{"id":"md2","text":"Уточнить требования по ЭМС для МПП-7 и направить в НИИ-экспертизы","resp":"u6","due":D(-1),"taskId":"t28"}]),
+                     decisions=[{"id":"md1","text":"Подготовить сравнительную таблицу поставщиков ППМ к техническому совету","resp":"u5","due":D(2),"taskId":"t27","taskIds":["t27"],"agendaN":3},{"id":"md2","text":"Уточнить требования по ЭМС для МПП-7 и направить в НИИ-экспертизы","resp":"u6","due":D(-1),"taskId":"t28","taskIds":["t28"],"agendaN":2}]),
                 dict(id="m2",code="СОВ-2026-042",title="Технический совет по МПП-7",type="Техническое",date=D(2),time="14:00",chair="u2",secretary="u3",attendees=["u2","u3","u6","u7"],status="Запланировано",
                      agenda=[{"n":1,"title":"Результаты моделирования адаптивной фильтрации","reporter":"u6"},{"n":2,"title":"Меры по риску Р-02","reporter":"u3"},{"n":3,"title":"Перенос климатических испытаний","reporter":"u7"}],decisions=[]),
                 dict(id="m3",code="СОВ-2026-043",title="Приёмка этапа СМТП-3",type="Приёмочное",date=D(7),time="11:00",chair="u2",secretary="u4",attendees=["u2","u4","u5","u6","u8"],status="Запланировано",
@@ -557,6 +576,12 @@ def seed(db):
             ]
             for m in meetings: db.save_ent(cur,"meeting",m)
             for t in tasks: db.save_ent(cur,"task",t)
+            # связи решений с поручениями (техпроект §4.1: meeting_tasks — связь, а не параллельная система задач)
+            for m in meetings:
+                for d in m.get("decisions") or []:
+                    for tid in dec_task_ids(d):
+                        cur.execute("INSERT INTO meeting_tasks(id,meeting_id,decision_id,task_id,ts,by_user) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                                    (uid("mt"), m["id"], d["id"], tid, now-7*DAY*1000, "u2"))
             risks=[
                 dict(id="r1",code="Р-01",title="Срыв поставки радиомодулей основным поставщиком",cat="Снабжение",projectId="p1",p=4,i=5,strategy="Снижение",owner="u3",status="В обработке",review=D(7),residual={"p":3,"i":4},desc="Единственный поставщик ППМ подтверждает срок поставки с задержкой до 6 недель.",measures=[{"id":"rm1","title":"Провести квалификацию альтернативного поставщика","assignee":"u5","due":D(5),"done":False},{"id":"rm2","title":"Включить штрафные санкции в договор","assignee":"u3","due":D(-2),"done":True}],history=[{"ts":now-18*DAY*1000,"p":3,"i":5,"by":"u3"},{"ts":now-6*DAY*1000,"p":4,"i":5,"by":"u3"}],events=[]),
                 dict(id="r2",code="Р-02",title="Недостижение требуемой чувствительности приёмного тракта",cat="Технические",projectId="p3",p=3,i=5,strategy="Снижение",owner="u6",status="В обработке",review=D(3),residual={"p":2,"i":5},desc="Моделирование показывает дефицит запаса по чувствительности при сильных помехах.",measures=[{"id":"rm3","title":"Отладка алгоритма адаптивной фильтрации на реальных записях","assignee":"u6","due":D(4),"done":False}],history=[{"ts":now-10*DAY*1000,"p":3,"i":5,"by":"u6"}],events=[{"ts":now-4*DAY*1000,"text":"На макете подтверждена неустойчивая сходимость алгоритма"}]),
@@ -614,6 +639,27 @@ def seed(db):
                       "dicts":json.loads(json.dumps(DEFAULT_DICTS)),"perms":json.loads(json.dumps(BASE_PERMS)),
                       "widgets":{},"seq":{"proj":6,"task":28,"risk":8,"doc":9,"calc":20,"report":20,"meet":43}}
             db.save_settings(cur,settings)
+            # демонстрационный утверждённый протокол (ТЗ §2.9): отдельная редакция с файлами DOCX+PDF
+            m1 = next(m for m in meetings if m["id"]=="m1")
+            if docgen is not None:
+                u_adm = {"id":"u1","login":"admin","name":"Соколов Артём","role":"admin"}
+                reg = _protocol_register(db, cur, u_adm, m1, ["docx","pdf"], "Утверждённый протокол (демо-набор)")
+                pr = protocol_default()
+                pr.update(status="Утверждён", version=1, sentAt=now-7*DAY*1000, sentBy="u3",
+                          approvedAt=now-6*DAY*1000, approvedBy="u2",
+                          route=[{"user":"u3","role":"Секретарь","state":"Согласовано","ts":now-7*DAY*1000,"comment":""},
+                                 {"user":"u2","role":"Председатель","state":"Согласовано","ts":now-6*DAY*1000,"comment":""}],
+                          comments=[{"ts":now-7*DAY*1000,"by":"u3","kind":"Направление","text":"Протокол подготовлен секретарём"}])
+                pr["versions"] = [{"v":1,"ts":now-6*DAY*1000,"by":"u2","note":"Утверждённый протокол (демо-набор)",
+                                   "docId":reg["docId"],"docCode":reg["docCode"],"docV":reg["docV"],"files":reg["files"],
+                                   "agenda":m1["agenda"],"decisions":m1["decisions"]}]
+                m1["protocol"] = pr
+                db.save_ent(cur,"meeting",m1)
+                for t in tasks:
+                    if t.get("meetingId")=="m1" and t.get("directive"):
+                        t["directive"]["protocolDoc"] = {"docId":reg["docId"],"docCode":reg["docCode"],"docV":reg["docV"]}
+                        db.save_ent(cur,"task",t)
+
             seed_events=[
                 (-9,"SECURITY","info","u2","admin","Вход в систему","Сессия","",{"ip":"192.168.10.21"}),
                 (-8,"BUSINESS","info","u3","portfolio","Создан проект","Проект","p5",{"name":"Мобильный узел связи МУС-5"}),
@@ -878,6 +924,15 @@ def h_task_delete(db, cur, u, p):
         nd = [d for d in r["deps"] if d["id"] != t["id"]]
         if len(nd) != len(r["deps"]):
             ot = db.get_ent(cur, "task", r["id"]); ot["deps"] = nd; db.save_ent(cur, "task", ot)
+    if t.get("meetingId"):
+        cur.execute("DELETE FROM meeting_tasks WHERE task_id=%s", (t["id"],))
+        m = db.get_ent(cur, "meeting", t["meetingId"])
+        if m:
+            for d in m.get("decisions") or []:
+                ids = [x for x in dec_task_ids(d) if x != t["id"]]
+                if ids != dec_task_ids(d):
+                    d["taskIds"] = ids; d["taskId"] = ids[0] if ids else None
+            db.save_ent(cur, "meeting", m)
     db.del_ent(cur, "task", t["id"])
     db.audit(cur, "AUDIT", "warning", u["id"], "tasks", "Задача удалена", "Задача", t["id"], {"code": t["code"], "title": t["title"]})
     return True, msg("Задача удалена", "Записи трудозатрат сохранены в M06 как история")
@@ -1326,49 +1381,147 @@ def h_meeting_agenda(db, cur, u, p):
     db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Добавлен вопрос повестки", "Совещание", m["id"], {"code": m["code"]})
     return m, msg("Вопрос добавлен")
 
-def _directive_from_decision(db, cur, u, m, d):
+DIRECTIVE_PRIORITIES = ("Критический", "Высокий", "Средний", "Низкий")
+
+def dec_task_ids(d):
+    """Связи решения с поручениями: одно решение может порождать несколько задач (ТЗ §2.10)."""
+    ids = d.get("taskIds")
+    if isinstance(ids, list) and ids: return [x for x in ids if x]
+    return [d["taskId"]] if d.get("taskId") else []
+
+def _directive_links(db, cur, m, d):
+    """Ссылки поручения на совещание, протокол и пункт решения (ТЗ §2.10)."""
+    pr = prot_of(m)
+    n = next((i + 1 for i, x in enumerate(m.get("decisions") or []) if x["id"] == d["id"]), None)
+    ver = next((v for v in reversed(pr["versions"]) if v["v"] == pr["version"]), None)
+    return {"meetingId": m["id"], "meetingCode": m["code"], "decisionId": d["id"], "decisionN": n,
+            "agendaN": d.get("agendaN"), "protocolV": pr["version"] or None,
+            "protocolDoc": ({"docId": ver["docId"], "docCode": ver["docCode"], "docV": ver["docV"]} if ver else None)}
+
+def _directive_from_decision(db, cur, u, m, d, p=None):
+    """Создание поручения из решения совещания: задача M02 со всеми полями ТЗ §2.10."""
     guard(db, cur, u, "tasks", "create")
-    cur.execute("SELECT id FROM projects WHERE pm=%s AND status NOT IN ('Архивный','Отменён') ORDER BY code LIMIT 1", (d["resp"],))
-    r = cur.fetchone()
-    if not r:
-        cur.execute("SELECT id FROM projects WHERE status NOT IN ('Архивный','Отменён') ORDER BY code LIMIT 1")
+    p = p or {}
+    assignee = p.get("assignee") or d.get("resp")
+    if not assignee: raise RpcError("Не указан исполнитель поручения", "Поручение")
+    cur.execute("SELECT id FROM users WHERE id=%s AND NOT blocked", (assignee,))
+    if not cur.fetchone(): raise RpcError("Исполнитель не найден или заблокирован: %s" % assignee, "Поручение")
+    co = []
+    for uid_ in (p.get("coassignees") or [])[:10]:
+        if uid_ == assignee or uid_ in co: continue
+        cur.execute("SELECT id FROM users WHERE id=%s AND NOT blocked", (uid_,))
+        if not cur.fetchone(): raise RpcError("Соисполнитель не найден: %s" % uid_, "Поручение")
+        co.append(uid_)
+    due = p.get("due") or d.get("due")
+    if not due: raise RpcError("Не указан срок исполнения поручения", "Поручение")
+    check_date(due, "дата срока поручения")
+    priority = p.get("priority") or "Высокий"
+    if priority not in DIRECTIVE_PRIORITIES: raise RpcError("Недопустимый приоритет: %s" % priority, "Поручение")
+    pid = p.get("projectId")
+    if pid:
+        pr_ = get_req(db, cur, "project", pid)
+        if pr_["status"] in ("Архивный", "Отменён", "Завершён"):
+            raise RpcError("Проект закрыт для новых поручений: %s (%s)" % (pr_["code"], pr_["status"]), "Поручение")
+    else:
+        cur.execute("SELECT id FROM projects WHERE pm=%s AND status NOT IN ('Архивный','Отменён','Завершён') ORDER BY code LIMIT 1", (assignee,))
         r = cur.fetchone()
-    if not r: raise RpcError("Нет доступного проекта для поручения")
+        if not r:
+            cur.execute("SELECT id FROM projects WHERE status NOT IN ('Архивный','Отменён','Завершён') ORDER BY code LIMIT 1")
+            r = cur.fetchone()
+        if not r: raise RpcError("Нет доступного проекта для поручения")
+        pid = r["id"]
+    links = _directive_links(db, cur, m, d)
+    title = (p.get("title") or d["text"]).strip()[:300]
+    if not title: raise RpcError("Не заполнено наименование поручения", "Поручение")
+    src = (p.get("source") or "Решение №%s совещания %s от %s%s" % (
+        links["decisionN"], m["code"], _fd(m["date"]),
+        " · пункт %s повестки" % links["agendaN"] if links.get("agendaN") else ""))[:500]
+    desc = (p.get("desc") or ("Поручение по решению совещания %s.\nФормулировка решения: %s" % (m["code"], d["text"])))[:4000]
+    criteria = (p.get("criteria") or "")[:2000]
+    posted = today()
     tn = next_seq(db, cur, "task")
-    t = dict(id=uid("t"), code="З-%03d" % tn, projectId=r["id"], parent=None, title=d["text"][:300], type="directive",
-             status="Готова к выполнению", priority="Высокий", assignee=d["resp"], start=dISO(today()), end=d["due"],
-             planHours=8, progress=0, deps=[], comments=[], result="", blockReason="", createdAt=now_ms(),
-             createdBy=u["id"], meetingId=m["id"], riskId=None, desc="Поручение по решению совещания " + m["code"])
+    t = dict(id=uid("t"), code="З-%03d" % tn, projectId=pid, parent=None, title=title, type="directive",
+             status="Готова к выполнению", priority=priority, assignee=assignee, start=dISO(posted), end=due,
+             planHours=max(0, int(p.get("planHours", 8) or 0)), progress=0, deps=[], comments=[], result="",
+             blockReason="", createdAt=now_ms(), createdBy=u["id"], meetingId=m["id"], riskId=None, desc=desc,
+             directive=dict(source=src, criteria=criteria, coassignees=co, postedAt=now_ms(), postedBy=u["id"],
+                            postedDate=dISO(posted), dueHistory=[], acceptance=None, docs=[], factDate=None,
+                            comment="", **links))
     db.save_ent(cur, "task", t)
-    d["taskId"] = t["id"]
-    notify(db, cur, t["assignee"], "directive.assigned", "Поручение: %s" % t["title"],
+    cur.execute("INSERT INTO meeting_tasks(id,meeting_id,decision_id,task_id,ts,by_user) VALUES(%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (decision_id,task_id) DO NOTHING",
+                (uid("mt"), m["id"], d["id"], t["id"], now_ms(), u["id"]))
+    ids = dec_task_ids(d) + [t["id"]]
+    d["taskIds"] = ids
+    d["taskId"] = ids[0]
+    notify(db, cur, assignee, "directive.assigned", "Поручение: %s" % t["title"],
            "%s · по решению совещания %s · срок %s" % (t["code"], m["code"], _fd(t["end"])),
-           "Поручение", t["id"], dedupe="directive.assigned:%s:%s" % (t["assignee"], t["id"]))
-    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Создано поручение из решения совещания", "Совещание", m["id"], {"meeting": m["code"], "task": t["code"]})
+           "Поручение", t["id"], dedupe="directive.assigned:%s:%s" % (assignee, t["id"]))
+    for uid_ in co:
+        if uid_ != u["id"]:
+            notify(db, cur, uid_, "directive.assigned", "Соисполнитель поручения: %s" % t["title"],
+                   "%s · совещание %s · срок %s" % (t["code"], m["code"], _fd(t["end"])),
+                   "Поручение", t["id"], dedupe="directive.coassigned:%s:%s" % (uid_, t["id"]))
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Создано поручение из решения совещания", "Совещание", m["id"],
+             {"meeting": m["code"], "task": t["code"], "decision": links["decisionN"], "assignee": assignee,
+              "coassignees": co, "due": due, "source": src, "event": "MEETING_DIRECTIVE_CREATED"})
+    LOG.info("Поручение %s создано из решения №%s совещания %s (исполнитель %s, срок %s)",
+             t["code"], links["decisionN"], m["code"], assignee, due)
     return t
 
 @reg("meeting.decision.add")
 def h_meeting_decision(db, cur, u, p):
     m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
     req(p, "text", "resp", "due"); check_date(p["due"])
-    d = {"id": uid("md"), "text": p["text"][:1000], "resp": p["resp"], "due": p["due"], "taskId": None}
+    agenda_n = p.get("agendaN")
+    if agenda_n is not None:
+        agenda_n = int(agenda_n)
+        if not any(a["n"] == agenda_n for a in m["agenda"]): raise RpcError("Пункт повестки не найден: %s" % agenda_n)
+    d = {"id": uid("md"), "text": p["text"][:1000], "resp": p["resp"], "due": p["due"],
+         "taskId": None, "taskIds": [], "agendaN": agenda_n}
     m["decisions"].append(d)
     t = None
-    if p.get("createTask"): t = _directive_from_decision(db, cur, u, m, d)
+    if p.get("createTask"): t = _directive_from_decision(db, cur, u, m, d, p)
     db.save_ent(cur, "meeting", m)
     db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Зафиксировано решение", "Совещание", m["id"], {"code": m["code"]})
     return m, msg("Поручение создано в M02" if t else "Решение зафиксировано", "Контроль срока — в M07 и на дашборде" if t else "")
 
 @reg("meeting.decision.toTask")
 def h_meeting_decision_task(db, cur, u, p):
+    """Преобразование решения в поручение. Повторное создание — только с явным подтверждением (ТЗ §2.10)."""
     m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
     d = next((x for x in m["decisions"] if x["id"] == p["did"]), None)
     if not d: raise RpcError("Решение не найдено")
-    if d.get("taskId"): raise RpcError("Поручение по этому решению уже создано")
-    _directive_from_decision(db, cur, u, m, d)
+    existing = [x for x in dec_task_ids(d) if db.get_ent(cur, "task", x)]
+    if existing and not p.get("confirm"):
+        codes = ", ".join(db.get_ent(cur, "task", x)["code"] for x in existing)
+        raise RpcError("По этому решению уже создано поручение (%s). Создание ещё одного требует явного подтверждения."
+                       % codes, "409 · Требуется подтверждение", 409, "NEED_CONFIRM")
+    t = _directive_from_decision(db, cur, u, m, d, p)
     db.save_ent(cur, "meeting", m)
     return m, msg("Поручение создано в M02", "Контроль срока — в M07 и на дашборде")
 
+@reg("meeting.decision.update")
+def h_meeting_decision_update(db, cur, u, p):
+    """Правка решения не создаёт поручение повторно (ТЗ §2.10): связи сохраняются."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    d = next((x for x in m["decisions"] if x["id"] == p["did"]), None)
+    if not d: raise RpcError("Решение не найдено")
+    if "text" in p: d["text"] = (p["text"] or "")[:1000]
+    if "resp" in p: d["resp"] = p["resp"]
+    if "due" in p: check_date(p["due"]); d["due"] = p["due"]
+    if "agendaN" in p:
+        n = p["agendaN"]
+        if n is not None:
+            n = int(n)
+            if not any(a["n"] == n for a in m["agenda"]): raise RpcError("Пункт повестки не найден: %s" % n)
+        d["agendaN"] = n
+    d["taskIds"] = [x for x in dec_task_ids(d) if db.get_ent(cur, "task", x)]
+    d["taskId"] = d["taskIds"][0] if d["taskIds"] else None
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Решение изменено", "Совещание", m["id"],
+             {"code": m["code"], "decision": d["id"], "tasks": len(d["taskIds"]), "event": "MEETING_DECISION_UPDATED"})
+    return m, msg("Решение изменено", "Созданные поручения сохранены, повторное создание не выполняется")
 @reg("meeting.delete")
 def h_meeting_delete(db, cur, u, p):
     m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "delete", m)
@@ -1576,7 +1729,7 @@ def h_admin_reset(db, cur, u, p):
     guard(db, cur, u, "admin", "delete")
     cur.execute("SELECT token, user_id, created FROM sessions")
     keep_sessions = cur.fetchall()
-    for tbl in ("notifications","reminders","doc_versions","docs","calcs","time_entries","tasks","risks","meetings","projects","cal_events","reports","events","settings","users"):
+    for tbl in ("notifications","reminders","meeting_tasks","doc_versions","docs","calcs","time_entries","tasks","risks","meetings","projects","cal_events","reports","events","settings","users"):
         cur.execute("DELETE FROM " + tbl)
     cur.execute("DELETE FROM sessions WHERE user_id NOT IN (SELECT id FROM users)")
     conn = cur.connection
@@ -2024,23 +2177,34 @@ def meeting_protocol_doc(db, cur, u, m):
         d.p("Материалы обсуждения не зарегистрированы.")
     d.h1("5. Принятые решения")
     if decs:
-        d.table(["№", "Решение", "Ответственный", "Срок", "Поручение"],
+        d.table(["№", "Решение", "Ответственный", "Срок", "Поручения"],
                 [[i + 1, x.get("text", ""), _uname(db, cur, x.get("resp")), _fd(x.get("due")),
-                  (db.get_ent(cur, "task", x["taskId"]) or {}).get("code", "") if x.get("taskId") else "—"]
+                  ", ".join((db.get_ent(cur, "task", tid) or {}).get("code", "") for tid in dec_task_ids(x)) or "—"]
                  for i, x in enumerate(decs)],
                 widths=[0.5, 3.6, 1.6, 1, 0.9], title="Реестр решений")
     else: d.p("Решения не зарегистрированы.")
     d.h1("6. Контроль исполнения")
     rows = []
     for x in decs:
-        t = db.get_ent(cur, "task", x["taskId"]) if x.get("taskId") else None
-        if t:
-            over = diffD(dISO(today()), t["end"]) if t["end"] < dISO(today()) and t["status"] not in ("Завершена", "Отменена", "Проверена") else 0
-            rows.append([t["code"], t["title"], _uname(db, cur, t["assignee"]), _fd(t["end"]), t["status"], t["progress"], over])
+        ts = [db.get_ent(cur, "task", tid) for tid in dec_task_ids(x)]
+        ts = [t for t in ts if t]
+        if ts:
+            for t in ts:
+                dr = t.get("directive") or {}
+                over = diffD(dISO(today()), t["end"]) if t["end"] < dISO(today()) and t["status"] not in DONE_ST + ["Отменена"] else 0
+                rows.append([t["code"], t["title"], _uname(db, cur, t["assignee"]),
+                             ", ".join(_uname(db, cur, c) for c in dr.get("coassignees") or []) or "—",
+                             _fd(t["end"]), t["status"], t["progress"], over])
         else:
-            rows.append(["—", x.get("text", ""), _uname(db, cur, x.get("resp")), _fd(x.get("due")), "поручение не создано", 0, 0])
-    d.table(["Поручение", "Содержание", "Исполнитель", "Срок", "Состояние", "Прогресс, %", "Просрочка, дн"], rows,
-            widths=[0.9, 3, 1.5, 0.9, 1.3, 0.8, 0.9], aligns=[None, None, None, None, None, "right", "right"])
+            rows.append(["—", x.get("text", ""), _uname(db, cur, x.get("resp")), "—", _fd(x.get("due")), "поручение не создано", 0, 0])
+    d.table(["Поручение", "Содержание", "Исполнитель", "Соисполнители", "Срок", "Состояние", "Прогресс, %", "Просрочка, дн"], rows,
+            widths=[0.8, 2.6, 1.3, 1.3, 0.8, 1.2, 0.7, 0.8], aligns=[None, None, None, None, None, None, "right", "right"])
+    crit = [[(db.get_ent(cur, "task", tid) or {}).get("code", ""),
+             ((db.get_ent(cur, "task", tid) or {}).get("directive") or {}).get("criteria", "") or "—"]
+            for x in decs for tid in dec_task_ids(x)]
+    if crit:
+        d.h2("Критерии завершения поручений")
+        d.table(["Поручение", "Критерии завершения"], crit, widths=[1, 5.5])
     d.h1("7. Подписи")
     d.signatures([("Председатель совещания", _uname(db, cur, m["chair"])),
                   ("Секретарь совещания", _uname(db, cur, m["secretary"]))])
@@ -2882,7 +3046,7 @@ def read_file_bytes(db, cur, user, doc_id, v, fmt=None):
 
 # ---------------- Резервное копирование (M14) ----------------
 BACKUP_TABLES = ["users","projects","meetings","risks","tasks","docs","doc_versions","calcs","time_entries","cal_events","reports","events","settings",
-                 "notifications","reminders"]
+                 "notifications","reminders","meeting_tasks"]
 # копии прежних версий (13 таблиц) восстанавливаются: новые таблицы считаются пустыми
 BACKUP_REQUIRED = ["users","projects","meetings","risks","tasks","docs","doc_versions","calcs","time_entries","cal_events","reports","events","settings"]
 
@@ -2935,7 +3099,7 @@ def restore_backup(db, user, data, token=None):
                         else: rest.append(row)
                     if len(rest) == len(pending): raise RpcError("Циклическая иерархия задач в копии", "Восстановление")
                     pending = rest; guard_n += 1
-                for t in ["docs","doc_versions","calcs","time_entries","cal_events","reports","events","settings","reminders","notifications"]:
+                for t in ["meeting_tasks","docs","doc_versions","calcs","time_entries","cal_events","reports","events","settings","reminders","notifications"]:
                     for row in tables[t]: ins(t, row)
                 cur.execute("UPDATE meta SET v=(v::bigint+1)::text WHERE k='rev'")
                 LOG.warning("БД ВОССТАНОВЛЕНА из копии пользователем %s (копия от %s)", user.get("login"), data.get("ts"))
@@ -3358,7 +3522,7 @@ def main():
 
 # ================= Установка и настройка через EXE (ТЗ §7) =================
 CONFIG_PATH = os.path.join(BASE_DIR, "supip.ini")
-SCHEMA_VERSION = 3   # 2 — уведомления (v1.4.0), 3 — маршрут согласования протокола (v1.5.0)
+SCHEMA_VERSION = 4   # 2 — уведомления (v1.4.0), 3 — маршрут протокола (v1.5.0), 4 — поручения (v1.6.0)
 MIGRATIONS = {   # {версия: [SQL, ...]} — применяется по порядку при старте/обновлении
     2: [  # v1.4.0: центр уведомлений и напоминаний
         """CREATE TABLE IF NOT EXISTS notifications(
@@ -3376,6 +3540,15 @@ MIGRATIONS = {   # {версия: [SQL, ...]} — применяется по п
     ],
     3: [  # v1.5.0: маршрут согласования и версии протокола (ТЗ M16 §2.9)
         "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS protocol JSONB NOT NULL DEFAULT '{}'",
+    ],
+    4: [  # v1.6.0: поручения совещаний (ТЗ M16 §2.10, техпроект §4.1)
+        "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS directive JSONB NOT NULL DEFAULT '{}'",
+        """CREATE TABLE IF NOT EXISTS meeting_tasks(
+             id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+             decision_id TEXT NOT NULL, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             ts BIGINT NOT NULL, by_user TEXT, UNIQUE(decision_id, task_id))""",
+        "CREATE INDEX IF NOT EXISTS ix_meeting_tasks_m ON meeting_tasks(meeting_id)",
+        "CREATE INDEX IF NOT EXISTS ix_meeting_tasks_t ON meeting_tasks(task_id)",
     ],
 }
 

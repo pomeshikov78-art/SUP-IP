@@ -741,8 +741,10 @@ async function rpc(action, payload){
   j = await r.json();
  }catch(e){ clog('error','Сервер недоступен при '+action+': '+e.message); toast('err','Сервер недоступен','Проверьте подключение к серверу СУП-ИП: '+e.message); return false; }
  if(j.state){ DB=j.state; if(DB.me) App.user=DB.users.find(u=>u.id===DB.me)||App.user; }
+ App.lastRpcError=null;
  if(!j.ok){
   const e=j.error||{};
+  App.lastRpcError=e;
   clog('warn','Операция '+action+' отклонена: '+(e.code||'')+' '+(e.message||''));
   if(r.status===401){ stopPolling(); App.user=null; renderLogin(); toast('info','Требуется вход', e.message||'Сессия завершена'); return false; }
   toast('err', e.title||'Операция отклонена', e.message||'');
@@ -1241,7 +1243,7 @@ App.about=function(){
   ['Права проверяются ядром','Войдите как Наблюдатель и попробуйте изменить задачу: кнопки скрыты, а прямой вызов операции отклоняется ядром с событием SECURITY в журнале M15.','journal'],
   ['Управление отклонениями','M07 показывает просрочки и сдвиги относительно базового плана M04. Создайте корректирующее поручение — оно станет задачей M02 с контролем срока.','control'],
   ['Инженерный расчёт → Excel','M10: выберите модель «Бюджет радиолинии», выполните расчёт по формуле методики, проверьте результат и выгрузите протокол в Excel (CSV).','calcs'],
-  ['Совещание → поручения','M16: откройте проведённое совещание, посмотрите решения и созданные из них поручения; статус исполнения виден в M07 и на дашборде.','meetings'],
+  ['Совещание → поручения','M16 §2.10: на вкладке «Решения» нажмите «В поручение» — задача M02 создаётся с исполнителем, соисполнителями, сроком, критериями завершения и источником; из карточки задачи блок «Основание поручения» возвращает к совещанию и протоколу.','meetings'],
   ['Протокол: маршрут и редакции','M16 §2.9: вкладка «Протокол» — настройте маршрут согласования, направьте протокол, дайте результат или замечания, утвердите редакцию (DOCX+PDF в M09) и опубликуйте. Изменение утверждённого протокола — только через новую редакцию с сохранением истории.','meetings'],
   ['Центр уведомлений','Нажмите колокольчик в шапке: доставленные сервером приглашения и напоминания, переход к объекту, «Прочитать все» и настройка типов. Интервалы напоминаний — в карточке совещания и события календаря.','meetings'],
   ['Конструктор дашборда','M17: включите/выключите виджеты и измените порядок — главный дашборд M00 перестроится. Настройки персональны для пользователя.','builder']
@@ -1252,7 +1254,7 @@ App.about=function(){
   '<h4 class="mb8">Трёхуровневая архитектура (ТЗ §2)</h4>'+arch+
   '<h4 style="margin:16px 0 8px">Ключевые принципы, которые можно проверить</h4>'+
   '<div class="grid g2 small" style="gap:6px 18px">'+
-   ['Единая БД: канбан, гант, календарь и дашборд не хранят копий — только представления данных M01/M02.','Каждая мутация проходит через API ядра: проверка прав → операция → аудит → сохранение → обновление всех представлений.','Просрочка — индикатор, а не статус (ТЗ M02 §1.4). Статусные переходы контролируются workflow.','WIP-лимит колонки «В работе» настраивается в M14 и проверяется при перетаскивании.','Базовый план хранится отдельно: сдвиг сроков на ганте не меняет утверждённый базовый план.','Оценка риска = P×I (1–5); история оценок сохраняется, остаточный риск считается после мероприятий.','Документы версионируются; устаревшие версии остаются доступными.','Уведомления и напоминания доставляет сервер: планировщик, защита от повторной доставки, персональные настройки типов.','Протокол совещания проходит настраиваемый маршрут согласования; утверждённый протокол хранится отдельной редакцией со снимком содержания.','Автономность: никаких внешних ресурсов и CDN — сервер и клиенты работают в изолированной локальной сети.'].map(s=>'<div class="flex" style="align-items:flex-start;gap:7px">'+ic('check','')+'<span>'+s+'</span></div>').join('')+
+   ['Единая БД: канбан, гант, календарь и дашборд не хранят копий — только представления данных M01/M02.','Каждая мутация проходит через API ядра: проверка прав → операция → аудит → сохранение → обновление всех представлений.','Просрочка — индикатор, а не статус (ТЗ M02 §1.4). Статусные переходы контролируются workflow.','WIP-лимит колонки «В работе» настраивается в M14 и проверяется при перетаскивании.','Базовый план хранится отдельно: сдвиг сроков на ганте не меняет утверждённый базовый план.','Оценка риска = P×I (1–5); история оценок сохраняется, остаточный риск считается после мероприятий.','Документы версионируются; устаревшие версии остаются доступными.','Уведомления и напоминания доставляет сервер: планировщик, защита от повторной доставки, персональные настройки типов.','Протокол совещания проходит настраиваемый маршрут согласования; утверждённый протокол хранится отдельной редакцией со снимком содержания.','Поручения — задачи единой системы M02: связь решения и задачи хранится отдельно, одно решение может порождать несколько поручений.','Автономность: никаких внешних ресурсов и CDN — сервер и клиенты работают в изолированной локальной сети.'].map(s=>'<div class="flex" style="align-items:flex-start;gap:7px">'+ic('check','')+'<span>'+s+'</span></div>').join('')+
   '</div>'+
   '<h4 style="margin:16px 0 8px">Демонстрационные сценарии (нажмите, чтобы перейти)</h4>'+
   scenarios.map((s,i)=>'<div class="scenario" onclick="App.closeModal(true);nav(\''+s[2]+'\')"><span class="sn">'+(i+1)+'</span><div><b>'+s[0]+'</b><p>'+s[1]+'</p></div>'+ic('chevR')+'</div>').join('')+
@@ -1635,6 +1637,7 @@ function openTask(tid){
    '<div class="mt8">'+progressBar(DONE_ST.includes(t.status)?100:t.progress)+'</div>'+
    (editable&&t.status==='В работе'?'<div class="flex mt8"><span class="small mut">Прогресс:</span><input type="range" min="0" max="100" step="5" value="'+t.progress+'" style="flex:1;accent-color:var(--acc)" onchange="App.taskProgress(\''+tid+'\',this.value)"><b class="small">'+t.progress+'%</b></div>':'')+
   '</div></div>'+
+  (t.type==='directive'&&dirOf(t).meetingId?directiveBasis(t):'')+
   (t.desc?'<div class="card mb14"><div class="ch">'+ic('info')+'Описание</div><div class="cb small">'+esc(t.desc)+'</div></div>':'')+
   (t.status==='Заблокирована'&&t.blockReason?'<div class="help-note" style="background:var(--err-bg);border-color:#fecaca;color:#991b1b">'+ic('blocked')+'<div><b>Причина блокировки:</b> '+esc(t.blockReason)+'</div></div>':'')+
   (t.result?'<div class="card mb14"><div class="ch">'+ic('check')+'Результат выполнения</div><div class="cb small">'+esc(t.result)+'</div></div>':'')+
@@ -2846,8 +2849,8 @@ function meetMinutes(m){
  return '<h1>ПРОТОКОЛ № '+esc(m.code.replace('СОВ-',''))+'</h1><div class="rmeta">'+esc(m.title)+' · '+esc(m.type)+' · '+fmtD(m.date)+' '+esc(m.time)+' · СУП-ИП</div>'+
  '<h2>Присутствовали</h2><p>Председатель: '+esc(U(m.chair).name)+'. Секретарь: '+esc(U(m.secretary).name)+'.<br>Участники: '+m.attendees.map(u=>esc(U(u).name)).join(', ')+'.</p>'+
  '<h2>Повестка дня</h2>'+(m.agenda.length?rptTable(['№','Вопрос','Докладчик'],m.agenda.map(a=>[a.n,a.title,U(a.reporter).name])):'<p>Повестка не сформирована.</p>')+
- '<h2>Принятые решения</h2>'+(m.decisions.length?rptTable(['№','Решение','Ответственный','Срок','Поручение'],m.decisions.map((d,i)=>[i+1,d.text,U(d.resp).name,fmtD(d.due),d.taskId?(T_(d.taskId)||{}).code||'—':'не создано'])):'<p>Решения не зарегистрированы.</p>')+
- '<h2>Контроль исполнения</h2>'+(dirs.length?rptTable(['Поручение','Статус','Срок','Просрочка'],dirs.map(t=>[t.title,t.status,fmtD(t.end),taskOverdue(t)?overDays(t)+' дн':'—'])):'<p>Поручения не создавались.</p>')+
+ '<h2>Принятые решения</h2>'+(m.decisions.length?rptTable(['№','Решение','Ответственный','Срок','Пункт повестки','Поручения'],m.decisions.map((d,i)=>[i+1,d.text,U(d.resp).name,fmtD(d.due),d.agendaN?'№'+d.agendaN:'—',decTasks(d).map(t=>t.code).join(', ')||'не создано'])):'<p>Решения не зарегистрированы.</p>')+
+ '<h2>Контроль исполнения</h2>'+(dirs.length?rptTable(['Поручение','Исполнитель','Соисполнители','Срок','Статус','Выполнение, %','Просрочка','Критерии завершения'],dirs.map(t=>{const dr=dirOf(t);return [t.code+' · '+t.title,U(t.assignee).name,dr.coassignees.map(u=>U(u).name).join(', ')||'—',fmtD(t.end),t.status,DONE_ST.includes(t.status)?100:t.progress,taskOverdue(t)?overDays(t)+' дн':'—',dr.criteria||'—'];})):'<p>Поручения не создавались.</p>')+
  '<h2>Согласование и утверждение</h2>'+rptTable(['Показатель','Значение'],[
    ['Статус согласования',protOf(m).status],
    ['Номер версии протокола',protOf(m).version?String(protOf(m).version):'не утверждён'],
@@ -2857,6 +2860,89 @@ function meetMinutes(m){
    ['Утверждающее лицо',protOf(m).approvedBy?U(protOf(m).approvedBy).name:'—']])+
  '<div class="sig"><div>Председатель / '+esc(U(m.chair).name)+'</div><div>Секретарь / '+esc(U(m.secretary).name)+'</div></div>';
 }
+/* ---------- M16 §2.10: поручения из решений совещаний ---------- */
+const decTasks=d=>{
+ const ids=(d&&Array.isArray(d.taskIds)&&d.taskIds.length)?d.taskIds:(d&&d.taskId?[d.taskId]:[]);
+ return ids.map(id=>T_(id)).filter(Boolean);
+};
+const dirOf=t=>Object.assign({source:'',criteria:'',coassignees:[],postedAt:null,postedBy:null,postedDate:null,
+ meetingId:null,meetingCode:'',decisionId:null,decisionN:null,agendaN:null,protocolV:null,protocolDoc:null},(t&&t.directive)||{});
+function directiveBasis(t){
+ const dr=dirOf(t), m=dr.meetingId?MEET(dr.meetingId):null;
+ const d=m?(m.decisions||[]).find(x=>x.id===dr.decisionId):null;
+ const co=(dr.coassignees||[]).map(u=>U(u));
+ return '<div class="card mb14" id="dir-basis"><div class="ch">'+ic('meeting')+'Основание поручения (ТЗ §2.10)'+
+  '<span class="r"><span class="chip">'+esc(dr.meetingCode||(m||{}).code||'—')+'</span></span></div><div class="cb">'+
+  '<div class="stat-line"><span>Совещание</span><b class="link" onclick="openMeeting(\''+dr.meetingId+'\')">'+esc(m?(m.code+' · '+m.title):(dr.meetingCode||'—'))+'</b></div>'+
+  '<div class="stat-line"><span>Решение</span><b class="link" onclick="App.f.meetTab=\'dec\';openMeeting(\''+dr.meetingId+'\')">'+(dr.decisionN?'№'+dr.decisionN:'—')+'</b></div>'+
+  (d?'<div class="small mut" style="margin:-4px 0 8px">'+esc(d.text)+'</div>':'')+
+  '<div class="stat-line"><span>Пункт повестки</span><b>'+(dr.agendaN?'№'+dr.agendaN:'—')+'</b></div>'+
+  '<div class="stat-line"><span>Протокол</span><b>'+(dr.protocolDoc?'<span class="link" onclick="openDoc(\''+dr.protocolDoc.docId+'\')">'+esc(dr.protocolDoc.docCode)+' v'+dr.protocolDoc.docV+'</span> · редакция '+dr.protocolV:(dr.protocolV?'редакция '+dr.protocolV:'не утверждён'))+'</b></div>'+
+  '<div class="stat-line"><span>Дата постановки</span><b>'+(dr.postedDate?fmtD(dr.postedDate):(dr.postedAt?fmtDT(dr.postedAt):'—'))+(dr.postedBy?' · '+esc(U(dr.postedBy).name):'')+'</b></div>'+
+  '<div class="stat-line"><span>Соисполнители</span><b>'+(co.length?co.map(u=>esc(u.name)).join(', '):'—')+'</b></div>'+
+  '<div class="stat-line"><span>Источник поручения</span><b class="small">'+esc(dr.source||'—')+'</b></div>'+
+  (dr.criteria?'<div class="mt8"><div class="small mut">Критерии завершения</div><div class="small">'+esc(dr.criteria)+'</div></div>':'')+
+  '<div class="help-note mt8">'+ic('info')+'<div>Поручение — обычная задача M02: статус, прогресс и трудозатраты ведутся в единой системе задач. Из задачи доступен переход к решению и протоколу совещания.</div></div>'+
+ '</div></div>';
+}
+App.directiveModal=function(mid,did){
+ if(!guard('tasks','create'))return;
+ const m=MEET(mid); if(!m)return;
+ const i=(m.decisions||[]).findIndex(x=>x.id===did), d=m.decisions[i]; if(!d)return;
+ const pr=protOf(m), projects=DB.projects.filter(p=>!['Архивный','Отменён','Завершён'].includes(p.status));
+ const defProj=(projects.find(p=>p.pm===d.resp)||projects[0]||{}).id||'';
+ const src='Решение №'+(i+1)+' совещания '+m.code+' от '+fmtD(m.date)+(d.agendaN?' · пункт '+d.agendaN+' повестки':'');
+ openModal(mh('Поручение из решения совещания','tasks')+'<div class="mb form">'+
+  '<div class="help-note mb8">'+ic('meeting')+'<div><b>Основание:</b> '+esc(m.code)+' · решение №'+(i+1)+
+   (d.agendaN?' · пункт '+d.agendaN+' повестки':'')+' · протокол: '+(pr.version?'редакция '+pr.version:'не утверждён')+
+   '<br>Поручение создаётся как задача M02 (единая система задач, ТЗ §2.10).</div></div>'+
+  field('Наименование поручения',inp('dr-title',d.text),true)+
+  field('Описание',ta('dr-desc','Поручение по решению совещания '+m.code+'.\nФормулировка решения: '+d.text,3))+
+  '<div class="row">'+field('Проект',sel('dr-proj',projects.map(p=>[p.id,p.code+' · '+p.name.slice(0,30)]),defProj),true)+
+   field('Исполнитель',sel('dr-as',DB.users.filter(u=>!u.blocked).map(u=>[u.id,u.name]),d.resp),true)+'</div>'+
+  field('Соисполнители','<div class="flexw" style="border:1.5px solid var(--line2);border-radius:8px;padding:9px 11px">'+
+   DB.users.filter(u=>!u.blocked).map(u=>'<label class="checkline"><input type="checkbox" class="dr-co" value="'+u.id+'" onchange="App.markDirty()">'+esc(u.name)+'</label>').join('')+'</div>')+
+  '<div class="row3">'+field('Дата постановки',inp('dr-posted',dISO(TODAY),'date','readonly'),false,'фиксируется сервером')+
+   field('Срок исполнения',inp('dr-due',d.due,'date'),true)+
+   field('Приоритет',sel('dr-pr',Object.keys(PRIO),'Высокий'),true)+'</div>'+
+  field('Критерии завершения',ta('dr-crit','',2),false,'что считается исполнением поручения')+
+  field('Источник поручения',inp('dr-src',src),false,'сохраняется в карточке задачи')+
+  (decTasks(d).length?'<div class="help-note" style="background:var(--warn-bg);border-color:#fde68a;color:#92400e">'+ic('alert')+'<div>По этому решению уже создано поручение: '+decTasks(d).map(t=>t.code).join(', ')+'. Повторное создание потребует явного подтверждения.</div></div>':'')+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button>'+
+  '<button class="btn pri" id="dr-save" onclick="App.directiveSave(\''+mid+'\',\''+did+'\')">'+ic('save')+' Создать поручение</button></div>',{wide:true});
+};
+App.directiveSave=function(mid,did,confirmed){
+ if(!requireFields(['dr-title','dr-due']))return;
+ const co=[...document.querySelectorAll('.dr-co:checked')].map(x=>x.value).filter(x=>x!==val('dr-as'));
+ const payload={id:mid,did,title:val('dr-title'),desc:val('dr-desc'),projectId:val('dr-proj'),assignee:val('dr-as'),
+  coassignees:co,due:val('dr-due'),priority:val('dr-pr'),criteria:val('dr-crit'),source:val('dr-src')};
+ if(confirmed)payload.confirm=true;
+ rpc('meeting.decision.toTask',payload).then(r=>{
+  if(r){ App.closeModal(true); App.f.meetTab='dec'; openMeeting(mid); return; }
+  const e=App.lastRpcError||{};
+  if(e.code==='NEED_CONFIRM'&&!confirmed&&confirm(e.message+'\n\nСоздать ещё одно поручение по этому решению?'))
+   App.directiveSave(mid,did,true);
+ });
+};
+App.decisionEdit=function(mid,did){
+ const m=MEET(mid); if(!m||!guard('meetings','edit',m))return;
+ const d=(m.decisions||[]).find(x=>x.id===did); if(!d)return;
+ openModal(mh('Решение совещания','check')+'<div class="mb form">'+
+  '<div class="small mut mb8">Правка решения не создаёт поручение повторно: созданные задачи сохраняются (ТЗ §2.10).</div>'+
+  field('Формулировка решения',ta('de-text',d.text,3),true)+
+  '<div class="row">'+field('Ответственный',sel('de-resp',DB.users.map(u=>[u.id,u.name]),d.resp),true)+
+   field('Срок исполнения',inp('de-due',d.due,'date'),true)+'</div>'+
+  field('Пункт повестки',sel('de-ag',[['','не привязан'],...m.agenda.map(a=>[a.n,'№'+a.n+' · '+a.title])],d.agendaN||''))+
+  (decTasks(d).length?'<div class="small mut">Созданные поручения: '+decTasks(d).map(t=>t.code).join(', ')+'</div>':'')+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button>'+
+  '<button class="btn pri" onclick="App.decisionEditSave(\''+mid+'\',\''+did+'\')">Сохранить</button></div>');
+};
+App.decisionEditSave=function(mid,did){
+ if(!requireFields(['de-text','de-due']))return;
+ const ag=val('de-ag');
+ rpc('meeting.decision.update',{id:mid,did,text:val('de-text'),resp:val('de-resp'),due:val('de-due'),
+  agendaN:ag?parseInt(ag,10):null}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
 /* ---------- M16 §2.9: маршрут согласования и версии протокола ---------- */
 const PR_ST={'Подготовка':['#64748b','#f1f5f9'],'Черновик':['#2563eb','#dbeafe'],
  'Направлен на согласование':['#d97706','#fef3c7'],'На доработке':['#dc2626','#fee2e2'],
@@ -3033,14 +3119,23 @@ function openMeeting(mid){
  if(tab==='dec'){
   body=(editable?'<div class="flexw mb8"><span class="small mut">Решение фиксируется с ответственным и сроком; поручение создаётся в M02.</span><span class="spacer"></span><button class="btn sm pri" onclick="App.decisionAdd(\''+mid+'\')">'+ic('plus')+' Решение</button></div>':'')+
   (m.decisions.length?m.decisions.map((d,i)=>{
-   const t=d.taskId?T_(d.taskId):null;
-   return '<div class="card mb8"><div class="cb"><div class="flex" style="align-items:flex-start"><span class="chip">№'+(i+1)+'</span><div style="flex:1"><b class="small">'+esc(d.text)+'</b><div class="small mut mt8">Ответственный: '+esc(U(d.resp).name)+' · срок '+fmtD(d.due)+'</div></div>'+
-    (t?'<span class="link small nowrap" onclick="openTask(\''+t.id+'\')">'+t.code+' '+stBadge(t.status)+'</span>':(can('tasks','create')?'<button class="btn sm pri" onclick="App.decisionToTask(\''+mid+'\',\''+d.id+'\')">'+ic('tasks')+' В поручение</button>':''))+'</div>'+
-    (t?('<div class="mt8">'+overdueMark(t)+'</div>'):'')+'</div></div>';
+   const ts=decTasks(d);
+   return '<div class="card mb8"><div class="cb"><div class="flex" style="align-items:flex-start"><span class="chip">№'+(i+1)+'</span><div style="flex:1"><b class="small">'+esc(d.text)+'</b>'+
+    '<div class="small mut mt8">Ответственный: '+esc(U(d.resp).name)+' · срок '+fmtD(d.due)+(d.agendaN?' · пункт повестки №'+d.agendaN:'')+'</div></div>'+
+    '<div class="flexw" style="justify-content:flex-end">'+
+    (can('tasks','create')?'<button class="btn sm '+(ts.length?'':'pri')+'" onclick="App.directiveModal(\''+mid+'\',\''+d.id+'\')">'+ic('tasks')+' '+(ts.length?'Ещё поручение':'В поручение')+'</button>':'')+
+    (editable?'<button class="btn sm" title="Изменить решение" onclick="App.decisionEdit(\''+mid+'\',\''+d.id+'\')">'+ic('edit')+'</button>':'')+'</div></div>'+
+    (ts.length?'<div class="mt8 flexw">'+ts.map(t=>'<span class="dep-chip" onclick="openTask(\''+t.id+'\')">'+t.code+' · '+esc(t.title.slice(0,40))+' '+stBadge(t.status)+'</span>').join('')+'</div>'+
+      '<div class="mt8">'+ts.map(t=>overdueMark(t)).join(' ')+'</div>':'<div class="small mut mt8">Поручение не создано</div>')+
+    '</div></div>';
   }).join(''):emptyBlock('Решений нет','Зафиксируйте решения по вопросам повестки','check'));
  }
  if(tab==='dir'){
-  body=dirs.length?'<div class="list-rows">'+dirs.map(t=>'<div class="lr" onclick="openTask(\''+t.id+'\')">'+avatar(U(t.assignee),'sm')+'<div class="lt"><b>'+esc(t.title)+'</b><small>'+t.code+' · срок '+fmtD(t.end)+'</small></div>'+stBadge(t.status)+overdueMark(t)+'</div>').join('')+'</div><div class="small mut mt8">Исполнено: '+dirs.filter(t=>DONE_ST.includes(t.status)).length+' из '+dirs.length+'</div>':emptyBlock('Поручений нет','Создайте поручения из решений на вкладке «Решения»','tasks');
+  body=dirs.length?'<div class="list-rows">'+dirs.map(t=>{const dr=dirOf(t);
+   return '<div class="lr" onclick="openTask(\''+t.id+'\')">'+avatar(U(t.assignee),'sm')+'<div class="lt"><b>'+esc(t.title)+'</b>'+
+    '<small>'+t.code+' · срок '+fmtD(t.end)+(dr.coassignees.length?' · соисполнители: '+esc(dr.coassignees.map(u=>U(u).name).join(', ')):'')+'</small>'+
+    (dr.criteria?'<small>критерии: '+esc(dr.criteria)+'</small>':'')+'</div>'+stBadge(t.status)+overdueMark(t)+'</div>';}).join('')+'</div>'+
+   '<div class="small mut mt8">Исполнено: '+dirs.filter(t=>DONE_ST.includes(t.status)).length+' из '+dirs.length+' · поручения ведутся как задачи M02 (ТЗ §2.10)</div>':emptyBlock('Поручений нет','Создайте поручения из решений на вкладке «Решения»','tasks');
  }
  if(tab==='prot'){
   body='<div class="flexw mb8"><button class="btn" onclick="App.meetPrint(\''+mid+'\')">'+ic('print')+' Печать</button><button class="btn" onclick="App.meetDownload(\''+mid+'\')">'+ic('download')+' HTML</button>'+docBtns('meeting',mid)+(can('meetings','export')&&can('docs','create')?'<button class="btn pri" onclick="App.meetProtocol(\''+mid+'\')">'+ic('save')+' Протокол в M09 (DOCX+PDF)</button>':'')+'<span class="spacer"></span>'+
@@ -3075,19 +3170,19 @@ App.agendaSave=function(mid){
  rpc('meeting.agenda.add',{id:mid,title:val('ag-title'),reporter:val('ag-rep')}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
 };
 App.decisionAdd=function(mid){
+ const m=MEET(mid)||{agenda:[]};
  openModal(mh('Решение совещания','check')+'<div class="mb form">'+field('Формулировка решения',ta('de-text','',3),true)+
  '<div class="row">'+field('Ответственный',sel('de-resp',DB.users.map(u=>[u.id,u.name]),'u5'),true)+field('Срок исполнения',inp('de-due',D(7),'date'),true)+'</div>'+
+ field('Пункт повестки',sel('de-ag',[['','не привязан'],...m.agenda.map(a=>[a.n,'№'+a.n+' · '+a.title])],''))+
  '<label class="checkline"><input type="checkbox" id="de-task" checked> Сразу создать поручение (задачу M02)</label>'+
  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" onclick="App.decisionSave(\''+mid+'\')">Зафиксировать</button></div>');
 };
 App.decisionSave=function(mid){
  if(!requireFields(['de-text','de-due']))return;
- const mkTask=document.getElementById('de-task').checked;
- rpc('meeting.decision.add',{id:mid,text:val('de-text'),resp:val('de-resp'),due:val('de-due'),createTask:mkTask}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+ const mkTask=document.getElementById('de-task').checked, ag=val('de-ag');
+ rpc('meeting.decision.add',{id:mid,text:val('de-text'),resp:val('de-resp'),due:val('de-due'),createTask:mkTask,agendaN:ag?parseInt(ag,10):null}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
 };
-App.decisionToTask=function(mid,did){
- rpc('meeting.decision.toTask',{id:mid,did}).then(r=>{if(r)openMeeting(mid);});
-};
+App.decisionToTask=function(mid,did){ App.directiveModal(mid,did); };
 App.meetProtocol=function(mid){
  if(!guard('meetings','export'))return;
  rpc('meeting.protocol',{id:mid,formats:['docx','pdf']}).then(r=>{

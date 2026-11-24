@@ -256,7 +256,7 @@ def main():
           any(e["details"].get("event") == "calendar.reminder.created" for e in evs if isinstance(e.get("details"), dict)))
     c, backup = adm.req("GET", "/api/backup", raw=True)
     backup = json.loads(backup)
-    check("копия содержит 15 таблиц", len(backup["tables"]) == 15, len(backup["tables"]))
+    check("копия содержит 16 таблиц", len(backup["tables"]) == 16, len(backup["tables"]))
     check("уведомления и напоминания в копии", "notifications" in backup["tables"] and "reminders" in backup["tables"])
     old = dict(backup); old["tables"] = {k: v for k, v in backup["tables"].items() if k not in ("notifications", "reminders")}
     c, j = adm.req("POST", "/api/restore", old)

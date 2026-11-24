@@ -321,6 +321,75 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
  ok('режим «Протоколы» в реестре совещаний', (await page.evaluate(()=>document.getElementById('view').textContent)).includes('E2E протокол согласования'));
  await page.screenshot({path:'/tmp/e2e/shot_protocol_versions.png'});
 
+ console.log('== M16 §2.10: поручения из решений совещаний ==');
+ const drRes = await rpcAs(admCookie,'meeting.create',{title:'E2E поручения из решений',type:'Оперативное',
+  date:new Date().toISOString().slice(0,10),time:'08:00',chair:'u2',secretary:'u3',attendees:['u5','u6']});
+ const dmid=(drRes.result||{}).id;
+ await rpcAs(admCookie,'meeting.agenda.add',{id:dmid,title:'Вопрос E2E по поручениям',reporter:'u3'});
+ const decRes = await rpcAs(admCookie,'meeting.decision.add',{id:dmid,text:'E2E решение для поручения',resp:'u5',
+  due:new Date(Date.now()+6*864e5).toISOString().slice(0,10),agendaN:1});
+ const ddid=((decRes.result||{}).decisions||[{}])[0].id;
+ ok('решение зарегистрировано вторым пользователем', !!ddid);
+ await page.evaluate(()=>pollState());
+ await sleep(400);
+ await page.evaluate(m=>{App.f.meetTab='dec';openMeeting(m);},dmid);
+ await sleep(300);
+ ok('кнопка «В поручение» в решении', (await page.evaluate(()=>document.getElementById('drawer-root').textContent)).includes('В поручение'));
+ await page.evaluate((m,d)=>App.directiveModal(m,d),dmid,ddid);
+ await sleep(300);
+ const drTxt = await page.evaluate(()=>document.getElementById('modal-root').textContent);
+ ok('форма поручения: поля ТЗ §2.10', ['Наименование','Описание','Проект','Исполнитель','Соисполнители','Дата постановки','Срок исполнения','Приоритет','Критерии завершения','Источник поручения'].every(x=>drTxt.includes(x)));
+ ok('исполнитель и проект предзаполнены', await page.evaluate(()=>val('dr-as')==='u5'&&!!val('dr-proj')));
+ ok('источник подставлен из решения', await page.evaluate(()=>val('dr-src').includes('Решение №1')));
+ await page.evaluate(()=>{
+  document.getElementById('dr-title').value='E2E поручение браузера';
+  document.getElementById('dr-crit').value='Отчёт подписан испытательной группой';
+  document.querySelector('.dr-co[value="u6"]').checked=true;
+ });
+ await page.evaluate(()=>document.getElementById('dr-save').click());
+ await sleep(900);
+ const dt = await page.evaluate(m=>{
+  const d=DB.meetings.find(x=>x.id===m).decisions[0];
+  const t=DB.tasks.find(x=>x.id===(d.taskIds||[])[0]);
+  return t?{id:t.id,code:t.code,type:t.type,dr:t.directive}:null;
+ },dmid);
+ ok('поручение создано как задача M02', !!dt && dt.type==='directive', dt&&dt.code);
+ ok('соисполнитель сохранён', dt&&dt.dr.coassignees.join(',')==='u6', dt&&dt.dr.coassignees);
+ ok('критерии завершения сохранены', dt&&dt.dr.criteria==='Отчёт подписан испытательной группой');
+ ok('ссылки на совещание, решение и пункт повестки', dt&&dt.dr.meetingId===dmid&&dt.dr.decisionN===1&&dt.dr.agendaN===1);
+ await page.screenshot({path:'/tmp/e2e/shot_directive_form.png'});
+ await page.evaluate(t=>openTask(t),dt.id);
+ await sleep(400);
+ ok('карточка задачи: блок «Основание поручения»', await page.$('#dir-basis')!==null);
+ const basisTxt = await page.evaluate(()=>(document.getElementById('dir-basis')||{}).textContent||'');
+ ok('основание содержит критерии и источник', basisTxt.includes('Отчёт подписан')&&basisTxt.includes('Решение №1'));
+ await page.evaluate(()=>{const el=[...document.querySelectorAll('#dir-basis .link')].find(x=>x.textContent.includes('СОВ-'));if(el)el.click();});
+ await sleep(500);
+ ok('обратный переход из задачи к совещанию', (await page.evaluate(()=>document.getElementById('drawer-root').textContent)).includes('E2E поручения из решений'));
+ await page.evaluate((m,d)=>{App.f.meetTab='dec';openMeeting(m);App.directiveModal(m,d);},dmid,ddid);
+ await sleep(350);
+ ok('предупреждение о повторном создании', (await page.evaluate(()=>document.getElementById('modal-root').textContent)).includes('уже создано поручение'));
+ const dlg2 = async d=>{ await d.accept(); };
+ page.on('dialog',dlg2);
+ await page.evaluate(()=>document.getElementById('dr-save').click());
+ await sleep(1100);
+ page.off('dialog',dlg2);
+ ok('второе поручение создано после подтверждения', await page.evaluate(m=>DB.meetings.find(x=>x.id===m).decisions[0].taskIds.length===2,dmid));
+ await page.evaluate((m,d)=>App.decisionEdit(m,d),dmid,ddid);
+ await sleep(300);
+ await page.evaluate(()=>{document.getElementById('de-text').value='E2E решение изменено без нового поручения';});
+ await page.evaluate((m,d)=>App.decisionEditSave(m,d),dmid,ddid);
+ await sleep(800);
+ ok('правка решения не создаёт поручение повторно', await page.evaluate(m=>{
+  const d=DB.meetings.find(x=>x.id===m).decisions[0];
+  return d.taskIds.length===2 && d.text.includes('изменено');
+ },dmid));
+ await page.evaluate(m=>{App.f.meetTab='dir';openMeeting(m);},dmid);
+ await sleep(350);
+ ok('вкладка «Поручения» показывает соисполнителей', (await page.evaluate(()=>document.getElementById('drawer-root').textContent)).includes('соисполнители'));
+ await page.screenshot({path:'/tmp/e2e/shot_directive_list.png'});
+ await page.evaluate(()=>App.closeDrawer());
+
  console.log('== Фильтры-списки: обработчик изменения ==');
  await page.evaluate(()=>{nav('tasks');App.f.tk.proj='';renderView();});
  await sleep(300);
