@@ -18,13 +18,28 @@ try:
 except ImportError:
     print("Требуется psycopg2:  python -m pip install psycopg2-binary"); sys.exit(1)
 
+def _init_console():
+    """Консоль Windows по умолчанию cp1252 и не кодирует кириллицу — CLI установки падал бы
+       с UnicodeEncodeError. Принудительно UTF-8 (ТЗ §7.3: мастер установки в консоли)."""
+    for stream in (sys.stdout, sys.stderr):
+        try: stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception: pass
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        except Exception: pass
+
+_init_console()
+
 try:
     import docgen                      # генератор DOCX/XLSX/PDF (ТЗ §25), только stdlib
 except ImportError:
     docgen = None
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
