@@ -9,7 +9,7 @@
 Запуск:  python server.py --host 0.0.0.0 --port 80
 БД:      параметры подключения — аргументы --pg-* или переменные SUPIP_PG* / стандартные PG*.
 """
-import argparse, base64, datetime, hashlib, hmac, json, math, os, re, secrets, ssl, sys, threading, time, urllib.parse
+import argparse, base64, configparser, datetime, hashlib, hmac, json, math, os, platform, re, secrets, shutil, ssl, subprocess, sys, threading, time, urllib.parse
 import http.server, socketserver
 from http.cookies import SimpleCookie
 
@@ -19,7 +19,7 @@ except ImportError:
     print("Требуется psycopg2:  python -m pip install psycopg2-binary"); sys.exit(1)
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -1928,35 +1928,92 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 def main():
-    global TLS_ON
+    global TLS_ON, CONFIG_PATH
     ap = argparse.ArgumentParser(description="СУП-ИП — сервер управления проектами (PostgreSQL)")
-    ap.add_argument("--host", default="0.0.0.0", help="адрес прослушивания (по умолчанию 0.0.0.0 — вся ЛВС)")
-    ap.add_argument("--port", type=int, default=int(os.environ.get("SUPIP_PORT", "8000")))
-    ap.add_argument("--dsn", default=os.environ.get("SUPIP_DSN", "host=127.0.0.1 port=5432 dbname=supip user=supip password=supip"),
-                    help="строка подключения PostgreSQL")
+    ap.add_argument("--host", help="адрес прослушивания (по умолчанию 0.0.0.0 — вся ЛВС)")
+    ap.add_argument("--port", type=int, help="порт (по умолчанию из supip.ini или 8000)")
+    ap.add_argument("--dsn", help="строка подключения PostgreSQL")
     ap.add_argument("--cert", help="PEM-сертификат для HTTPS")
     ap.add_argument("--key", help="PEM-ключ для HTTPS")
+    ap.add_argument("--config", help="путь к supip.ini (по умолчанию рядом с EXE/скриптом)")
     ap.add_argument("--no-seed", action="store_true", help="не заполнять демо-данные при пустой БД")
+    ap.add_argument("--install", action="store_true", help="мастер установки и настройки (ТЗ §7.3)")
+    ap.add_argument("--install-auto", metavar="INI", help="автоматическая установка по параметрам из INI (для установщика)")
+    ap.add_argument("--service", metavar="ACTION", help="служба Windows: install|remove|start|stop|restart|run")
+    ap.add_argument("--migrate", action="store_true", help="применить миграции БД и выйти")
+    ap.add_argument("--backup-now", action="store_true", help="создать резервную копию и выйти")
+    ap.add_argument("--health", action="store_true", help="диагностика: БД, файловое хранилище, порт")
     args = ap.parse_args()
+    if args.config: CONFIG_PATH = os.path.abspath(args.config)
+    if args.install or args.install_auto:
+        sys.exit(run_install(args.install_auto))
+    if args.service:
+        sys.exit(service_command(args.service))
+    cfg = load_config()
+    host = args.host or cfg["host"]
+    port = args.port or int(os.environ.get("SUPIP_PORT", cfg["port"]))
+    dsn = args.dsn or os.environ.get("SUPIP_DSN", cfg["dsn"])
+    cert = args.cert or cfg["cert"] or None
+    key = args.key or cfg["key"] or None
     os.makedirs(FILES_DIR, exist_ok=True)
     try:
-        db = DB(args.dsn)
+        db = DB(dsn)
     except Exception as e:
-        print("Не удалось подключиться к PostgreSQL: %s\nПроверьте, что служба запущена и БД/роль созданы (см. README.md)." % e)
+        print("Не удалось подключиться к PostgreSQL: %s\nЗапустите мастер установки: SUP-IP.exe --install (или run.bat)." % e)
         sys.exit(2)
-    if not args.no_seed: seed(db)
+    migrate(db)
+    if args.health:
+        ok = True
+        conn = db.get()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT COUNT(*) AS n FROM users"); n = cur.fetchone()["n"]
+                cur.execute("SELECT v FROM meta WHERE k='schema'"); sv = cur.fetchone()["v"]
+            conn.commit()
+            print("БД: OK (PostgreSQL, пользователей: %d, схема: %s)" % (n, sv))
+        except Exception as e:
+            print("БД: ОШИБКА %s" % e); ok = False
+        finally:
+            db.put(conn)
+        try:
+            probe = os.path.join(FILES_DIR, ".probe")
+            open(probe, "w").write("ok"); os.remove(probe)
+            print("Файловое хранилище: OK (%s)" % FILES_DIR)
+        except Exception as e:
+            print("Файловое хранилище: ОШИБКА %s" % e); ok = False
+        print("Порт %s: %s" % (port, "свободен" if socket_bind_probe(host, port) else "занят (возможно, сервер уже запущен)"))
+        sys.exit(0 if ok else 1)
+    if args.backup_now:
+        conn = db.get()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                data = {"app": APP_NAME, "version": VERSION, "ts": now_ms(), "rev": db.rev(cur), "tables": {}}
+                for t in BACKUP_TABLES:
+                    cur.execute("SELECT * FROM " + t); data["tables"][t] = [dict(r) for r in cur.fetchall()]
+                db.audit(cur, "TECH", "info", "system", "admin", "Резервная копия создана (CLI --backup-now)", "БД", "", {})
+                conn.commit()
+        finally:
+            db.put(conn)
+        os.makedirs(os.path.join(DATA_DIR, "backups"), exist_ok=True)
+        p = os.path.join(DATA_DIR, "backups", "supip-backup-%s.json" % datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+        with open(p, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, default=str)
+        print("Резервная копия: %s" % p)
+        sys.exit(0)
+    if args.migrate:
+        print("Миграции применены; схема актуальна."); sys.exit(0)
+    if not args.no_seed and cfg.get("seed", "1") == "1": seed(db)
     App.db = db
-    srv = Server((args.host, args.port), App)
+    srv = Server((host, port), App)
     scheme = "http"
-    if args.cert and args.key:
+    if cert and key:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(args.cert, args.key)
+        ctx.load_cert_chain(cert, key)
         srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
         TLS_ON = True; scheme = "https"
     print("=" * 62)
     print("  %s v%s — сервер запущен" % (APP_NAME, VERSION))
     print("  СУБД: PostgreSQL · хранилище файлов: %s" % FILES_DIR)
-    print("  Адрес: %s://%s:%d  (веб-клиенты ЛВС — по IP этого ПК)" % (scheme, args.host, args.port))
+    print("  Адрес: %s://%s:%d  (веб-клиенты ЛВС — по IP этого ПК)" % (scheme, host, port))
     print("  Демо-вход: u1…u8, пароль demo (u1 — администратор)")
     print("=" * 62)
     try:
@@ -1966,5 +2023,326 @@ def main():
     finally:
         srv.server_close()
 
+# ================= Установка и настройка через EXE (ТЗ §7) =================
+CONFIG_PATH = os.path.join(BASE_DIR, "supip.ini")
+SCHEMA_VERSION = 1
+MIGRATIONS = {}  # {версия: [SQL, ...]} — применяется по порядку при старте/обновлении
+
+def migrate(db):
+    """Миграции схемы БД (ТЗ §7.6: обновление выполняет миграции)."""
+    conn = db.get()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT v FROM meta WHERE k='schema'")
+            r = cur.fetchone(); cur_ver = int(r["v"]) if r else 0
+            applied = []
+            for ver in sorted(MIGRATIONS):
+                if ver > cur_ver:
+                    for sql in MIGRATIONS[ver]: cur.execute(sql)
+                    cur.execute("UPDATE meta SET v=%s WHERE k='schema'", (str(ver),))
+                    applied.append(ver)
+            if applied:
+                db.audit(cur, "TECH", "info", "system", "admin", "Миграции БД применены: %s" % applied, "БД", "", {"schema": max(applied)})
+            conn.commit()
+            return applied
+    finally:
+        db.put(conn)
+
+def load_config(path=None):
+    """Конфигурация supip.ini (рядом с EXE/скриптом). CLI и env имеют приоритет."""
+    cfg = {"host": "0.0.0.0", "port": "8000",
+           "dsn": "host=127.0.0.1 port=5432 dbname=supip user=supip password=supip",
+           "cert": "", "key": "", "seed": "1"}
+    p = path or CONFIG_PATH
+    if os.path.isfile(p):
+        cp = configparser.ConfigParser()
+        cp.read(p, encoding="utf-8")
+        if cp.has_section("server"):
+            for k in cfg:
+                if cp.has_option("server", k): cfg[k] = cp.get("server", k)
+    return cfg
+
+def save_config(cfg, path=None):
+    cp = configparser.ConfigParser()
+    cp["server"] = cfg
+    with open(path or CONFIG_PATH, "w", encoding="utf-8") as f:
+        f.write("# СУП-ИП — конфигурация сервера (создана мастером установки)\n")
+        cp.write(f)
+
+def _gen_cert(cert_path, key_path, cn):
+    """Самоподписанный сертификат для HTTPS ЛВС: cryptography → openssl → отказ."""
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+        now = datetime.datetime.utcnow()
+        cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+                .public_key(key.public_key()).serial_number(x509.random_serial_number())
+                .not_valid_before(now - datetime.timedelta(days=1))
+                .not_valid_after(now + datetime.timedelta(days=825))
+                .add_extension(x509.SubjectAlternativeName([x509.DNSName(cn), x509.DNSName("localhost")]), critical=False)
+                .sign(key, hashes.SHA256()))
+        with open(key_path, "wb") as f:
+            f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
+        with open(cert_path, "wb") as f: f.write(cert.public_bytes(serialization.Encoding.PEM))
+        return True
+    except ImportError:
+        pass
+    try:
+        r = subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                            "-keyout", key_path, "-out", cert_path, "-days", "825", "-subj", "/CN=" + cn],
+                           capture_output=True, timeout=60)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+def _pg_ensure(dsn_super, app_db, app_user, app_pass, report):
+    """Создание роли и БД приложения через суперпользователя PostgreSQL (идемпотентно)."""
+    conn = psycopg2.connect(dsn_super)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (app_user,))
+            if not cur.fetchone():
+                cur.execute("CREATE USER %s PASSWORD %%s" % psycopg2.extensions.quote_ident(app_user, cur), (app_pass,))
+                report.append("Роль PostgreSQL «%s» создана" % app_user)
+            else:
+                cur.execute("ALTER USER %s PASSWORD %%s" % psycopg2.extensions.quote_ident(app_user, cur), (app_pass,))
+                report.append("Роль PostgreSQL «%s» существует (пароль обновлён)" % app_user)
+            cur.execute("SELECT 1 FROM pg_database WHERE datname=%s", (app_db,))
+            if not cur.fetchone():
+                cur.execute("CREATE DATABASE %s OWNER %s" % (psycopg2.extensions.quote_ident(app_db, cur), psycopg2.extensions.quote_ident(app_user, cur)))
+                report.append("База данных «%s» создана" % app_db)
+            else:
+                report.append("База данных «%s» существует" % app_db)
+    finally:
+        conn.close()
+
+def install_report_write(lines):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    p = os.path.join(DATA_DIR, "install-report.txt")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("СУП-ИП v%s — отчёт об установке (%s)\n\n" % (VERSION, datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")))
+        f.write("\n".join(lines) + "\n")
+    return p
+
+def run_install(auto_path=None):
+    """Мастер установки/настройки (ТЗ §7.3). Интерактивный или автоматический (--install-auto ini)."""
+    report = []
+    print("=" * 64)
+    print("  СУП-ИП v%s — мастер установки и настройки" % VERSION)
+    print("=" * 64)
+    auto = None
+    if auto_path:
+        cp = configparser.ConfigParser(); cp.read(auto_path, encoding="utf-8")
+        auto = dict(cp["install"]) if cp.has_section("install") else {}
+    def ask(key, prompt, default, secret=False):
+        if auto is not None: return auto.get(key, default)
+        suffix = " [%s]" % default if default else ""
+        try:
+            v = input("%s%s: " % (prompt, suffix)).strip()
+        except EOFError:
+            v = ""
+        return v or default
+    # 1. Проверка совместимости (ТЗ §7.2)
+    if sys.platform == "win32":
+        wv = sys.getwindowsversion()
+        ok = wv.major >= 10
+        report.append("ОС: Windows %d.%d x%s — %s" % (wv.major, wv.build, "64" if platform.machine().endswith("64") else "32", "совместима" if ok else "ТРЕБУЕТСЯ Windows 10/11 x64"))
+        if not ok: print("ОШИБКА: требуется Windows 10/11 x64"); return 2
+    else:
+        report.append("ОС: %s (режим разработки; целевая платформа — Windows 10/11 x64)" % platform.system())
+    free_gb = shutil.disk_usage(BASE_DIR).free / 2**30
+    report.append("Свободно на диске: %.1f ГБ — %s" % (free_gb, "достаточно" if free_gb >= 1 else "МАЛО (<1 ГБ)"))
+    if free_gb < 1: print("ОШИБКА: недостаточно дискового пространства"); return 2
+    # 2. Параметры
+    pg_host = ask("pg_host", "Адрес PostgreSQL", "127.0.0.1")
+    pg_port = ask("pg_port", "Порт PostgreSQL", "5432")
+    pg_super = ask("pg_super", "Суперпользователь PostgreSQL", "postgres")
+    pg_super_pass = ask("pg_super_pass", "Пароль суперпользователя PostgreSQL", "", secret=True)
+    app_db = ask("app_db", "Имя БД приложения", "supip")
+    app_user = ask("app_user", "Роль приложения", "supip")
+    app_pass = ask("app_pass", "Пароль роли приложения", "supip")
+    port = ask("port", "Порт веб-сервера", "8443" if sys.platform == "win32" else "8000")
+    bind = ask("host", "Адрес прослушивания (0.0.0.0 — вся ЛВС)", "0.0.0.0")
+    https = ask("https", "HTTPS (1 — да, 0 — нет)", "1").lower() in ("1", "да", "yes", "true")
+    admin_pass = ask("admin_pass", "Пароль администратора приложения (логин admin)", "demo")
+    # 3. Роль и БД
+    dsn_super = "host=%s port=%s dbname=postgres user=%s password=%s" % (pg_host, pg_port, pg_super, pg_super_pass)
+    try:
+        _pg_ensure(dsn_super, app_db, app_user, app_pass, report)
+    except Exception as e:
+        report.append("ОШИБКА PostgreSQL: %s" % e)
+        print("\n".join(report)); print("\nПроверьте, что служба PostgreSQL запущена и пароль суперпользователя верен.")
+        install_report_write(report); return 3
+    # 4. Схема, миграции, демо-данные
+    dsn = "host=%s port=%s dbname=%s user=%s password=%s" % (pg_host, pg_port, app_db, app_user, app_pass)
+    db = DB(dsn)
+    applied = migrate(db)
+    report.append("Схема БД создана/проверена (версия %d)%s" % (SCHEMA_VERSION + len(MIGRATIONS), "; миграции: %s" % applied if applied else ""))
+    seeded = seed(db)
+    report.append("Демо-данные: %s" % ("создан эталонный набор" if seeded else "уже присутствуют"))
+    # 5. Пароль администратора
+    if admin_pass and admin_pass != "demo":
+        conn = db.get()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                salt, h = pass_hash(admin_pass)
+                cur.execute("UPDATE users SET pass_salt=%s, pass_hash=%s WHERE login='admin'", (salt, h))
+                db.audit(cur, "SECURITY", "info", "system", "admin", "Установлен пароль администратора при установке", "Пользователь", "u1", {})
+                conn.commit()
+            report.append("Учётная запись администратора: admin (пароль задан мастером)")
+        finally:
+            db.put(conn)
+    else:
+        report.append("Учётная запись администратора: admin / demo (смените после входа!)")
+    # 6. Файловое хранилище
+    os.makedirs(FILES_DIR, exist_ok=True)
+    os.makedirs(os.path.join(DATA_DIR, "backups"), exist_ok=True)
+    report.append("Файловое хранилище: %s" % FILES_DIR)
+    # 7. HTTPS
+    cert = key = ""
+    if https:
+        cert_dir = os.path.join(DATA_DIR, "cert"); os.makedirs(cert_dir, exist_ok=True)
+        cert, key = os.path.join(cert_dir, "cert.pem"), os.path.join(cert_dir, "key.pem")
+        if not (os.path.isfile(cert) and os.path.isfile(key)):
+            cn = ask("cn", "Имя сервера для сертификата (CN)", platform.node() or "supip-server")
+            if _gen_cert(cert, key, cn):
+                report.append("HTTPS: самоподписанный сертификат создан (%s)" % cert)
+            else:
+                report.append("HTTPS: не удалось создать сертификат (нет cryptography/openssl) — сервер будет работать по HTTP")
+                cert = key = ""
+        else:
+            report.append("HTTPS: использован существующий сертификат")
+    else:
+        report.append("HTTPS: отключён мастером (включите: --cert/--key или supip.ini)")
+    # 8. Конфигурация
+    cfg = {"host": bind, "port": str(port), "dsn": dsn, "cert": cert, "key": key, "seed": "1"}
+    save_config(cfg)
+    report.append("Конфигурация сохранена: %s" % CONFIG_PATH)
+    # 9. Брандмауэр и служба (Windows)
+    if sys.platform == "win32":
+        try:
+            r = subprocess.run(["netsh", "advfirewall", "firewall", "add", "rule", "name=SUP-IP",
+                                "dir=in", "action=allow", "protocol=TCP", "localport=%s" % port], capture_output=True, timeout=30)
+            report.append("Брандмауэр: правило для TCP %s — %s" % (port, "добавлено" if r.returncode == 0 else "не добавлено (нужны права администратора)"))
+        except Exception as e:
+            report.append("Брандмауэр: %s" % e)
+        if ask("service", "Установить службу Windows с автозапуском (1/0)", "1") in ("1", "да", "yes"):
+            rc = service_command("install", cfg)
+            report.append("Служба Windows: %s" % ("установлена и запущена" if rc == 0 else "не установлена (см. вывод выше)"))
+    else:
+        report.append("Служба Windows: пропущено (не Windows); используйте systemd/run.sh")
+    # 10. Проверка работоспособности
+    conn = db.get()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1"); cur.fetchone()
+        conn.commit(); report.append("Проверка БД: соединение OK")
+    finally:
+        db.put(conn)
+    try:
+        probe = socket_bind_probe(bind, int(port))
+        report.append("Проверка порта %s: %s" % (port, "свободен" if probe else "ЗАНЯТ (освободите порт или измените настройку)"))
+    except Exception as e:
+        report.append("Проверка порта: %s" % e)
+    scheme = "https" if cert else "http"
+    report.append("")
+    report.append("ГОТОВО. Запуск: %s" % ("SUP-IP.exe (служба)" if sys.platform == "win32" else "python3 server.py"))
+    report.append("Клиенты в ЛВС: %s://<IP-этого-ПК>:%s" % (scheme, port))
+    report.append("Вход: admin / %s" % ("(пароль мастера)" if admin_pass != "demo" else "demo"))
+    p = install_report_write(report)
+    print("\n".join(report))
+    print("\nОтчёт об установке: %s" % p)
+    return 0
+
+def socket_bind_probe(bind, port):
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind((bind if bind != "0.0.0.0" else "", port)); return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+# ---------------- Служба Windows (ТЗ §7.4: автозапуск, контролируемый перезапуск) ----------------
+def service_command(action, cfg=None):
+    if sys.platform != "win32":
+        print("Служба Windows доступна только на Windows. На Linux используйте systemd или run.sh."); return 1
+    try:
+        import win32serviceutil, win32service, servicemanager  # noqa
+    except ImportError:
+        print("Для службы нужен pywin32: python -m pip install pywin32 (входит в EXE-сборку)."); return 1
+    name = "SUP-IP"
+    exe = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(sys.argv[0])
+    exe_args = '--service run --config "%s"' % CONFIG_PATH
+    if action == "install":
+        try:
+            win32serviceutil.InstallService(None, name, "СУП-ИП — сервер управления проектами",
+                                            startType=win32service.SERVICE_AUTO_START,
+                                            exeName=exe, exeArgs=exe_args,
+                                            description="СУП-ИП: веб-сервер управления проектами инженерного подразделения (PostgreSQL)")
+            subprocess.run(["sc", "failure", name, "reset=", "86400", "actions=", "restart/5000/restart/5000/restart/5000"], capture_output=True)
+            win32serviceutil.StartService(name)
+            return 0
+        except Exception as e:
+            print("Служба: %s" % e); return 1
+    if action == "remove":
+        try:
+            try: win32serviceutil.StopService(name)
+            except Exception: pass
+            win32serviceutil.RemoveService(name); return 0
+        except Exception as e:
+            print("Служба: %s" % e); return 1
+    if action in ("start", "stop", "restart"):
+        try:
+            if action == "restart":
+                try: win32serviceutil.StopService(name)
+                except Exception: pass
+                win32serviceutil.StartService(name)
+            elif action == "start": win32serviceutil.StartService(name)
+            else: win32serviceutil.StopService(name)
+            return 0
+        except Exception as e:
+            print("Служба: %s" % e); return 1
+    if action == "run":
+        import servicemanager, win32serviceutil
+        cfg = cfg or load_config()
+        class SupipService(win32serviceutil.ServiceFramework):
+            _svc_name_ = name
+            _svc_display_name_ = "СУП-ИП — сервер управления проектами"
+            def SvcStop(self):
+                self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+                if self._srv: threading.Thread(target=self._srv.shutdown, daemon=True).start()
+            def SvcDoRun(self):
+                self._srv = None
+                try:
+                    db = DB(cfg["dsn"])
+                    migrate(db)
+                    if cfg.get("seed", "1") == "1": seed(db)
+                    App.db = db
+                    srv = Server((cfg["host"], int(cfg["port"])), App)
+                    if cfg.get("cert") and cfg.get("key"):
+                        global TLS_ON
+                        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                        ctx.load_cert_chain(cfg["cert"], cfg["key"])
+                        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+                        TLS_ON = True
+                    self._srv = srv
+                    srv.serve_forever()
+                except Exception as e:
+                    servicemanager.LogErrorMsg("СУП-ИП: %s" % e)
+        servicemanager.PrepareToHostSingle(SupipService)
+        servicemanager.StartServiceCtrlDispatcher()
+        return 0
+    print("Неизвестное действие службы: %s" % action); return 1
+
 if __name__ == "__main__":
     main()
+
+

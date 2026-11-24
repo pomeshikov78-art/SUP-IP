@@ -4,6 +4,9 @@
 копия README сохраняется в `versions/README-vX.Y.Z.md`, изменения пушатся в
 https://github.com/pomeshikov78-art/SUP-IP.
 
+## v1.1.0 — 2026-11-24
+- Установка и настройка через EXE (ТЗ §7): мастер --install/--install-auto, supip.ini, служба Windows с автозапуском/автоперезапуском, миграции БД, --health/--backup-now, NSIS-установщик (обновление с бэкапом, деинсталляция с сохранением данных), автосборка EXE в GitHub Actions
+
 ## v1.0.1 — 2026-11-24
 - git-инфраструктура: синхронизация с GitHub, версионированные README (versions/), CHANGELOG, скрипт релиза tools/release.py, .gitignore (runtime-данные исключены)
 
