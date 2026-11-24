@@ -80,6 +80,9 @@ jobs:
       - name: Испытания реестра поручений и приёмки результата
         working-directory: sup-ip
         run: python tests/registry_test.py --base http://127.0.0.1:8000
+      - name: Испытания контроля сроков и отчётности по поручениям
+        working-directory: sup-ip
+        run: python tests/control_test.py --base http://127.0.0.1:8000
       - name: Журнал сервера (при сбое)
         if: failure()
         run: cat sup-ip/server.log

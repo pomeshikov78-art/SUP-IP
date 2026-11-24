@@ -789,8 +789,8 @@ async function uploadDocFile(did, v, file){
  }catch(e){ toast('err','Файл не загружен', e.message); return false; }
 }
 /* вычисляемые показатели */
-const taskOverdue = t => !DONE_ST.includes(t.status) && t.status!=='Отменена' && t.end < dISO(TODAY);
-const overDays = t => diffD(dISO(TODAY), t.end);
+const taskOverdue = t => !DONE_ST.includes(t.status) && t.status!=='Отменена' && !!t.end && t.end < dISO(TODAY);
+const overDays = t => t.end ? diffD(dISO(TODAY), t.end) : 0;
 const projTasks = pid => DB.tasks.filter(t=>t.projectId===pid && t.status!=='Отменена');
 function projProgress(p){
  const ts=projTasks(p.id).filter(t=>t.type!=='milestone');
@@ -928,7 +928,7 @@ function exportCSV(name, rows){
 }
 /* Выгрузка документов DOCX/XLSX/PDF: формирует СЕРВЕР (ТЗ §25), право export проверяется сервером,
    событие BUSINESS пишется в M15. Клиент только скачивает готовый файл. */
-const EXP_MOD={portfolio:'portfolio',project:'portfolio',tasks:'tasks',gantt:'gantt',resources:'resources',time:'time',risks:'risks',calc:'calcs',meeting:'meetings',report:'reports',journal:'journal',dashboard:'analytics'};
+const EXP_MOD={portfolio:'portfolio',project:'portfolio',tasks:'tasks',gantt:'gantt',resources:'resources',time:'time',risks:'risks',calc:'calcs',meeting:'meetings',directives:'meetings',report:'reports',journal:'journal',dashboard:'analytics'};
 function docBtns(kind,id,fmts){
  const mod=EXP_MOD[kind]||'reports';
  if(!can(mod,'export'))return '';
@@ -1245,6 +1245,8 @@ App.about=function(){
   ['Инженерный расчёт → Excel','M10: выберите модель «Бюджет радиолинии», выполните расчёт по формуле методики, проверьте результат и выгрузите протокол в Excel (CSV).','calcs'],
   ['Совещание → поручения','M16 §2.10: на вкладке «Решения» нажмите «В поручение» — задача M02 создаётся с исполнителем, соисполнителями, сроком, критериями завершения и источником; из карточки задачи блок «Основание поручения» возвращает к совещанию и протоколу.','meetings'],
   ['Реестр поручений и приёмка','M16 §2.11: режим «Поручения» — реестр со статусом, процентом, датой факта и документами. Карточка задачи → вкладка «Поручение»: продление срока с основанием, подтверждающие документы и приёмка результата руководителем.','meetings'],
+  ['Контроль сроков поручений','M16 §2.11.1: режим «Контроль сроков» — шесть категорий отклонений (приближающийся срок, просрочка, нет исполнителя, нет срока, нет обновлений, нужна проверка результата). Кнопка «Выполнить контроль и разослать» рассылает уведомления настроенному кругу получателей; пороги и состав получателей — в «Настроить контроль».','meetings'],
+  ['Отчётность по поручениям','M16 §2.11.2: режим «Отчётность» — семь видов отчётов (реестр, просроченные, по исполнителям, по совещаниям, по проектам, за период, по неисполненным решениям). Отчёт выгружается в DOCX/XLSX/PDF/CSV и сохраняется снимком в M13.','meetings'],
   ['Протокол: маршрут и редакции','M16 §2.9: вкладка «Протокол» — настройте маршрут согласования, направьте протокол, дайте результат или замечания, утвердите редакцию (DOCX+PDF в M09) и опубликуйте. Изменение утверждённого протокола — только через новую редакцию с сохранением истории.','meetings'],
   ['Центр уведомлений','Нажмите колокольчик в шапке: доставленные сервером приглашения и напоминания, переход к объекту, «Прочитать все» и настройка типов. Интервалы напоминаний — в карточке совещания и события календаря.','meetings'],
   ['Конструктор дашборда','M17: включите/выключите виджеты и измените порядок — главный дашборд M00 перестроится. Настройки персональны для пользователя.','builder']
@@ -1272,7 +1274,7 @@ function deviations(){
  DB.tasks.filter(t=>t.type==='milestone'&&taskOverdue(t)).forEach(t=>out.push({kind:'Контрольная точка',sev:'err',icon:'milestone',title:'Сорвана контрольная точка: '+t.title,sub:(P(t.projectId)||{}).code+' · план '+fmtD(t.end)+' · сдвиг '+overDays(t)+' дн',task:t}));
  DB.tasks.filter(t=>t.status==='Заблокирована').forEach(t=>out.push({kind:'Блокировка',sev:'warn',icon:'blocked',title:t.title,sub:t.code+' · причина: '+(t.blockReason||'не указана'),task:t}));
  DB.projects.filter(p=>!['Завершён','Архивный','Отменён'].includes(p.status)).forEach(p=>{
-  Object.entries(p.baseline||{}).forEach(([tid,b])=>{ const t=T_(tid); if(t&&t.end>b.end&&!DONE_ST.includes(t.status)) out.push({kind:'Базовый план',sev:'warn',icon:'gantt',title:'Сдвиг относительно базового плана: '+t.title,sub:p.code+' · базовый финиш '+fmtD(b.end)+' → текущий '+fmtD(t.end)+' (+'+diffD(t.end,b.end)+' дн)',task:t}); });
+  Object.entries(p.baseline||{}).forEach(([tid,b])=>{ const t=T_(tid); if(t&&t.end&&t.end>b.end&&!DONE_ST.includes(t.status)) out.push({kind:'Базовый план',sev:'warn',icon:'gantt',title:'Сдвиг относительно базового плана: '+t.title,sub:p.code+' · базовый финиш '+fmtD(b.end)+' → текущий '+fmtD(t.end)+' (+'+diffD(t.end,b.end)+' дн)',task:t}); });
   const used=projActualHours(p.id);
   if(used>p.budgetHours*0.95) out.push({kind:'Трудозатраты',sev:'warn',icon:'clock',title:'Приближение к лимиту трудоёмкости: '+p.name,sub:p.code+' · '+fmtN(used)+' из '+fmtN(p.budgetHours)+' чел·ч ('+Math.round(100*used/p.budgetHours)+'%)',proj:p});
   if(p.status==='Требует внимания') out.push({kind:'Проект',sev:'warn',icon:'folder',title:'Проект требует внимания руководства',sub:p.code+' · '+p.name,proj:p});
@@ -1472,7 +1474,7 @@ function openProject(pid){
   body='<div class="help-note">'+ic('gantt')+'<div>Календарный план ведётся в M04. Базовый план — утверждённый снимок сроков; текущие сдвиги не изменяют его автоматически.</div></div>'+
   '<div class="flexw mb14"><button class="btn pri" onclick="App.closeDrawer();nav(\'gantt\');App.gantt.proj=\''+pid+'\';renderView()">'+ic('gantt')+' Открыть диаграмму Ганта</button>'+
   (can('gantt','edit',p)?'<button class="btn" onclick="App.saveBaseline(\''+pid+'\')">'+ic('save')+' Сохранить базовый план</button>':'')+docBtns('project',pid)+'</div>'+
-  (bl.length?'<div class="card"><div class="ch">'+ic('save')+'Базовый план от '+fmtD(dISO(new Date(p.baselineAt)))+'</div><div class="tbl-wrap"><table class="tbl"><thead><tr><th>Задача</th><th>Базовый финиш</th><th>Текущий финиш</th><th>Отклонение</th></tr></thead><tbody>'+bl.map(([tid,b])=>{const t=T_(tid);if(!t)return '';const dv=diffD(t.end,b.end);return '<tr onclick="openTask(\''+tid+'\')"><td>'+esc(t.title)+'</td><td>'+fmtD(b.end)+'</td><td>'+fmtD(t.end)+'</td><td>'+(dv>0?'<span class="overdue">+'+dv+' дн</span>':dv<0?'<span style="color:var(--ok);font-weight:700">'+dv+' дн</span>':'<span class="mut">0</span>')+'</td></tr>';}).join('')+'</tbody></table></div></div>':emptyBlock('Базовый план не сохранён','Утвердите план и сохраните снимок сроков','save'));
+  (bl.length?'<div class="card"><div class="ch">'+ic('save')+'Базовый план от '+fmtD(dISO(new Date(p.baselineAt)))+'</div><div class="tbl-wrap"><table class="tbl"><thead><tr><th>Задача</th><th>Базовый финиш</th><th>Текущий финиш</th><th>Отклонение</th></tr></thead><tbody>'+bl.map(([tid,b])=>{const t=T_(tid);if(!t)return '';const dv=t.end?diffD(t.end,b.end):0;return '<tr onclick="openTask(\''+tid+'\')"><td>'+esc(t.title)+'</td><td>'+fmtD(b.end)+'</td><td>'+fmtD(t.end)+'</td><td>'+(dv>0?'<span class="overdue">+'+dv+' дн</span>':dv<0?'<span style="color:var(--ok);font-weight:700">'+dv+' дн</span>':'<span class="mut">0</span>')+'</td></tr>';}).join('')+'</tbody></table></div></div>':emptyBlock('Базовый план не сохранён','Утвердите план и сохраните снимок сроков','save'));
  }
  if(tab==='team'){
   body='<div class="list-rows">'+p.team.map(uid_=>{const u=U(uid_);const ts=DB.tasks.filter(t=>t.projectId===pid&&t.assignee===uid_&&!DONE_ST.includes(t.status)&&t.status!=='Отменена');return '<div class="lr" style="cursor:default">'+avatar(u)+'<div class="lt"><b>'+esc(u.name)+'</b><small>'+esc(u.position)+' · '+ROLES[u.role].name+'</small></div><span class="chip">активных задач: '+ts.length+'</span><span class="chip">'+fmtN(sum(ts.map(t=>t.planHours)))+' ч план</span></div>';}).join('')+'</div>';
@@ -1806,7 +1808,8 @@ Views.gantt=function(){
  const g=App.gantt;
  if(!P(g.proj))g.proj=(DB.projects[0]||{}).id;
  const p=P(g.proj);
- const ts=projTasks(g.proj).slice().sort((a,b)=>a.start<b.start?-1:(a.start>b.start?1:(a.code<b.code?-1:1)));
+ const ts=projTasks(g.proj).map(t=>t.end?t:Object.assign({},t,{end:t.start}))
+  .sort((a,b)=>a.start<b.start?-1:(a.start>b.start?1:(a.code<b.code?-1:1)));
  if(!ts.length)return '<div class="page-head"><div><h2>Диаграмма Ганта</h2></div></div><div class="card">'+emptyBlock('В проекте нет задач','Создайте задачи в M02 — они появятся на временной шкале','gantt')+'</div>';
  const px=g.px;
  let minD=ts[0].start, maxD=ts[0].end;
@@ -1919,6 +1922,7 @@ App.saveBaselineG=function(pid){ App.saveBaseline(pid); App.closeDrawer(); rende
 App.gDown=function(e,tid){
  if(e.button!==0)return;
  const t=T_(tid); if(!t)return;
+ if(!t.end){toast('warn','Срок не установлен','Задайте срок исполнения в карточке поручения (ТЗ §2.11.1)');return;}
  const p=P(t.projectId);
  const editable=can('gantt','edit',p);
  const g=e.currentTarget; const startX=e.clientX; const px=App.gantt.px;
@@ -2807,13 +2811,13 @@ App.reportDownload=function(rid){
 
 /* ---------- M16: совещания ---------- */
 function meetingsDirectives(f){
- const over=f.tab==='over';
+ const over=f.tab==='over', ctl=f.tab==='ctl', rep=f.tab==='rep';
  App.f.mt.df=App.f.mt.df||{};
  if(over)App.f.mt.df.od=true; else if(App.f.mt._wasOver)App.f.mt.df.od=false;
  App.f.mt._wasOver=over;
  const all=DB.tasks.filter(t=>t.type==='directive');
  const acc=all.filter(t=>(dirOf(t).acceptance||{}).verdict==='Принято').length;
- return '<div class="page-head"><div><h2>'+(over?'Просроченные поручения':'Реестр поручений')+'</h2>'+
+ return '<div class="page-head"><div><h2>'+(ctl?'Контроль сроков поручений':rep?'Отчётность по поручениям':over?'Просроченные поручения':'Реестр поручений')+'</h2>'+
   '<div class="desc">Поручения, сформированные по итогам совещаний (ТЗ §2.11). Единый владелец данных — задачи M02; реестр показывает номер, совещание, протокол, решение, исполнителя, соисполнителей, срок, статус, процент выполнения, дату факта, результат и подтверждающие документы.</div></div>'+
   '<div class="acts"><button class="btn" onclick="App.f.mt.tab=\'next\';renderView()">'+ic('meeting')+' К совещаниям</button></div></div>'+
   '<div class="grid g4 mb14">'+
@@ -2827,9 +2831,11 @@ function meetingsDirectives(f){
    '<button onclick="App.f.mt.tab=\'prot\';renderView()">Протоколы</button>'+
    '<button class="'+(over?'':'on')+'" onclick="App.f.mt.tab=\'dir\';renderView()">Поручения</button>'+
    '<button class="'+(over?'on':'')+'" onclick="App.f.mt.tab=\'over\';renderView()">Просроченные поручения</button>'+
+   '<button class="'+(ctl?'on':'')+'" id="mt-tab-ctl" onclick="App.f.mt.tab=\'ctl\';renderView()">Контроль сроков</button>'+
+   '<button class="'+(rep?'on':'')+'" id="mt-tab-rep" onclick="App.f.mt.tab=\'rep\';renderView()">Отчётность</button>'+
    '<button onclick="App.f.mt.tab=\'all\';renderView()">Все</button></div>'+
-  '<div class="small mut mb8">Принято руководителем: '+acc+' из '+all.length+'</div>'+
-  directiveRegistry();
+  (ctl?directiveControl():rep?directiveReports():
+   '<div class="small mut mb8">Принято руководителем: '+acc+' из '+all.length+'</div>'+directiveRegistry());
 }
 Views.meetings=function(){
  const f=App.f.mt=App.f.mt||{tab:'next'};
@@ -2837,7 +2843,7 @@ Views.meetings=function(){
  if(f.tab==='next')rows=rows.filter(m=>m.date>=dISO(TODAY));
  if(f.tab==='past')rows=rows.filter(m=>m.date<dISO(TODAY));
  if(f.tab==='prot')rows=rows.filter(m=>protOf(m).status!=='Подготовка');
- if(f.tab==='dir'||f.tab==='over')return meetingsDirectives(f);
+ if(['dir','over','ctl','rep'].includes(f.tab))return meetingsDirectives(f);
  rows.sort((a,b)=>f.tab==='past'?(a.date>b.date?-1:1):(a.date<b.date?-1:1));
  const dirs=DB.tasks.filter(t=>t.type==='directive'&&t.status!=='Отменена');
  return '<div class="page-head"><div><h2>Совещания</h2><div class="desc">Повестка, участники, решения и контроль исполнения. Протокол проходит маршрут согласования и утверждается отдельной редакцией (§2.9). Решение совещания одним нажатием превращается в поручение — задачу M02 с ответственным и сроком; исполнение видно в M07 и на дашборде.</div></div>'+
@@ -2848,7 +2854,7 @@ Views.meetings=function(){
   kpiHTML(dirs.length,'Поручений активно','создано из решений','tasks','info',"nav('control')")+
   kpiHTML(dirs.filter(taskOverdue).length,'Поручений просрочено','требуют эскалации','alert',dirs.filter(taskOverdue).length?'err':'ok',"nav('control')")+
  '</div>'+
- '<div class="tabs"><button class="'+(f.tab==='next'?'on':'')+'" onclick="App.f.mt.tab=\'next\';renderView()">Предстоящие и текущие</button><button class="'+(f.tab==='past'?'on':'')+'" onclick="App.f.mt.tab=\'past\';renderView()">Проведённые</button><button class="'+(f.tab==='prot'?'on':'')+'" onclick="App.f.mt.tab=\'prot\';renderView()">Протоколы</button><button class="'+(f.tab==='dir'?'on':'')+'" onclick="App.f.mt.tab=\'dir\';renderView()">Поручения</button><button class="'+(f.tab==='over'?'on':'')+'" onclick="App.f.mt.tab=\'over\';renderView()">Просроченные поручения</button><button class="'+(f.tab==='all'?'on':'')+'" onclick="App.f.mt.tab=\'all\';renderView()">Все</button></div>'+
+ '<div class="tabs"><button class="'+(f.tab==='next'?'on':'')+'" onclick="App.f.mt.tab=\'next\';renderView()">Предстоящие и текущие</button><button class="'+(f.tab==='past'?'on':'')+'" onclick="App.f.mt.tab=\'past\';renderView()">Проведённые</button><button class="'+(f.tab==='prot'?'on':'')+'" onclick="App.f.mt.tab=\'prot\';renderView()">Протоколы</button><button class="'+(f.tab==='dir'?'on':'')+'" onclick="App.f.mt.tab=\'dir\';renderView()">Поручения</button><button class="'+(f.tab==='over'?'on':'')+'" onclick="App.f.mt.tab=\'over\';renderView()">Просроченные поручения</button><button onclick="App.f.mt.tab=\'ctl\';renderView()">Контроль сроков</button><button onclick="App.f.mt.tab=\'rep\';renderView()">Отчётность</button><button class="'+(f.tab==='all'?'on':'')+'" onclick="App.f.mt.tab=\'all\';renderView()">Все</button></div>'+
  '<div class="card"><div class="tbl-wrap"><table class="tbl"><thead><tr><th>Код</th><th>Совещание</th><th>Тип</th><th>Дата</th><th>Председатель</th><th>Участники</th><th>Решения</th><th>Протокол</th><th>Статус</th></tr></thead><tbody>'+
  (rows.length?rows.map(m=>'<tr onclick="openMeeting(\''+m.id+'\')"><td class="b nowrap">'+m.code+'</td><td><b>'+esc(m.title)+'</b></td><td class="small">'+esc(m.type)+'</td><td class="nowrap">'+fmtD(m.date)+' '+esc(m.time)+'</td><td><div class="flex">'+avatar(U(m.chair),'sm')+'<span class="small">'+esc(U(m.chair).name)+'</span></div></td><td class="small">'+m.attendees.length+' чел.</td><td class="num">'+m.decisions.length+'</td><td class="nowrap">'+prBadge(protOf(m).status)+(protOf(m).version?' <span class="chip">ред. '+protOf(m).version+'</span>':'')+'</td><td>'+badge(m.status,m.status==='Запланировано'?'#2563eb':m.status==='Проведено'?'#d97706':'#16a34a',m.status==='Запланировано'?'#dbeafe':m.status==='Проведено'?'#fef3c7':'#dcfce7')+'</td></tr>').join(''):'<tr class="nohover"><td colspan="9">'+emptyBlock('Совещаний нет','Создайте совещание или измените вкладку','meeting')+'</td></tr>')+
  '</tbody></table></div></div>';
@@ -2972,6 +2978,8 @@ function directiveTab(t){
   '<div class="stat-line"><span>Номер протокола</span><b>'+(dr.protocolV?'редакция '+dr.protocolV:'не утверждён')+'</b></div>'+
   '<div class="stat-line"><span>Срок исполнения</span><b>'+fmtD(t.end)+' '+overdueMark(t)+'</b></div>'+
   '<div class="stat-line"><span>Дата фактического исполнения</span><b>'+(dr.factDate?fmtD(dr.factDate):'—')+'</b></div>'+
+  '<div class="stat-line"><span>Контролирующее лицо</span><b id="dir-ctrl-view">'+esc(dr.controller?U(dr.controller).name:((DB.users.find(u=>u.role==='head')||{}).name||'руководитель подразделения'))+'</b></div>'+
+  '<div class="stat-line"><span>Обновление состояния</span><b>'+((dr.stateAt||t.createdAt)?fmtDT(dr.stateAt||t.createdAt):'—')+'</b></div>'+
   '<div class="mt8">'+progressBar(DONE_ST.includes(t.status)?100:t.progress)+'</div>'+
   '<div class="flexw mt8">'+
    (editable?'<button class="btn sm" id="dir-extend-btn" onclick="App.dirExtend(\''+tid+'\')">'+ic('clock')+' Продлить срок</button>':'')+
@@ -2982,6 +2990,9 @@ function directiveTab(t){
    field('Результат выполнения',ta('dir-result',t.result||'',3))+
    '<div class="row">'+field('Дата фактического исполнения',inp('dir-fact',dr.factDate||'','date'))+
     field('Процент выполнения',inp('dir-prog',String(DONE_ST.includes(t.status)?100:t.progress),'number','min="0" max="100"'))+'</div>'+
+   '<div class="row">'+field('Исполнитель',sel('dir-assignee',[['','— не назначен —'],...DB.users.filter(u=>!u.blocked).map(u=>[u.id,u.name])],t.assignee||''))+
+    field('Контролирующее лицо',sel('dir-ctrl',[['','По настройке контроля'],...DB.users.filter(u=>!u.blocked).map(u=>[u.id,u.name])],dr.controller||''))+'</div>'+
+   (t.end?'':field('Установить срок исполнения',inp('dir-due-new','','date'),false,'Поручение без срока выявляется контролем §2.11.1'))+
    field('Комментарий',ta('dir-cmt',dr.comment||'',2))+
    field('Критерии завершения',ta('dir-crit',dr.criteria||'',2))+
    '<div class="flex"><span class="spacer"></span><button class="btn pri" id="dir-save" onclick="App.dirSave(\''+tid+'\')">'+ic('save')+' Сохранить</button></div>'+
@@ -3003,8 +3014,11 @@ function directiveTab(t){
 }
 App.dirSave=function(tid){
  const fact=val('dir-fact'), prog=parseInt(val('dir-prog')||'0',10);
- rpc('directive.update',{id:tid,result:val('dir-result'),factDate:fact||null,progress:isNaN(prog)?0:prog,
-  comment:val('dir-cmt'),criteria:val('dir-crit')}).then(r=>{if(r)openTask(tid);});
+ const p={id:tid,result:val('dir-result'),factDate:fact||null,progress:isNaN(prog)?0:prog,
+  comment:val('dir-cmt'),criteria:val('dir-crit'),assignee:val('dir-assignee')||null,controller:val('dir-ctrl')||null};
+ const nd=val('dir-due-new');
+ if(nd)p.due=nd;
+ rpc('directive.update',p).then(r=>{if(r){App.dirCtl=null;openTask(tid);}});
 };
 App.dirExtend=function(tid){
  const t=T_(tid);
@@ -3045,13 +3059,147 @@ App.dirAttachGo=function(tid){
 App.dirDetach=function(tid,docId){
  rpc('directive.detach',{id:tid,docId}).then(r=>{if(r)openTask(tid);});
 };
+/* ---------- M16 §2.11.1–2.11.2: контроль сроков поручений и отчётность ---------- */
+const DIR_CHECKS_UI=[['dueSoon','Приближается срок','clock','#d97706','#fef3c7'],
+ ['overdue','Просрочено','alert','#dc2626','#fee2e2'],
+ ['noAssignee','Без исполнителя','users','#c026d3','#fae8ff'],
+ ['noDue','Без срока','calendar','#7c3aed','#ede9fe'],
+ ['stale','Без обновления состояния','refresh','#475569','#e2e8f0'],
+ ['needReview','Требует проверки результата','eye','#0891b2','#cffafe']];
+const DIR_REC_UI=[['assignee','Исполнитель'],['coassignees','Соисполнители'],['chair','Председатель совещания'],
+ ['secretary','Секретарь совещания'],['head','Руководитель подразделения'],['controller','Контролирующее лицо']];
+const DIR_REPORTS_UI=[['registry','Реестр всех поручений'],['overdue','Перечень просроченных поручений'],
+ ['assignees','Отчёт по исполнителям'],['meetings','Отчёт по совещаниям'],['projects','Отчёт по проектам'],
+ ['period','Отчёт по исполнению за период'],['unfulfilled','Отчёт по неисполненным решениям']];
+const dirCheckBadge=k=>{const c=DIR_CHECKS_UI.find(x=>x[0]===k)||[k,k,'info','#64748b','#f1f5f9'];return badge(c[1],c[3],c[4]);};
+const dirCtlF=()=>(App.f.mt.cf=App.f.mt.cf||{check:''});
+const dirRepF=()=>(App.f.mt.rf=App.f.mt.rf||{kind:'registry',from:D(-30),to:D(0),p:'',m:'',a:''});
+function dirRecNames(ids){return (ids||[]).map(x=>U(x).name).join(', ')||'—';}
+function directiveControl(){
+ const f=dirCtlF(), c=App.dirCtl;
+ if(!c){App.dirCtlLoad();return '<div class="card"><div class="cb small mut">Загрузка данных контроля сроков…</div></div>';}
+ const cfg=c.cfg||{}, rows=c.rows||[];
+ const shown=f.check?rows.filter(r=>(r.issues||[]).includes(f.check)):rows;
+ const recOn=DIR_REC_UI.filter(x=>(cfg.recipients||{})[x[0]]).map(x=>x[1]);
+ return '<div class="grid g3 mb14">'+(c.checks||[]).map(k=>{
+   const ui=DIR_CHECKS_UI.find(x=>x[0]===k.key)||[k.key,k.name,'info'];
+   return '<div class="kpi tone-'+(k.count?(k.key==='overdue'?'err':'warn'):'ok')+'" id="dck-'+k.key+'" onclick="App.dirCtlPick(\''+k.key+'\')">'+
+    '<span class="ki">'+ic(ui[2])+'</span><span class="kv">'+k.count+'</span><span class="kl">'+esc(k.name)+'</span>'+
+    '<span class="ks">'+(k.on?(f.check===k.key?'отбор по категории · нажмите ещё раз для сброса':'проверка включена'):'проверка отключена настройкой')+'</span></div>';
+  }).join('')+'</div>'+
+ '<div class="filters">'+
+  '<span class="small mut">Порог приближения срока: <b>'+(cfg.dueSoonDays||3)+' дн</b> · без обновления состояния: <b>'+(cfg.staleDays||7)+' дн</b></span>'+
+  '<span class="spacer"></span>'+
+  '<button class="btn sm" id="dir-ctl-refresh" onclick="App.dirCtlLoad()">'+ic('refresh')+' Обновить</button>'+
+  (can('meetings','approve')?'<button class="btn sm pri" id="dir-ctl-run" onclick="App.dirCtlRun()">'+ic('bell')+' Выполнить контроль и разослать</button>':'')+
+  (can('admin','edit')?'<button class="btn sm" id="dir-ctl-cfg" onclick="App.dirCtlCfg()">'+ic('settings')+' Настроить контроль</button>':'')+
+  (can('meetings','export')?'<button class="btn sm" id="dir-ctl-csv" onclick="App.dirCtlExport()">'+ic('download')+' CSV</button>':'')+
+ '</div>'+
+ '<div class="card"><div class="ch">'+ic('shield')+'Контроль сроков поручений ('+shown.length+')'+
+  '<span class="r small mut">получатели: '+esc(recOn.join(', ')||'не заданы')+'</span></div><div class="tbl-wrap"><table class="tbl" id="dir-control"><thead><tr>'+
+  ['№','Поручение','Исполнитель','Срок','Статус','Отклонения','Без обновления, дн','Получатели уведомления'].map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>'+
+  (shown.length?shown.map(r=>'<tr onclick="App.f.taskTab=\'dir\';openTask(\''+r.id+'\')">'+
+   '<td class="b nowrap">'+r.code+'</td><td><b class="small">'+esc(r.title)+'</b><div class="small mut">'+esc(r.meetingCode||'')+'</div></td>'+
+   '<td class="small">'+esc(r.assignee?U(r.assignee).name:'— не назначен —')+'</td>'+
+   '<td class="nowrap">'+fmtD(r.due)+(r.overdueDays?' '+badge('+'+r.overdueDays+' дн','#dc2626','#fee2e2'):'')+'</td>'+
+   '<td>'+dirBadge(r.status)+'</td>'+
+   '<td><div class="flexw">'+(r.issues||[]).map(dirCheckBadge).join('')+'</div></td>'+
+   '<td class="num">'+(r.idleDays||0)+'</td>'+
+   '<td class="small">'+esc(dirRecNames(r.recipients))+'</td></tr>').join('')
+   :'<tr class="nohover"><td colspan="8">'+emptyBlock('Отклонений не выявлено','Все поручения обеспечены исполнителем, сроком и обновлениями','check')+'</td></tr>')+
+ '</tbody></table></div></div>'+
+ '<div class="help-note mt14">'+ic('info')+'<div>Система автоматически выявляет поручения с приближающимся сроком, просроченные, без исполнителя, без срока, без обновления состояния и требующие проверки результата (ТЗ §2.11.1). Состав получателей уведомлений настраивается; рассылка выполняется планировщиком и кнопкой «Выполнить контроль».</div></div>';
+}
+App.dirCtlLoad=function(){
+ return rpc('directive.control',{}).then(r=>{if(r){App.dirCtl=r;renderView();}return r;});
+};
+App.dirCtlPick=function(k){const f=dirCtlF();f.check=f.check===k?'':k;renderView();};
+App.dirCtlRun=function(){
+ if(!guard('meetings','approve'))return;
+ rpc('directive.controlNotify',{}).then(r=>{if(r)App.dirCtlLoad();});
+};
+App.dirCtlExport=function(){
+ if(!guard('meetings','export'))return;
+ const c=App.dirCtl||{rows:[]}, f=dirCtlF();
+ const rows=f.check?(c.rows||[]).filter(r=>(r.issues||[]).includes(f.check)):(c.rows||[]);
+ exportCSV('kontrol_poryucheniy.csv',[['Номер','Поручение','Совещание','Исполнитель','Срок','Статус','Отклонения','Просрочка дн','Без обновления дн','Получатели'],
+  ...rows.map(r=>[r.code,r.title,r.meetingCode||'',r.assignee?U(r.assignee).name:'',fmtD(r.due),r.status,
+   (r.issues||[]).map(k=>(DIR_CHECKS_UI.find(x=>x[0]===k)||[k,k])[1]).join('; '),r.overdueDays||0,r.idleDays||0,dirRecNames(r.recipients)])]);
+};
+App.dirCtlCfg=function(){
+ if(!guard('admin','edit'))return;
+ const c=(App.dirCtl&&App.dirCtl.cfg)||{};
+ const rec=c.recipients||{}, chk=c.checks||{};
+ openModal(mh('Настройка контроля поручений','settings')+'<div class="mb form">'+
+  '<div class="small mut mb8">Пороги выявления отклонений и состав получателей уведомлений (ТЗ §2.11.1). Настройка действует для всех поручений.</div>'+
+  '<div class="row">'+field('Приближающийся срок, дней',inp('dcfg-soon',String(c.dueSoonDays||3),'number','min="1" max="30"'),true)+
+   field('Без обновления состояния, дней',inp('dcfg-stale',String(c.staleDays||7),'number','min="1" max="90"'),true)+'</div>'+
+  field('Контролирующее лицо по умолчанию',sel('dcfg-ctrl',[['','Руководитель подразделения'],...DB.users.filter(u=>!u.blocked).map(u=>[u.id,u.name])],c.controller||''))+
+  field('Проверки контроля','<div class="flexw" style="border:1.5px solid var(--line2);border-radius:8px;padding:9px 11px">'+
+   DIR_CHECKS_UI.map(x=>'<label class="checkline"><input type="checkbox" class="dcfg-chk" value="'+x[0]+'" '+(chk[x[0]]!==false?'checked':'')+'> '+x[1]+'</label>').join('')+'</div>')+
+  field('Получатели уведомлений','<div class="flexw" style="border:1.5px solid var(--line2);border-radius:8px;padding:9px 11px">'+
+   DIR_REC_UI.map(x=>'<label class="checkline"><input type="checkbox" class="dcfg-rec" value="'+x[0]+'" '+(rec[x[0]]!==false?'checked':'')+'> '+x[1]+'</label>').join('')+'</div>')+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button>'+
+  '<button class="btn pri" id="dcfg-save" onclick="App.dirCtlCfgSave()">'+ic('save')+' Сохранить</button></div>');
+};
+App.dirCtlCfgSave=function(){
+ if(!requireFields(['dcfg-soon','dcfg-stale']))return;
+ const checks={}, recipients={};
+ DIR_CHECKS_UI.forEach(x=>{checks[x[0]]=[...document.querySelectorAll('.dcfg-chk:checked')].some(e=>e.value===x[0]);});
+ DIR_REC_UI.forEach(x=>{recipients[x[0]]=[...document.querySelectorAll('.dcfg-rec:checked')].some(e=>e.value===x[0]);});
+ rpc('directive.controlConfig',{dueSoonDays:parseInt(val('dcfg-soon'),10),staleDays:parseInt(val('dcfg-stale'),10),
+  controller:val('dcfg-ctrl')||null,checks:checks,recipients:recipients}).then(r=>{if(r){App.closeModal(true);App.dirCtlLoad();}});
+};
+function directiveReports(){
+ const f=dirRepF(), rep=App.dirRep&&App.dirRep.report;
+ const isPeriod=f.kind==='period';
+ return '<div class="filters">'+
+  sel('drp-kind',DIR_REPORTS_UI,f.kind,'onchange="App.f.mt.rf.kind=this.value;App.dirRep=null;renderView()"')+
+  sel('drp-m',[['','Все совещания'],...DB.meetings.map(m=>[m.id,m.code])],f.m||'','onchange="App.f.mt.rf.m=this.value;renderView()"')+
+  sel('drp-p',[['','Все проекты'],...DB.projects.map(p=>[p.id,p.code])],f.p||'','onchange="App.f.mt.rf.p=this.value;renderView()"')+
+  sel('drp-a',[['','Все исполнители'],...DB.users.map(u=>[u.id,u.name])],f.a||'','onchange="App.f.mt.rf.a=this.value;renderView()"')+
+  (isPeriod?inp('drp-from',f.from,'date','onchange="App.f.mt.rf.from=this.value"')+inp('drp-to',f.to,'date','onchange="App.f.mt.rf.to=this.value"'):'')+
+  '<button class="btn sm pri" id="drp-go" onclick="App.dirRepLoad()">'+ic('report')+' Сформировать</button>'+
+  '<span class="spacer"></span>'+
+  (rep&&can('reports','create')?'<button class="btn sm" id="drp-save" onclick="App.dirRepSave()">'+ic('save')+' Снимок в M13</button>':'')+
+  (rep&&can('meetings','export')?['docx','xlsx','pdf','csv'].map(x=>'<button class="btn sm" id="drp-'+x+'" onclick="App.dirRepExport(\''+x+'\')">'+ic('download')+' '+x.toUpperCase()+'</button>').join(''):'')+
+ '</div>'+
+ (rep?'<div class="card mb14"><div class="ch">'+ic('chart')+'Сводные показатели · '+esc(rep.name)+'</div><div class="cb">'+
+   '<div class="grid g4">'+rep.summary.map(s=>'<div class="stat-line"><span>'+esc(s[0])+'</span><b>'+esc(s[1])+'</b></div>').join('')+'</div></div></div>'+
+  '<div class="card"><div class="ch">'+ic('report')+esc(rep.name)+' ('+rep.total+')<span class="r small mut">данные на '+fmtDT(rep.ts)+'</span></div>'+
+  '<div class="tbl-wrap"><table class="tbl" id="dir-rep-table"><thead><tr>'+rep.columns.map(h=>'<th>'+esc(h)+'</th>').join('')+'</tr></thead><tbody>'+
+  (rep.rows.length?rep.rows.map(r=>'<tr class="nohover">'+r.map(c=>'<td class="small">'+esc(c)+'</td>').join('')+'</tr>').join('')
+   :'<tr class="nohover"><td colspan="'+rep.columns.length+'">'+emptyBlock('Записей по отбору нет','Измените вид отчёта или параметры отбора','report')+'</td></tr>')+
+  '</tbody></table></div></div>'
+ :'<div class="card"><div class="cb">'+emptyBlock('Отчёт не сформирован','Выберите вид отчёта и нажмите «Сформировать» — семь видов отчётности по поручениям (ТЗ §2.11.2)','report')+'</div></div>')+
+ '<div class="help-note mt14">'+ic('info')+'<div>Отчёт формируется сервером из реестра поручений M16, выгружается в DOCX/XLSX/PDF/CSV и может быть сохранён снимком в реестре отчётов M13. Отчёт по неисполненным решениям включает решения совещаний, по которым поручение не создано.</div></div>';
+}
+App.dirRepParams=function(){
+ const f=dirRepF(), p={kind:f.kind};
+ if(f.m)p.meetingId=f.m;
+ if(f.p)p.projectId=f.p;
+ if(f.a)p.assignee=f.a;
+ if(f.kind==='period'){p.from=f.from;p.to=f.to;}
+ return p;
+};
+App.dirRepLoad=function(save){
+ const p=App.dirRepParams();
+ if(save)p.save=true;
+ return rpc('directive.report',p).then(r=>{if(r){App.dirRep=r;renderView();}return r;});
+};
+App.dirRepSave=function(){if(!guard('reports','create'))return;App.dirRepLoad(true);};
+App.dirRepExport=function(fmt){
+ if(!guard('meetings','export'))return;
+ App.expDocPost('directives',fmt,App.dirRepParams());
+};
 /* ---------- M16 §2.10: поручения из решений совещаний ---------- */
 const decTasks=d=>{
  const ids=(d&&Array.isArray(d.taskIds)&&d.taskIds.length)?d.taskIds:(d&&d.taskId?[d.taskId]:[]);
  return ids.map(id=>T_(id)).filter(Boolean);
 };
 const dirOf=t=>Object.assign({source:'',criteria:'',coassignees:[],postedAt:null,postedBy:null,postedDate:null,
- meetingId:null,meetingCode:'',decisionId:null,decisionN:null,agendaN:null,protocolV:null,protocolDoc:null},(t&&t.directive)||{});
+ meetingId:null,meetingCode:'',decisionId:null,decisionN:null,agendaN:null,protocolV:null,protocolDoc:null,
+ controller:null,stateAt:null},(t&&t.directive)||{});
 function directiveBasis(t){
  const dr=dirOf(t), m=dr.meetingId?MEET(dr.meetingId):null;
  const d=m?(m.decisions||[]).find(x=>x.id===dr.decisionId):null;

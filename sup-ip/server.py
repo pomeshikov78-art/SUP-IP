@@ -39,7 +39,7 @@ except ImportError:
     docgen = None
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -636,6 +636,7 @@ def seed(db):
             db.save_ent(cur,"calEvent",dict(id="ce1",title="Согласование ТЗ АКИ-12 с заказчиком",date=D(4),time="15:00",type="Событие",participants=["u4","u2"],note="В переговорной №2"))
             db.save_ent(cur,"calEvent",dict(id="ce2",title="Инвентаризация измерительной лаборатории",date=D(12),time="09:00",type="Событие",participants=["u7","u1"],note=""))
             settings={"wip":8,"sessionMin":30,"loadWarn":85,"loadOver":100,
+                      "dirControl":json.loads(json.dumps(DIR_CONTROL_DEF)),
                       "dicts":json.loads(json.dumps(DEFAULT_DICTS)),"perms":json.loads(json.dumps(BASE_PERMS)),
                       "widgets":{},"seq":{"proj":6,"task":28,"risk":8,"doc":9,"calc":20,"report":20,"meet":43}}
             db.save_settings(cur,settings)
@@ -749,6 +750,10 @@ def apply_task_status(t, s):
     if s == "На проверке": t["progress"] = 90
     if s == "Возвращена на доработку": t["progress"] = 60
     if s in DONE_ST: t["progress"] = 100
+    if t.get("type") == "directive":
+        dr = t.get("directive") or {}
+        dr["stateAt"] = now_ms()          # контроль «без обновления состояния» (ТЗ §2.11.1)
+        t["directive"] = dr
 WIDGET_KEYS = ["kpi_portfolio","kpi_tasks","kpi_overdue","kpi_load","kpi_risks","kpi_meetings","chart_proj_status",
                "chart_hours_trend","chart_load","list_my_tasks","list_deviations","list_milestones","list_directives",
                "list_meetings","matrix_risks","cal_week"]
@@ -903,6 +908,8 @@ def h_task_status(db, cur, u, p):
 def h_task_progress(db, cur, u, p):
     t = get_req(db, cur, "task", p["id"]); guard(db, cur, u, "tasks", "edit", t)
     t["progress"] = max(0, min(100, int(p["value"])))
+    if t.get("type") == "directive":
+        dr = dir_of(t); dr["stateAt"] = now_ms(); t["directive"] = dr
     db.save_ent(cur, "task", t)
     db.audit(cur, "AUDIT", "info", u["id"], "tasks", "Прогресс задачи изменён", "Задача", t["id"], {"code": t["code"], "progress": t["progress"]})
     return t, msg("Прогресс: %d%%" % t["progress"], t["code"])
@@ -976,6 +983,7 @@ def gantt_affected(db, cur, t, delta):
     cur.execute("SELECT id FROM tasks WHERE project_id=%s", (t["projectId"],))
     for r in cur.fetchall():
         x = db.get_ent(cur, "task", r["id"])
+        if not x.get("end"): continue
         for d in x["deps"]:
             if d["id"] != t["id"]: continue
             viol = False
@@ -989,6 +997,7 @@ def gantt_affected(db, cur, t, delta):
 @reg("gantt.impact")
 def h_gantt_impact(db, cur, u, p):
     t = get_req(db, cur, "task", p["id"]); guard(db, cur, u, "gantt", "view")
+    if not t.get("end"): raise RpcError("У поручения не установлен срок исполнения — задайте его в карточке (ТЗ §2.11.1)", "Гант")
     delta = int(p["delta"])
     if abs(delta) > 365: raise RpcError("Сдвиг слишком велик")
     aff = gantt_affected(db, cur, t, delta)
@@ -999,11 +1008,13 @@ def h_gantt_impact(db, cur, u, p):
 def h_gantt_shift(db, cur, u, p):
     t = get_req(db, cur, "task", p["id"])
     pr = get_req(db, cur, "project", t["projectId"]); guard(db, cur, u, "gantt", "edit", pr)
+    if not t.get("end"): raise RpcError("У поручения не установлен срок исполнения — задайте его в карточке (ТЗ §2.11.1)", "Гант")
     delta = int(p["delta"])
     if abs(delta) > 365: raise RpcError("Сдвиг слишком велик")
     before = {"start": t["start"], "end": t["end"]}
     shifted = []
     def shift(task, dd):
+        if not task.get("end"): return          # поручение без срока не сдвигается (контроль §2.11.1)
         task["start"] = dISO(parseD(task["start"]) + datetime.timedelta(days=dd))
         task["end"] = dISO(parseD(task["end"]) + datetime.timedelta(days=dd))
         db.save_ent(cur, "task", task); shifted.append(task["code"])
@@ -1012,10 +1023,12 @@ def h_gantt_shift(db, cur, u, p):
         queue = [t["id"]]; seen = {t["id"]}
         while queue:
             ct = db.get_ent(cur, "task", queue.pop(0))
+            if not ct.get("end"): continue      # поручение без срока в каскаде не участвует
             cur.execute("SELECT id FROM tasks WHERE project_id=%s", (ct["projectId"],))
             for r in cur.fetchall():
                 if r["id"] in seen: continue
                 x = db.get_ent(cur, "task", r["id"])
+                if not x.get("end"): continue
                 for d in x["deps"]:
                     if d["id"] != ct["id"]: continue
                     need = 0; lag = d.get("lag") or 0
@@ -1464,7 +1477,8 @@ def _directive_from_decision(db, cur, u, m, d, p=None):
                    "Поручение", t["id"], dedupe="directive.coassigned:%s:%s" % (uid_, t["id"]))
     db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Создано поручение из решения совещания", "Совещание", m["id"],
              {"meeting": m["code"], "task": t["code"], "decision": links["decisionN"], "assignee": assignee,
-              "coassignees": co, "due": due, "source": src, "event": "MEETING_DIRECTIVE_CREATED"})
+              "coassignees": co, "due": due, "source": src, "event": "MEETING_DIRECTIVE_CREATED",
+              "events": ["MEETING_DIRECTIVE_CREATED", "MEETING_TASK_CREATED"]})
     LOG.info("Поручение %s создано из решения №%s совещания %s (исполнитель %s, срок %s)",
              t["code"], links["decisionN"], m["code"], assignee, due)
     return t
@@ -1544,7 +1558,7 @@ def dir_of(t):
     d = {"source": "", "criteria": "", "coassignees": [], "postedAt": None, "postedBy": None,
          "postedDate": None, "meetingId": None, "meetingCode": "", "decisionId": None, "decisionN": None,
          "agendaN": None, "protocolV": None, "protocolDoc": None, "dueHistory": [], "acceptance": None,
-         "docs": [], "factDate": None, "comment": ""}
+         "docs": [], "factDate": None, "comment": "", "controller": None, "stateAt": None}
     d.update(t.get("directive") or {})
     for k in ("coassignees", "dueHistory", "docs"):
         if not isinstance(d.get(k), list): d[k] = []
@@ -1552,7 +1566,7 @@ def dir_of(t):
 
 def directive_overdue(t):
     """Просрочка вычисляется автоматически (ТЗ §19.6): срок прошёл, работа не завершена."""
-    return (t.get("end") or "") < dISO(today()) and t["status"] not in DONE_ST + ["Отменена"]
+    return bool(t.get("end")) and t["end"] < dISO(today()) and t["status"] not in DONE_ST + ["Отменена"]
 
 def directive_status(t):
     """Статус поручения в реестре — производный от статуса задачи и приёмки результата (§2.11)."""
@@ -1586,7 +1600,9 @@ def directive_row(db, cur, t):
             "factDate": dr.get("factDate"), "result": t.get("result", ""), "comment": dr.get("comment", ""),
             "criteria": dr.get("criteria", ""), "source": dr.get("source", ""), "priority": t["priority"],
             "docs": dr["docs"], "dueHistory": dr["dueHistory"], "acceptance": dr.get("acceptance"),
-            "overdueDays": diffD(dISO(today()), t["end"]) if directive_overdue(t) else 0}
+            "controller": dr.get("controller"), "stateAt": directive_state_ts(t),
+            "idleDays": int((now_ms() - directive_state_ts(t)) / (DAY * 1000)),
+            "overdueDays": diffD(dISO(today()), t["end"]) if directive_overdue(t) and t.get("end") else 0}
 
 def _directive_req(db, cur, u, p, op="edit"):
     t = get_req(db, cur, "task", p["id"])
@@ -1595,10 +1611,8 @@ def _directive_req(db, cur, u, p, op="edit"):
     return t
 
 def _directive_notify(db, cur, t, dr, type_, title, body, extra=()):
-    m = db.get_ent(cur, "meeting", dr.get("meetingId")) if dr.get("meetingId") else None
-    rec = [t.get("assignee")] + list(dr.get("coassignees") or [])
-    if m: rec += [m.get("chair"), m.get("secretary")]
-    rec += list(extra)
+    """Состав получателей определяется настройкой контроля поручений (ТЗ §2.11.1)."""
+    rec = directive_recipients(db, cur, t, dr) + list(extra)
     for uid_ in dict.fromkeys([x for x in rec if x]):
         notify(db, cur, uid_, type_, title, body, "Поручение", t["id"],
                dedupe="%s:%s:%s:%s" % (type_, uid_, t["id"], now_ms()))
@@ -1627,6 +1641,37 @@ def h_directive_update(db, cur, u, p):
     """Карточка поручения: соисполнители, критерии, комментарий, результат, дата фактического исполнения."""
     t = _directive_req(db, cur, u, p)
     dr = dir_of(t)
+    touched = False
+    if "assignee" in p:
+        aid = p["assignee"] or None
+        if aid:
+            cur.execute("SELECT id FROM users WHERE id=%s AND NOT blocked", (aid,))
+            if not cur.fetchone(): raise RpcError("Исполнитель не найден или заблокирован: %s" % aid, "Поручение")
+            dr["coassignees"] = [c for c in dr["coassignees"] if c != aid]
+        if aid != t.get("assignee"): touched = True
+        t["assignee"] = aid          # снятие исполнителя выявляется контролем §2.11.1
+    if "due" in p:
+        nd = p["due"] or None
+        if nd:
+            check_date(nd, "дата срока поручения")
+            if t.get("end") and nd != t["end"]:
+                raise RpcError("Изменение установленного срока выполняется продлением с основанием (directive.extend)",
+                               "Поручение")
+            if not t.get("end"):
+                dr["dueHistory"].append({"ts": now_ms(), "by": u["id"], "from": None, "to": nd,
+                                         "reason": "Установлен срок исполнения поручения"})
+        elif t.get("end"):
+            dr["dueHistory"].append({"ts": now_ms(), "by": u["id"], "from": t["end"], "to": None,
+                                     "reason": "Срок исполнения снят — поручение подлежит контролю §2.11.1"})
+        if (nd or "") != (t.get("end") or ""): touched = True
+        t["end"] = nd or ""            # снятый срок хранится пустым значением (NOT NULL в схеме)
+        if nd and (t.get("start") or "") > nd: t["start"] = nd
+    if "controller" in p:
+        cid = p["controller"] or None
+        if cid:
+            cur.execute("SELECT id FROM users WHERE id=%s AND NOT blocked", (cid,))
+            if not cur.fetchone(): raise RpcError("Контролирующее лицо не найдено: %s" % cid, "Поручение")
+        dr["controller"] = cid
     if "coassignees" in p:
         co = []
         for uid_ in (p.get("coassignees") or [])[:10]:
@@ -1647,7 +1692,9 @@ def h_directive_update(db, cur, u, p):
     if "progress" in p:
         v = int(p["progress"])
         if not 0 <= v <= 100: raise RpcError("Процент выполнения: 0…100", "Поручение")
+        if v != t["progress"]: touched = True
         t["progress"] = v
+    if touched or any(k in p for k in ("result", "factDate")): dr["stateAt"] = now_ms()
     t["directive"] = dr
     db.save_ent(cur, "task", t)
     db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Карточка поручения изменена", "Поручение", t["id"],
@@ -1709,7 +1756,8 @@ def h_directive_accept(db, cur, u, p):
     _directive_notify(db, cur, t, dr, ntype, title, sub)
     db.audit(cur, "BUSINESS", "info" if verdict == "Принято" else "warning", u["id"], "meetings",
              "Приёмка результата поручения: " + verdict, "Поручение", t["id"],
-             {"code": t["code"], "verdict": verdict, "comment": comment, "event": ev})
+             {"code": t["code"], "verdict": verdict, "comment": comment, "event": ev,
+              "events": [ev] + (["MEETING_TASK_COMPLETED"] if verdict == "Принято" else [])})
     return directive_row(db, cur, t), msg("Результат поручения: " + verdict, sub, tone)
 
 @reg("directive.attach")
@@ -1740,6 +1788,491 @@ def h_directive_detach(db, cur, u, p):
     db.audit(cur, "AUDIT", "warning", u["id"], "meetings", "Подтверждающий документ откреплён от поручения", "Поручение", t["id"],
              {"code": t["code"], "doc": p.get("docId")})
     return directive_row(db, cur, t), msg("Документ откреплён", "Сам документ остался в M09")
+# ---------------- Контроль сроков и отчётность по поручениям (ТЗ M16 §2.11.1–2.11.2) ----------------
+# Система автоматически выявляет шесть категорий отклонений по поручениям и рассылает уведомления
+# настраиваемому кругу получателей: исполнитель, соисполнители, председатель, секретарь,
+# руководитель подразделения, контролирующее лицо. Отчётность — семь видов отчётов (§2.11.2),
+# каждый выгружается в DOCX/XLSX/PDF/CSV/HTML и сохраняется снимком в реестре отчётов M13.
+
+DIR_CHECKS = [("dueSoon", "Приближается срок исполнения"), ("overdue", "Просрочено"),
+              ("noAssignee", "Без исполнителя"), ("noDue", "Без установленного срока"),
+              ("stale", "Без обновления состояния"), ("needReview", "Требует проверки результата")]
+DIR_RECIPIENTS = [("assignee", "Исполнитель"), ("coassignees", "Соисполнители"),
+                  ("chair", "Председатель совещания"), ("secretary", "Секретарь совещания"),
+                  ("head", "Руководитель подразделения"), ("controller", "Контролирующее лицо")]
+DIR_CHECK_NOTIF = {"dueSoon": "directive.due", "overdue": "directive.overdue",
+                   "noAssignee": "directive.noassignee", "noDue": "directive.nodue",
+                   "stale": "directive.stale", "needReview": "directive.review"}
+DIR_CONTROL_DEF = {"dueSoonDays": 3, "staleDays": 7, "controller": None,
+                   "recipients": {k: True for k, _ in DIR_RECIPIENTS},
+                   "checks": {k: True for k, _ in DIR_CHECKS}}
+
+def dir_control_cfg(db, cur):
+    """Действующая настройка контроля сроков (значения по умолчанию — для записей прежних версий)."""
+    c = (db.settings(cur) or {}).get("dirControl") or {}
+    rec, chk = c.get("recipients") or {}, c.get("checks") or {}
+    try: soon = int(c.get("dueSoonDays", DIR_CONTROL_DEF["dueSoonDays"]))
+    except Exception: soon = DIR_CONTROL_DEF["dueSoonDays"]
+    try: stale = int(c.get("staleDays", DIR_CONTROL_DEF["staleDays"]))
+    except Exception: stale = DIR_CONTROL_DEF["staleDays"]
+    return {"dueSoonDays": max(1, min(30, soon)), "staleDays": max(1, min(90, stale)),
+            "controller": c.get("controller") or None,
+            "recipients": {k: bool(rec.get(k, True)) for k, _ in DIR_RECIPIENTS},
+            "checks": {k: bool(chk.get(k, True)) for k, _ in DIR_CHECKS}}
+
+def _active_ids(db, cur):
+    cur.execute("SELECT id FROM users WHERE NOT blocked")
+    return {r["id"] for r in cur.fetchall()}
+
+def _head_ids(db, cur):
+    cur.execute("SELECT id FROM users WHERE role='head' AND NOT blocked ORDER BY id")
+    return [r["id"] for r in cur.fetchall()]
+
+def directive_state_ts(t):
+    """Момент последнего обновления состояния поручения: статус, процент, результат, срок, приёмка."""
+    dr = dir_of(t)
+    ts = [t.get("createdAt") or 0, dr.get("stateAt") or 0, (dr.get("acceptance") or {}).get("ts") or 0]
+    ts += [h.get("ts") or 0 for h in dr["dueHistory"]]
+    return max(ts)
+
+def directive_issues(db, cur, t, cfg=None, active=None):
+    """Категории отклонений поручения (ТЗ §2.11.1). Завершённые и отменённые не проверяются."""
+    st = directive_status(t)
+    if st in ("Выполнено", "Отменено"): return []
+    cfg = cfg or dir_control_cfg(db, cur)
+    active = _active_ids(db, cur) if active is None else active
+    dr = dir_of(t)
+    today_s = dISO(today())
+    found = []
+    if not t.get("assignee") or t["assignee"] not in active: found.append("noAssignee")
+    if not t.get("end"):
+        found.append("noDue")
+    elif directive_overdue(t):
+        found.append("overdue")
+    elif diffD(t["end"], today_s) <= cfg["dueSoonDays"]:
+        found.append("dueSoon")
+    if now_ms() - directive_state_ts(t) > cfg["staleDays"] * DAY * 1000: found.append("stale")
+    if st in ("На проверке", "Ожидает подтверждения"): found.append("needReview")
+    return [k for k, _ in DIR_CHECKS if k in found and cfg["checks"].get(k, True)]
+
+def directive_recipients(db, cur, t, dr, cfg=None, active=None):
+    """Круг получателей уведомлений по поручению — согласно настройке (ТЗ §2.11.1)."""
+    cfg = cfg or dir_control_cfg(db, cur)
+    active = _active_ids(db, cur) if active is None else active
+    rec = cfg["recipients"]
+    m = db.get_ent(cur, "meeting", dr.get("meetingId")) if dr.get("meetingId") else None
+    out = []
+    if rec.get("assignee"): out.append(t.get("assignee"))
+    if rec.get("coassignees"): out += list(dr.get("coassignees") or [])
+    if rec.get("chair") and m: out.append(m.get("chair"))
+    if rec.get("secretary") and m: out.append(m.get("secretary"))
+    heads = _head_ids(db, cur)
+    if rec.get("head"): out += heads
+    if rec.get("controller"): out.append(dr.get("controller") or cfg.get("controller") or (heads[0] if heads else None))
+    return [x for x in dict.fromkeys([y for y in out if y]) if x in active]
+
+def _directive_control_msg(db, cur, t, check):
+    """Заголовок и текст уведомления для категории отклонения."""
+    dr = dir_of(t)
+    if check == "dueSoon":
+        return ("Приближается срок поручения: %s" % t["title"],
+                "%s · срок %s · осталось %d дн" % (t["code"], _fd(t["end"]), diffD(t["end"], dISO(today()))))
+    if check == "overdue":
+        return ("Поручение просрочено: %s" % t["title"],
+                "%s · срок %s · просрочка %d дн" % (t["code"], _fd(t["end"]), diffD(dISO(today()), t["end"])))
+    if check == "noAssignee":
+        return ("Поручение без исполнителя: %s" % t["title"],
+                "%s · требуется назначить ответственного исполнителя" % t["code"])
+    if check == "noDue":
+        return ("Поручение без срока исполнения: %s" % t["title"],
+                "%s · требуется установить срок исполнения" % t["code"])
+    if check == "stale":
+        d = int((now_ms() - directive_state_ts(t)) / (DAY * 1000))
+        return ("Поручение без обновления состояния: %s" % t["title"],
+                "%s · состояние не обновлялось %d дн · требуется контроль исполнения" % (t["code"], d))
+    return ("Поручение требует проверки результата: %s" % t["title"],
+            "%s · результат заявлен исполнителем и ожидает приёмки руководителем" % t["code"])
+
+def _audit_overdue_once(db, cur, t, today_s):
+    """Событие MEETING_TASK_OVERDUE (ТЗ §2.13) — не чаще одного раза в сутки на поручение."""
+    day_start = int(time.mktime(today().timetuple())) * 1000
+    cur.execute("SELECT 1 FROM events WHERE obj_id=%s AND action=%s AND ts>=%s LIMIT 1",
+                (t["id"], "Выявлена просрочка поручения", day_start))
+    if cur.fetchone(): return False
+    db.audit(cur, "BUSINESS", "warning", "system", "meetings", "Выявлена просрочка поручения", "Поручение", t["id"],
+             {"code": t["code"], "due": t["end"], "days": diffD(today_s, t["end"]),
+              "assignee": t.get("assignee"), "event": "MEETING_TASK_OVERDUE"})
+    return True
+
+def directive_control_cycle(db, cur):
+    """Проход контроля сроков поручений: выявление отклонений и рассылка (ТЗ §2.11.1)."""
+    cfg = dir_control_cfg(db, cur)
+    active = _active_ids(db, cur)
+    today_s = dISO(today())
+    by = {k: 0 for k, _ in DIR_CHECKS}
+    found = {k: 0 for k, _ in DIR_CHECKS}
+    delivered = 0
+    tasks = 0
+    for t in db.all_ent(cur, "task", order="code"):
+        if t.get("type") != "directive": continue
+        tasks += 1
+        iss = directive_issues(db, cur, t, cfg, active)
+        if not iss: continue
+        dr = dir_of(t)
+        rec = directive_recipients(db, cur, t, dr, cfg, active)
+        for k in iss:
+            found[k] += 1
+            title, body = _directive_control_msg(db, cur, t, k)
+            n = notify_many(db, cur, rec, DIR_CHECK_NOTIF[k], title, body, "Поручение", t["id"], dedupe_suffix=today_s)
+            by[k] += n
+            delivered += n
+            if k == "overdue" and n: _audit_overdue_once(db, cur, t, today_s)
+    return {"delivered": delivered, "byCheck": by, "found": found, "tasks": tasks,
+            "recipients": cfg["recipients"], "dueSoonDays": cfg["dueSoonDays"], "staleDays": cfg["staleDays"]}
+
+@reg("directive.control")
+def h_directive_control(db, cur, u, p):
+    """Контроль сроков (ТЗ §2.11.1): шесть категорий отклонений с указанием получателей уведомления."""
+    guard(db, cur, u, "meetings", "view")
+    cfg = dir_control_cfg(db, cur)
+    active = _active_ids(db, cur)
+    f = p or {}
+    rows = []
+    for t in db.all_ent(cur, "task", order="code"):
+        if t.get("type") != "directive": continue
+        iss = directive_issues(db, cur, t, cfg, active)
+        if not iss: continue
+        if f.get("check") and f["check"] not in iss: continue
+        if f.get("meetingId") and t.get("meetingId") != f["meetingId"]: continue
+        if f.get("projectId") and t.get("projectId") != f["projectId"]: continue
+        if f.get("assignee") and t.get("assignee") != f["assignee"] and f["assignee"] not in dir_of(t)["coassignees"]: continue
+        r = directive_row(db, cur, t)
+        r["issues"] = iss
+        r["stateAt"] = directive_state_ts(t)
+        r["idleDays"] = int((now_ms() - r["stateAt"]) / (DAY * 1000))
+        r["recipients"] = directive_recipients(db, cur, t, dir_of(t), cfg, active)
+        rows.append(r)
+    return {"rows": rows, "total": len(rows), "cfg": cfg,
+            "checks": [{"key": k, "name": n, "on": cfg["checks"][k],
+                        "count": sum(1 for r in rows if k in r["issues"])} for k, n in DIR_CHECKS],
+            "recipientKinds": [{"key": k, "name": n, "on": cfg["recipients"][k]} for k, n in DIR_RECIPIENTS]}, None
+
+@reg("directive.controlConfig")
+def h_directive_control_config(db, cur, u, p):
+    """Настройка контроля: пороги, состав проверок и состав получателей уведомлений (ТЗ §2.11.1)."""
+    guard(db, cur, u, "meetings", "view")
+    cfg = dir_control_cfg(db, cur)
+    if not p: return cfg, None
+    guard(db, cur, u, "admin", "edit")
+    s = db.settings(cur)
+    c = dict(cfg)
+    if "dueSoonDays" in p:
+        try: v = int(p["dueSoonDays"])
+        except Exception: raise RpcError("Порог приближения срока: целое число дней", "Контроль поручений")
+        if not 1 <= v <= 30: raise RpcError("Порог приближения срока: 1…30 дней", "Контроль поручений")
+        c["dueSoonDays"] = v
+    if "staleDays" in p:
+        try: v = int(p["staleDays"])
+        except Exception: raise RpcError("Порог отсутствия обновлений: целое число дней", "Контроль поручений")
+        if not 1 <= v <= 90: raise RpcError("Порог отсутствия обновлений: 1…90 дней", "Контроль поручений")
+        c["staleDays"] = v
+    if "recipients" in p:
+        rec = dict(c["recipients"])
+        for k, v in (p["recipients"] or {}).items():
+            if k not in c["recipients"]: raise RpcError("Неизвестный получатель: %s" % k, "Контроль поручений")
+            rec[k] = bool(v)
+        if not any(rec.values()): raise RpcError("Должен остаться хотя бы один получатель уведомлений", "Контроль поручений")
+        c["recipients"] = rec
+    if "checks" in p:
+        chk = dict(c["checks"])
+        for k, v in (p["checks"] or {}).items():
+            if k not in chk: raise RpcError("Неизвестная проверка: %s" % k, "Контроль поручений")
+            chk[k] = bool(v)
+        if not any(chk.values()): raise RpcError("Должна остаться хотя бы одна проверка контроля сроков", "Контроль поручений")
+        c["checks"] = chk
+    if "controller" in p:
+        cid = p["controller"] or None
+        if cid:
+            cur.execute("SELECT id FROM users WHERE id=%s AND NOT blocked", (cid,))
+            if not cur.fetchone(): raise RpcError("Контролирующее лицо не найдено: %s" % cid, "Контроль поручений")
+        c["controller"] = cid
+    s["dirControl"] = c
+    db.save_settings(cur, s)
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Изменены настройки контроля поручений", "Система", "",
+             {"dueSoonDays": c["dueSoonDays"], "staleDays": c["staleDays"], "controller": c["controller"],
+              "recipients": [k for k, v in c["recipients"].items() if v],
+              "checks": [k for k, v in c["checks"].items() if v], "event": "MEETING_DIRECTIVE_CONTROL_CONFIG"})
+    return c, msg("Настройки контроля сохранены", "Пороги и состав получателей применяются планировщиком немедленно")
+
+@reg("directive.controlNotify")
+def h_directive_control_notify(db, cur, u, p):
+    """Внеочередной проход контроля сроков с рассылкой (руководитель, председатель)."""
+    guard(db, cur, u, "meetings", "approve")
+    res = directive_control_cycle(db, cur)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Выполнен контроль сроков поручений", "Система", "",
+             {"delivered": res["delivered"], "found": res["found"], "event": "MEETING_DIRECTIVE_CONTROL_RUN"})
+    return res, msg("Контроль сроков выполнен", "Отклонений выявлено: %d · уведомлений доставлено: %d"
+                    % (sum(res["found"].values()), res["delivered"]))
+
+# ---- Отчётность по поручениям (ТЗ §2.11.2): семь видов отчётов ----
+DIRECTIVE_REPORTS = [("registry", "Реестр всех поручений"), ("overdue", "Перечень просроченных поручений"),
+                     ("assignees", "Отчёт по исполнителям"), ("meetings", "Отчёт по совещаниям"),
+                     ("projects", "Отчёт по проектам"), ("period", "Отчёт по исполнению за период"),
+                     ("unfulfilled", "Отчёт по неисполненным решениям")]
+DIR_REPORT_NAMES = dict(DIRECTIVE_REPORTS)
+
+def _dir_report_filter(db, cur, rows, f):
+    if f.get("meetingId"): rows = [r for r in rows if r["meetingId"] == f["meetingId"]]
+    if f.get("projectId"): rows = [r for r in rows if r["projectId"] == f["projectId"]]
+    if f.get("assignee"): rows = [r for r in rows if r["assignee"] == f["assignee"] or f["assignee"] in r["coassignees"]]
+    if f.get("from"): rows = [r for r in rows if (r["due"] or "") >= f["from"]]
+    if f.get("to"): rows = [r for r in rows if (r["due"] or "") <= f["to"]]
+    return rows
+
+def _dir_pct(done, total):
+    return int(round(100.0 * done / total)) if total else 0
+
+def _dir_hours(db, cur, ids):
+    if not ids: return 0.0
+    cur.execute("SELECT COALESCE(SUM(hours),0) AS h FROM time_entries WHERE task_id = ANY(%s) AND status<>'Отклонена'",
+                (list(ids),))
+    return round(float(cur.fetchone()["h"]), 1)
+
+def _dir_report_meta(db, cur, f):
+    m = []
+    if f.get("from") or f.get("to"): m.append(("Период", "%s — %s" % (_fd(f.get("from")), _fd(f.get("to")))))
+    if f.get("meetingId"):
+        mm = db.get_ent(cur, "meeting", f["meetingId"])
+        m.append(("Совещание", (mm or {}).get("code", f["meetingId"])))
+    if f.get("projectId"): m.append(("Проект", _pname(db, cur, f["projectId"])))
+    if f.get("assignee"): m.append(("Исполнитель", _uname(db, cur, f["assignee"])))
+    return m or [("Отбор", "Все поручения")]
+
+def directive_report_data(db, cur, u, kind, params=None):
+    """Данные отчёта по поручениям: сводные показатели, таблица и диаграмма (ТЗ §2.11.2)."""
+    if kind not in DIR_REPORT_NAMES:
+        raise RpcError("Неизвестный вид отчёта по поручениям: %s" % kind, "Отчётность", 404, "UNKNOWN_REPORT")
+    f = dict(params or {})
+    if kind == "period":
+        f.setdefault("from", D(-30)); f.setdefault("to", dISO(today()))
+        if f.get("from") and f.get("to"):
+            check_date(f["from"], "дата начала периода"); check_date(f["to"], "дата окончания периода")
+            if f["from"] > f["to"]: raise RpcError("Начало периода позже его окончания", "Отчётность")
+    tasks = [t for t in db.all_ent(cur, "task", order="code") if t.get("type") == "directive"]
+    rows = [directive_row(db, cur, t) for t in tasks]
+    tmap = {t["id"]: t for t in tasks}
+    name = DIR_REPORT_NAMES[kind]
+    columns, data, summary, chart = [], [], [], None
+    today_s = dISO(today())
+
+    if kind in ("registry", "overdue"):
+        sel = _dir_report_filter(db, cur, rows, f)
+        if kind == "overdue":
+            sel = sorted([r for r in sel if r["overdueDays"] > 0], key=lambda r: -r["overdueDays"])
+            columns = ["№", "Поручение", "Совещание", "Исполнитель", "Срок", "Просрочка, дн", "Статус", "%", "Контролирующее лицо"]
+            for r in sel:
+                ctl = r.get("controller") or dir_control_cfg(db, cur).get("controller")
+                data.append([r["code"], r["title"], r["meetingCode"], _uname(db, cur, r["assignee"]) or "— не назначен —",
+                             _fd(r["due"]), r["overdueDays"], r["status"], r["progress"], _uname(db, cur, ctl)])
+            days = [r["overdueDays"] for r in sel]
+            summary = [("Просроченных поручений", len(sel)),
+                       ("Максимальная просрочка, дн", max(days) if days else 0),
+                       ("Средняя просрочка, дн", round(sum(days) / len(days), 1) if days else 0),
+                       ("Без исполнителя", sum(1 for r in sel if not r["assignee"])),
+                       ("Срок продлевался", sum(1 for r in sel if r["dueHistory"]))]
+            if sel:
+                top = sel[:8]
+                chart = {"type": "bar", "labels": [r["code"] for r in top],
+                         "values": [r["overdueDays"] for r in top], "unit": "дн", "title": "Наибольшие просрочки"}
+        else:
+            columns = ["№", "Совещание", "Протокол", "Решение", "Поручение", "Исполнитель", "Соисполнители",
+                       "Срок", "Статус", "%", "Дата факта", "Результат", "Документы"]
+            for r in sel:
+                data.append([r["code"], r["meetingCode"], ("ред. %s" % r["protocolV"]) if r["protocolV"] else "—",
+                             (("№%s · " % r["decisionN"]) if r["decisionN"] else "") + (r["decisionText"] or r["title"]),
+                             r["title"], _uname(db, cur, r["assignee"]) or "— не назначен —",
+                             ", ".join(_uname(db, cur, c) for c in r["coassignees"]) or "—",
+                             _fd(r["due"]) or "— не установлен —", r["status"], r["progress"],
+                             _fd(r["factDate"]) or "—", r["result"] or "—",
+                             ", ".join(x["code"] for x in r["docs"]) or "—"])
+            summary = [("Всего поручений", len(sel))] + \
+                      [(s, sum(1 for r in sel if r["status"] == s)) for s in DIRECTIVE_STATUSES
+                       if any(r["status"] == s for r in sel)] + \
+                      [("Средний процент выполнения", _dir_pct(sum(r["progress"] for r in sel), 100 * len(sel)) if sel else 0)]
+            chart = {"type": "pie", "labels": [s for s in DIRECTIVE_STATUSES if any(r["status"] == s for r in sel)],
+                     "values": [sum(1 for r in sel if r["status"] == s) for s in DIRECTIVE_STATUSES
+                                if any(r["status"] == s for r in sel)], "unit": "шт", "title": "Состояния поручений"}
+
+    elif kind == "assignees":
+        sel = _dir_report_filter(db, cur, rows, f)
+        columns = ["Исполнитель", "Должность", "Всего", "Выполнено", "В работе", "На проверке", "Просрочено",
+                   "Не начато", "Дисциплина, %", "Средняя просрочка, дн"]
+        groups = {}
+        for r in sel: groups.setdefault(r["assignee"] or "", []).append(r)
+        for uid_, gr in sorted(groups.items(), key=lambda kv: _uname(db, cur, kv[0]) or "я"):
+            done = sum(1 for r in gr if r["status"] == "Выполнено")
+            over = [r["overdueDays"] for r in gr if r["overdueDays"] > 0]
+            data.append([_uname(db, cur, uid_) or "— без исполнителя —", _role_of(db, cur, uid_), len(gr), done,
+                         sum(1 for r in gr if r["status"] == "В работе"),
+                         sum(1 for r in gr if r["status"] in ("На проверке", "Ожидает подтверждения")),
+                         len(over), sum(1 for r in gr if r["status"] == "Не начато"),
+                         _dir_pct(done, len(gr)), round(sum(over) / len(over), 1) if over else 0])
+        summary = [("Исполнителей в отчёте", len(data)), ("Поручений", len(sel)),
+                   ("Исполнено и принято", sum(1 for r in sel if r["status"] == "Выполнено")),
+                   ("Исполнительская дисциплина, %", _dir_pct(sum(1 for r in sel if r["status"] == "Выполнено"), len(sel)))]
+        if data:
+            chart = {"type": "bar", "labels": [r[0] for r in data], "values": [r[2] for r in data],
+                     "unit": "шт", "title": "Поручений по исполнителям"}
+
+    elif kind == "meetings":
+        sel = _dir_report_filter(db, cur, rows, f)
+        columns = ["Совещание", "Дата", "Протокол", "Решений", "Поручений", "Выполнено", "Просрочено", "Не начато", "Исполнение, %"]
+        meetings = [m for m in db.all_ent(cur, "meeting", order="code")
+                    if not f.get("meetingId") or m["id"] == f["meetingId"]]
+        no_task = 0
+        for m in meetings:
+            gr = [r for r in sel if r["meetingId"] == m["id"]]
+            decs = m.get("decisions") or []
+            no_task += sum(1 for d in decs if not [x for x in dec_task_ids(d) if x in tmap])
+            if not gr and not decs: continue
+            if f.get("from") and (m.get("date") or "") < f["from"]: continue
+            if f.get("to") and (m.get("date") or "") > f["to"]: continue
+            done = sum(1 for r in gr if r["status"] == "Выполнено")
+            pr = prot_of(m)
+            data.append([m["code"] + " · " + m["title"], _fd(m["date"]),
+                         ("ред. %s" % pr["version"]) if pr.get("version") else "не утверждён",
+                         len(decs), len(gr), done, sum(1 for r in gr if r["overdueDays"] > 0),
+                         sum(1 for r in gr if r["status"] == "Не начато"), _dir_pct(done, len(gr))])
+        summary = [("Совещаний в отчёте", len(data)), ("Поручений", len(sel)),
+                   ("Решений без поручений", no_task),
+                   ("Исполнено и принято", sum(1 for r in sel if r["status"] == "Выполнено"))]
+
+    elif kind == "projects":
+        sel = _dir_report_filter(db, cur, rows, f)
+        columns = ["Проект", "Наименование", "Поручений", "Выполнено", "В работе", "Просрочено", "Исполнение, %", "Трудозатраты, ч"]
+        groups = {}
+        for r in sel: groups.setdefault(r["projectId"] or "", []).append(r)
+        for pid, gr in sorted(groups.items(), key=lambda kv: (db.get_ent(cur, "project", kv[0]) or {}).get("code", "")):
+            pj = db.get_ent(cur, "project", pid) or {}
+            done = sum(1 for r in gr if r["status"] == "Выполнено")
+            data.append([pj.get("code", "—"), pj.get("name", "Проект не указан"), len(gr), done,
+                         sum(1 for r in gr if r["status"] == "В работе"),
+                         sum(1 for r in gr if r["overdueDays"] > 0), _dir_pct(done, len(gr)),
+                         _dir_hours(db, cur, [r["id"] for r in gr])])
+        summary = [("Проектов в отчёте", len(data)), ("Поручений", len(sel)),
+                   ("Трудозатраты по поручениям, ч", _dir_hours(db, cur, [r["id"] for r in sel])),
+                   ("Исполнение, %", _dir_pct(sum(1 for r in sel if r["status"] == "Выполнено"), len(sel)))]
+
+    elif kind == "period":
+        lo, hi = f["from"], f["to"]
+        sel = [r for r in rows if (lo <= (r["postedDate"] or "") <= hi) or (lo <= (r["factDate"] or "") <= hi)
+               or (lo <= (r["due"] or "") <= hi)]
+        sel = _dir_report_filter(db, cur, sel, {"meetingId": f.get("meetingId"), "projectId": f.get("projectId"),
+                                               "assignee": f.get("assignee")})
+        columns = ["№", "Поручение", "Исполнитель", "Постановка", "Срок", "Дата факта", "Статус", "%", "Продлений срока"]
+        for r in sel:
+            data.append([r["code"], r["title"], _uname(db, cur, r["assignee"]) or "— не назначен —",
+                         _fd(r["postedDate"]), _fd(r["due"]) or "—", _fd(r["factDate"]) or "—",
+                         r["status"], r["progress"], len(r["dueHistory"])])
+        posted = [r for r in rows if lo <= (r["postedDate"] or "") <= hi]
+        fact = [r for r in rows if lo <= (r["factDate"] or "") <= hi]
+        accepted = [r for r in rows if (r.get("acceptance") or {}).get("verdict") == "Принято"
+                    and lo <= dISO(datetime.date.fromtimestamp((r["acceptance"]["ts"] or 0) / 1000)) <= hi]
+        ext = sum(1 for r in rows for h in r["dueHistory"]
+                  if lo <= dISO(datetime.date.fromtimestamp((h.get("ts") or 0) / 1000)) <= hi)
+        in_time = sum(1 for r in fact if (r["due"] or "") >= (r["factDate"] or ""))
+        late = [r for r in rows if r["overdueDays"] > 0 and (r["due"] or "") <= hi]
+        summary = [("Период", "%s — %s" % (_fd(lo), _fd(hi))), ("Поставлено поручений", len(posted)),
+                   ("Исполнено (дата факта)", len(fact)), ("Принято руководителем", len(accepted)),
+                   ("Исполнено в срок", in_time), ("Дисциплина исполнения, %", _dir_pct(in_time, len(fact))),
+                   ("Просрочено на конец периода", len(late)), ("Продлений срока за период", ext)]
+        if fact or posted:
+            chart = {"type": "bar", "labels": ["Поставлено", "Исполнено", "Принято", "Просрочено"],
+                     "values": [len(posted), len(fact), len(accepted), len(late)], "unit": "шт",
+                     "title": "Исполнение за период"}
+
+    else:  # unfulfilled — неисполненные решения совещаний (в том числе без созданных поручений)
+        columns = ["Совещание", "Дата", "№ решения", "Решение", "Ответственный", "Срок решения",
+                   "Поручение", "Состояние поручения", "Просрочка, дн"]
+        meetings = [m for m in db.all_ent(cur, "meeting", order="code")
+                    if not f.get("meetingId") or m["id"] == f["meetingId"]]
+        no_task = 0
+        for m in meetings:
+            if f.get("from") and (m.get("date") or "") < f["from"]: continue
+            if f.get("to") and (m.get("date") or "") > f["to"]: continue
+            for i, d in enumerate(m.get("decisions") or []):
+                ts = [tmap[x] for x in dec_task_ids(d) if x in tmap]
+                if f.get("projectId") and not any(t["projectId"] == f["projectId"] for t in ts): continue
+                if f.get("assignee") and not any(t["assignee"] == f["assignee"] or
+                                                 f["assignee"] in dir_of(t)["coassignees"] for t in ts): continue
+                if not ts:
+                    if f.get("projectId") or f.get("assignee"): continue
+                    no_task += 1
+                    data.append([m["code"], _fd(m["date"]), i + 1, d.get("text", ""),
+                                 _uname(db, cur, d.get("resp")) or "— не назначен —", _fd(d.get("due")),
+                                 "— не создано —", "Поручение не создано",
+                                 diffD(today_s, d["due"]) if d.get("due") and d["due"] < today_s else 0])
+                    continue
+                for t in ts:
+                    st = directive_status(t)
+                    if st in ("Выполнено", "Отменено"): continue
+                    r = directive_row(db, cur, t)
+                    data.append([m["code"], _fd(m["date"]), i + 1, d.get("text", ""),
+                                 _uname(db, cur, t["assignee"]) or "— не назначен —", _fd(d.get("due")),
+                                 t["code"] + " · " + t["title"], st, r["overdueDays"]])
+        summary = [("Неисполненных решений", len(data)), ("Из них без поручения", no_task),
+                   ("Просроченных поручений", sum(1 for r in data if isinstance(r[8], int) and r[8] > 0)),
+                   ("Совещаний в отчёте", len(meetings))]
+
+    return {"kind": kind, "name": name, "title": name, "params": f, "columns": columns, "rows": data,
+            "summary": summary, "chart": chart, "total": len(data), "ts": now_ms(), "by": u["id"],
+            "meta": _dir_report_meta(db, cur, f)}
+
+def directive_report_html(rep):
+    """HTML-снимок отчёта для реестра M13 (данные фиксируются на момент формирования)."""
+    def esc(s):
+        return (str("" if s is None else s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    h = ["<h1>%s</h1>" % esc(rep["title"])]
+    h.append('<div class="rmeta">СУП-ИП · сформировано %s</div>'
+             % datetime.datetime.fromtimestamp(rep["ts"] / 1000).strftime("%d.%m.%Y %H:%M"))
+    h.append("<h2>Сводные показатели</h2><table><tbody>")
+    for k, v in rep["summary"]: h.append("<tr><td>%s</td><td>%s</td></tr>" % (esc(k), esc(v)))
+    h.append("</tbody></table>")
+    h.append("<h2>%s</h2><table><thead><tr>" % esc(rep["name"]))
+    h += ["<th>%s</th>" % esc(c) for c in rep["columns"]]
+    h.append("</tr></thead><tbody>")
+    for r in rep["rows"]:
+        h.append("<tr>" + "".join("<td>%s</td>" % esc(c) for c in r) + "</tr>")
+    h.append("</tbody></table>")
+    if not rep["rows"]: h.append("<p>По заданному отбору записей нет.</p>")
+    return "".join(h)
+
+@reg("directive.report")
+def h_directive_report(db, cur, u, p):
+    """Отчёт по поручениям (ТЗ §2.11.2). save=true — снимок в реестре отчётов M13."""
+    guard(db, cur, u, "meetings", "view")
+    kind = (p or {}).get("kind") or "registry"
+    rep = directive_report_data(db, cur, u, kind, p or {})
+    saved = None
+    if (p or {}).get("save"):
+        guard(db, cur, u, "reports", "create")
+        n = next_seq(db, cur, "report")
+        saved = dict(id=uid("rp"), code="ОТ-%03d" % n, type=rep["name"], title=rep["title"], params=rep["params"],
+                     ts=now_ms(), by=u["id"], status="Сформирован", html=directive_report_html(rep))
+        db.save_ent(cur, "report", saved)
+        db.audit(cur, "BUSINESS", "info", u["id"], "reports", "Сформирован отчёт по поручениям", "Отчёт", saved["id"],
+                 {"kind": kind, "code": saved["code"], "rows": rep["total"]})
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Сформирован отчёт по поручениям", "Поручение", kind,
+             {"kind": kind, "name": rep["name"], "rows": rep["total"], "params": rep["params"],
+              "event": "MEETING_DIRECTIVE_REPORT"})
+    return {"report": rep, "saved": saved, "kinds": [{"key": k, "name": n} for k, n in DIRECTIVE_REPORTS]}, \
+        msg("Отчёт сформирован: %s" % rep["name"], "Записей: %d%s" % (rep["total"], " · снимок сохранён в M13" if saved else ""))
+
+@reg("directive.reportKinds")
+def h_directive_report_kinds(db, cur, u, p):
+    guard(db, cur, u, "meetings", "view")
+    return {"kinds": [{"key": k, "name": n} for k, n in DIRECTIVE_REPORTS]}, None
+
 # ---------------- M13: отчёты ----------------
 @reg("report.save")
 def h_report_save(db, cur, u, p):
@@ -1999,6 +2532,7 @@ EXPORT_KINDS = {
     "risks":     ("risks", "Реестр рисков"),
     "calc":      ("calcs", "Протокол расчёта"),
     "meeting":   ("meetings", "Протокол совещания"),
+    "directives": ("meetings", "Отчёт по поручениям"),
     "report":    ("reports", "Отчёт"),
     "journal":   ("journal", "Журнал событий"),
     "dashboard": ("analytics", "Панель показателей"),
@@ -2143,7 +2677,7 @@ def build_export(db, cur, u, kind, id_="", params=None):
         for t in tasks: by_status[t["status"]] = by_status.get(t["status"], 0) + 1
         d.h1("2. Распределение по статусам")
         d.chart("bar", list(by_status), list(by_status.values()), title="Задачи по статусам", unit="шт")
-        overdue = [t for t in tasks if t["end"] < dISO(today()) and t["status"] not in ("Завершена", "Отменена", "Проверена")]
+        overdue = [t for t in tasks if t.get("end") and t["end"] < dISO(today()) and t["status"] not in ("Завершена", "Отменена", "Проверена")]
         if overdue:
             d.h1("3. Просроченные задачи")
             d.table(["Код", "Задача", "Исполнитель", "Срок", "Просрочка, дн"],
@@ -2166,12 +2700,13 @@ def build_export(db, cur, u, kind, id_="", params=None):
                   ("Статус", p["status"]), ("Прогресс, %", _proj_progress(db, cur, p["id"]))])
             d.table(["Код", "Работа", "Исполнитель", "Начало", "Окончание", "Длит., дн", "Прогресс, %", "Предшественники"],
                     [[t["code"], t["title"], _uname(db, cur, t["assignee"]), _fd(t["start"]), _fd(t["end"]),
-                      max(1, diffD(t["end"], t["start"]) + 1), t["progress"],
-                      ", ".join((db.get_ent(cur, "task", x) or {}).get("code", "") for x in (t["deps"] or []))] for t in tasks],
+                      max(1, diffD(t["end"], t["start"]) + 1) if t.get("end") else "—", t["progress"],
+                      ", ".join((db.get_ent(cur, "task", x["id"] if isinstance(x, dict) else x) or {}).get("code", "")
+                                for x in (t["deps"] or []))] for t in tasks],
                     widths=[0.9, 3, 1.5, 0.9, 0.9, 0.7, 0.8, 1.2],
                     aligns=[None, None, None, None, None, "right", "right", None],
                     title="График работ")
-            d.chart("bar", [t["code"] for t in tasks], [max(1, diffD(t["end"], t["start"]) + 1) for t in tasks],
+            d.chart("bar", [t["code"] for t in tasks], [max(1, diffD(t["end"], t["start"]) + 1) if t.get("end") else 0 for t in tasks],
                     title="Длительность работ", unit="дн")
             d.pagebreak()
         return d, "kalendarnyy_grafik"
@@ -2306,6 +2841,27 @@ def build_export(db, cur, u, kind, id_="", params=None):
         d = meeting_protocol_doc(db, cur, u, m)
         return d, "protokol_%s" % m["code"]
 
+    if kind == "directives":
+        rep = directive_report_data(db, cur, u, params.get("kind") or "registry", params)
+        d = D(rep["title"], subtitle="Отчётность по поручениям совещаний (ТЗ M16 §2.11.2)",
+              meta=_export_meta(db, cur, u, [("Вид отчёта", rep["name"]), ("Записей", rep["total"])] + rep["meta"]))
+        d.toc = True
+        d.h1("1. Сводные показатели")
+        d.kv(rep["summary"])
+        d.h1("2. " + rep["name"])
+        if rep["rows"]:
+            d.table(rep["columns"], rep["rows"], title=rep["name"])
+        else:
+            d.p("По заданному отбору записей нет.")
+        if rep.get("chart"):
+            ch = rep["chart"]
+            d.h1("3. Графическое представление")
+            d.chart(ch["type"], ch["labels"], ch["values"], title=ch.get("title", ""), unit=ch.get("unit", ""))
+        d.note("Отчёт сформирован из реестра поручений M16. Статус поручения синхронизирован со связанной задачей M02; "
+               "статус «Выполнено» устанавливается только после приёмки результата руководителем (ТЗ §2.11).")
+        d.signatures([("Составил", u["name"]), ("Проверил", "")])
+        return d, "poryucheniya_%s" % rep["kind"]
+
     if kind == "report":
         r = db.get_ent(cur, "report", id_)
         if not r: raise RpcError("Отчёт не найден", "Экспорт", 404, "NOT_FOUND")
@@ -2402,7 +2958,7 @@ def meeting_protocol_doc(db, cur, u, m):
         if ts:
             for t in ts:
                 dr = t.get("directive") or {}
-                over = diffD(dISO(today()), t["end"]) if t["end"] < dISO(today()) and t["status"] not in DONE_ST + ["Отменена"] else 0
+                over = diffD(dISO(today()), t["end"]) if t.get("end") and t["end"] < dISO(today()) and t["status"] not in DONE_ST + ["Отменена"] else 0
                 rows.append([t["code"], t["title"], _uname(db, cur, t["assignee"]),
                              ", ".join(_uname(db, cur, c) for c in dr.get("coassignees") or []) or "—",
                              _fd(t["end"]), t["status"], t["progress"], over])
@@ -2722,6 +3278,9 @@ NOTIF_TYPES = {
     "directive.due":      ("Приближается срок поручения", "meetings"),
     "directive.overdue":  ("Поручение просрочено", "meetings"),
     "directive.stale":    ("Поручение без обновления состояния", "meetings"),
+    "directive.noassignee": ("Поручение без исполнителя", "meetings"),
+    "directive.nodue":    ("Поручение без установленного срока", "meetings"),
+    "directive.review":   ("Поручение требует проверки результата", "meetings"),
     "directive.extended": ("Срок поручения продлён", "meetings"),
     "directive.accepted": ("Результат поручения принят", "meetings"),
     "directive.rework":   ("Поручение возвращено на доработку", "meetings"),
@@ -2925,33 +3484,23 @@ def notification_cycle_cur(db, cur):
             db.audit(cur, "BUSINESS", "info", "system", "calendar", "Доставлено напоминание",
                      obj, r["owner_id"], {"user": r["user_id"], "offset": r["offset_min"],
                                           "event": "calendar.reminder.sent"})
-    # 2. Сроки задач и поручений
+    # 2. Сроки обычных задач M02 (поручения совещаний проверяются отдельным контуром §2.11.1)
     today_s = dISO(today()); tomorrow = D(1)
     cur.execute("SELECT id,code,title,status,assignee,\"end\",type,meeting_id,created_at FROM tasks "
-                "WHERE status NOT IN ('Завершена','Отменена','Проверена') AND assignee IS NOT NULL")
+                "WHERE status NOT IN ('Завершена','Отменена','Проверена') AND assignee IS NOT NULL "
+                "AND COALESCE(type,'task')<>'directive' AND COALESCE(\"end\",'')<>''")
     for t in cur.fetchall():
-        dir_ = t["type"] == "directive"
         if t["end"] < today_s:
             days = diffD(today_s, t["end"])
-            notify(db, cur, t["assignee"], "directive.overdue" if dir_ else "task.overdue",
-                   "Просрочено: %s" % t["title"], "%s · просрочка %d дн" % (t["code"], days),
-                   "Поручение" if dir_ else "Задача", t["id"])
+            notify(db, cur, t["assignee"], "task.overdue", "Просрочено: %s" % t["title"],
+                   "%s · просрочка %d дн" % (t["code"], days), "Задача", t["id"])
             delivered += 1
         elif t["end"] <= tomorrow:
-            notify(db, cur, t["assignee"], "directive.due" if dir_ else "task.due",
-                   "Срок истекает: %s" % t["title"], "%s · срок %s" % (t["code"], _fd(t["end"])),
-                   "Поручение" if dir_ else "Задача", t["id"])
+            notify(db, cur, t["assignee"], "task.due", "Срок истекает: %s" % t["title"],
+                   "%s · срок %s" % (t["code"], _fd(t["end"])), "Задача", t["id"])
             delivered += 1
-    # 3. Поручения без обновления состояния более 7 дней — председателю и секретарю
-    cur.execute("SELECT t.id,t.code,t.title,t.meeting_id,m.chair,m.secretary FROM tasks t "
-                "JOIN meetings m ON m.id=t.meeting_id WHERE t.type='directive' "
-                "AND t.status NOT IN ('Завершена','Отменена','Проверена') AND t.created_at < %s",
-                (now - 7 * DAY * 1000,))
-    for t in cur.fetchall():
-        for uid_ in (t["chair"], t["secretary"]):
-            notify(db, cur, uid_, "directive.stale", "Поручение без обновления: %s" % t["title"],
-                   "%s · требуется контроль исполнения" % t["code"], "Поручение", t["id"],
-                   dedupe="directive.stale:%s:%s:%s" % (uid_, t["id"], today_s))
+    # 3. Контроль сроков поручений: шесть проверок и настраиваемый состав получателей (ТЗ §2.11.1)
+    delivered += directive_control_cycle(db, cur)["delivered"]
     # 4. Пересмотр рисков
     cur.execute("SELECT id,code,title,owner FROM risks WHERE status<>'Закрыт' AND review<=%s AND owner IS NOT NULL", (today_s,))
     for r in cur.fetchall():

@@ -90,6 +90,18 @@ def main():
             if fmt == "docx":
                 check("%s: имя файла в заголовке" % kind, "filename*=UTF-8''" in disp and disp.endswith(".docx"), disp)
 
+    print("== Регрессия: график работ с зависимостями и поручение без срока ==")
+    dep_proj = next((p["id"] for p in st["projects"]
+                     if any(t["projectId"] == p["id"] and t["deps"] for t in st["tasks"])), None)
+    check("проект с зависимостями найден", bool(dep_proj), dep_proj)
+    for fmt in ("docx", "xlsx", "pdf"):
+        code, data, hdr = admin.raw("/api/export?kind=gantt&id=%s&fmt=%s" % (dep_proj, fmt))
+        sig = data[:2] == b"PK" if fmt in ("docx", "xlsx") else data[:4] == b"%PDF"
+        check("график работ с зависимостями → %s" % fmt.upper(), code == 200 and sig and len(data) > 1500,
+              "%s %d байт" % (code, len(data)))
+    code, data, hdr = admin.raw("/api/export?kind=gantt&fmt=csv")
+    check("график работ всех проектов → CSV", code == 200 and len(data) > 200, "%s %d байт" % (code, len(data)))
+
     print("== Структура DOCX (ТЗ §25.1) ==")
     names = zip_names(sizes[("meeting", "docx")])
     check("DOCX: стили заголовков", "word/styles.xml" in names)
