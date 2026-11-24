@@ -5,7 +5,7 @@ rem Опционально для полностью офлайн-пакета: 
 rem            в installer\postgresql-setup.exe — он будет включён в установщик.
 cd /d "%~dp0.."
 python -m pip install pyinstaller psycopg2-binary pywin32 cryptography
-pyinstaller --onefile --name SUP-IP --add-data "static;static" --clean server.py
+pyinstaller --onefile --name SUP-IP --add-data "static;static" --add-data "assets;assets" --hidden-import docgen --clean server.py
 if errorlevel 1 (echo Ошибка сборки EXE & pause & exit /b 1)
 set VER=
 for /f "tokens=3 delims= " %%a in ('findstr /b "VERSION = " server.py') do set VER=%%~a

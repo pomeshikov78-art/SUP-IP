@@ -863,6 +863,57 @@ function exportCSV(name, rows){
  const csv='\uFEFF'+rows.map(r=>r.map(c=>{const s=String(c==null?'':c);return /[";\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}).join(';')).join('\r\n');
  if(download(name,csv,'text/csv;charset=utf-8')){ log('INTEGRATION','info',App.view,'Экспорт данных (Excel/CSV)','Файл',name,{rows:rows.length}); dbSave(); }
 }
+/* Выгрузка документов DOCX/XLSX/PDF: формирует СЕРВЕР (ТЗ §25), право export проверяется сервером,
+   событие BUSINESS пишется в M15. Клиент только скачивает готовый файл. */
+const EXP_MOD={portfolio:'portfolio',project:'portfolio',tasks:'tasks',gantt:'gantt',resources:'resources',time:'time',risks:'risks',calc:'calcs',meeting:'meetings',report:'reports',journal:'journal',dashboard:'analytics'};
+function docBtns(kind,id,fmts){
+ const mod=EXP_MOD[kind]||'reports';
+ if(!can(mod,'export'))return '';
+ return (fmts||['xlsx','docx','pdf']).map(f=>'<button class="btn" title="Выгрузить '+f.toUpperCase()+' — документ формирует сервер" onclick="App.expDoc(\''+kind+'\',\''+(id||'')+'\',\''+f+'\')">'+ic('download')+' '+f.toUpperCase()+'</button>').join('');
+}
+App.expDocPost=async function(kind,fmt,params){
+ const mod=EXP_MOD[kind]||'reports';
+ if(!guard(mod,'export'))return;
+ try{
+  const r=await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({kind:kind,fmt:fmt,params:params||{}})});
+  if(!r.ok){ let e={}; try{ e=(await r.json()).error||{}; }catch(_){}
+   toast('err',e.title||'Выгрузка отклонена',e.message||('HTTP '+r.status)); return; }
+  const blob=await r.blob();
+  const cd=r.headers.get('Content-Disposition')||'';
+  const tail=cd.split("filename*=UTF-8''")[1]||'';
+  const name=tail?decodeURIComponent(tail.trim()):(kind+'.'+fmt);
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name;
+  document.body.appendChild(a); a.click(); setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},400);
+  toast('ok','Документ сформирован сервером',name+' · '+Math.max(1,Math.round(blob.size/1024))+' КБ');
+  pollState();
+ }catch(e){ toast('err','Сервер недоступен',e.message); }
+};
+App.dashExport=function(fmt){
+ const widgets=userWidgets().filter(k=>WIDGETS[k]).map(k=>{
+  let html=''; try{ html=WIDGETS[k].render(); }catch(e){ html='<p>Виджет недоступен</p>'; }
+  return {title:WIDGETS[k].t,type:'html',html:html};
+ });
+ App.expDocPost('dashboard',fmt,{title:'Панель показателей · '+App.user.name,widgets:widgets});
+};
+App.expDoc=async function(kind,id,fmt,params){
+ const mod=EXP_MOD[kind]||'reports';
+ if(!guard(mod,'export'))return;
+ const q=new URLSearchParams(Object.assign({kind:kind,id:id||'',fmt:fmt},params||{}));
+ try{
+  const r=await fetch('/api/export?'+q.toString());
+  if(!r.ok){ let e={}; try{ e=(await r.json()).error||{}; }catch(_){}
+   toast('err',e.title||'Выгрузка отклонена',e.message||('HTTP '+r.status)); return; }
+  const blob=await r.blob();
+  const cd=r.headers.get('Content-Disposition')||'';
+  const tail=cd.split("filename*=UTF-8''")[1]||'';
+  const name=tail?decodeURIComponent(tail.trim()):(kind+'.'+fmt);
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name;
+  document.body.appendChild(a); a.click(); setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},400);
+  toast('ok','Документ сформирован сервером',name+' · '+Math.max(1,Math.round(blob.size/1024))+' КБ · событие в M15');
+  pollState();
+ }catch(e){ toast('err','Сервер недоступен',e.message); }
+};
 function printHTML(title, body){
  try{
   const f=document.createElement('iframe'); f.style.cssText='position:fixed;right:0;bottom:0;width:0;height:0;border:0';
@@ -1196,7 +1247,7 @@ Views.dash=function(){
  const u=App.user;
  const hour=new Date().getHours(); const greet=hour<5?'Доброй ночи':hour<12?'Доброе утро':hour<18?'Добрый день':'Добрый вечер';
  return '<div class="page-head"><div><h2>'+greet+', '+esc(u.name.split(' ')[1])+'!</h2><div class="desc">Сводка по подразделению на '+TODAY.toLocaleDateString('ru-RU',{day:'numeric',month:'long',year:'numeric'})+'. Данные — из модулей-источников через единое ядро; обновлено '+(App.lastSync?fmtT(App.lastSync):'—')+'.</div></div>'+
- '<div class="acts"><button class="btn" onclick="App.dashRefresh()">'+ic('refresh')+' Обновить</button>'+(can('builder','edit')?'<button class="btn pri" onclick="nav(\'builder\')">'+ic('layout')+' Настроить панель</button>':'')+'</div></div>'+
+ '<div class="acts"><button class="btn" onclick="App.dashRefresh()">'+ic('refresh')+' Обновить</button>'+(can('analytics','export')?'<button class="btn" onclick="App.dashExport(\'pdf\')">'+ic('download')+' Панель в PDF</button><button class="btn" onclick="App.dashExport(\'xlsx\')">'+ic('excel')+' XLSX</button>':'')+(can('builder','edit')?'<button class="btn pri" onclick="nav(\'builder\')">'+ic('layout')+' Настроить панель</button>':'')+'</div></div>'+
  '<div class="grid" style="grid-template-columns:repeat('+Math.max(s.length,1)+',1fr);gap:12px;margin-bottom:14px">'+s.map(k=>widgetWrap(k)).join('')+'</div>'+
  '<div class="grid g2">'+rest.map(k=>widgetWrap(k,true)).join('')+'</div>';
 };
@@ -1242,7 +1293,7 @@ Views.portfolio=function(){
  const act=DB.projects.filter(p=>['Выполняется','Утверждён','Планирование','Требует внимания'].includes(p.status));
  const att=DB.projects.filter(p=>projHealth(p).n!=='В норме'&&projHealth(p).n!=='Закрыт');
  return '<div class="page-head"><div><h2>Портфель проектов</h2><div class="desc">Единый реестр проектов подразделения: статусы, сроки, прогресс, трудоёмкость и состояние. Карточка проекта — точка входа во все связанные объекты.</div></div>'+
- '<div class="acts">'+(can('portfolio','export')?'<button class="btn" onclick="App.pfExport()">'+ic('excel')+' Экспорт</button>':'')+(can('portfolio','create')?'<button class="btn pri" onclick="App.projModal()">'+ic('plus')+' Новый проект</button>':'')+'</div></div>'+
+ '<div class="acts">'+(can('portfolio','export')?'<button class="btn" onclick="App.pfExport()">'+ic('excel')+' CSV</button>':'')+docBtns('portfolio')+(can('portfolio','create')?'<button class="btn pri" onclick="App.projModal()">'+ic('plus')+' Новый проект</button>':'')+'</div></div>'+
  '<div class="grid g4 mb14">'+
   kpiHTML(DB.projects.length,'Всего проектов','включая архив','folder','acc',"App.f.pf.arch=false;App.f.pf.st='';renderView()")+
   kpiHTML(act.length,'Активные','выполняются и планируются','play','info',"App.f.pf.st='Выполняется';renderView()")+
@@ -1329,7 +1380,7 @@ function openProject(pid){
   const bl=Object.entries(p.baseline||{});
   body='<div class="help-note">'+ic('gantt')+'<div>Календарный план ведётся в M04. Базовый план — утверждённый снимок сроков; текущие сдвиги не изменяют его автоматически.</div></div>'+
   '<div class="flexw mb14"><button class="btn pri" onclick="App.closeDrawer();nav(\'gantt\');App.gantt.proj=\''+pid+'\';renderView()">'+ic('gantt')+' Открыть диаграмму Ганта</button>'+
-  (can('gantt','edit',p)?'<button class="btn" onclick="App.saveBaseline(\''+pid+'\')">'+ic('save')+' Сохранить базовый план</button>':'')+'</div>'+
+  (can('gantt','edit',p)?'<button class="btn" onclick="App.saveBaseline(\''+pid+'\')">'+ic('save')+' Сохранить базовый план</button>':'')+docBtns('project',pid)+'</div>'+
   (bl.length?'<div class="card"><div class="ch">'+ic('save')+'Базовый план от '+fmtD(dISO(new Date(p.baselineAt)))+'</div><div class="tbl-wrap"><table class="tbl"><thead><tr><th>Задача</th><th>Базовый финиш</th><th>Текущий финиш</th><th>Отклонение</th></tr></thead><tbody>'+bl.map(([tid,b])=>{const t=T_(tid);if(!t)return '';const dv=diffD(t.end,b.end);return '<tr onclick="openTask(\''+tid+'\')"><td>'+esc(t.title)+'</td><td>'+fmtD(b.end)+'</td><td>'+fmtD(t.end)+'</td><td>'+(dv>0?'<span class="overdue">+'+dv+' дн</span>':dv<0?'<span style="color:var(--ok);font-weight:700">'+dv+' дн</span>':'<span class="mut">0</span>')+'</td></tr>';}).join('')+'</tbody></table></div></div>':emptyBlock('Базовый план не сохранён','Утвердите план и сохраните снимок сроков','save'));
  }
  if(tab==='team'){
@@ -1397,7 +1448,7 @@ Views.tasks=function(){
  rows.sort((a,b)=>a.end<b.end?-1:1);
  const open=DB.tasks.filter(t=>!DONE_ST.includes(t.status)&&t.status!=='Отменена');
  return '<div class="page-head"><div><h2>Управление задачами</h2><div class="desc">M02 — единственный владелец данных задач. Канбан, гант, календарь и дашборд используют эти же записи. Просрочка отображается индикатором, а не статусом.</div></div>'+
- '<div class="acts">'+(can('tasks','export')?'<button class="btn" onclick="App.tkExport()">'+ic('excel')+' Экспорт</button>':'')+(can('tasks','create')?'<button class="btn pri" onclick="App.taskModal()">'+ic('plus')+' Новая задача</button>':'')+'</div></div>'+
+ '<div class="acts">'+(can('tasks','export')?'<button class="btn" onclick="App.tkExport()">'+ic('excel')+' CSV</button>':'')+docBtns('tasks')+(can('tasks','create')?'<button class="btn pri" onclick="App.taskModal()">'+ic('plus')+' Новая задача</button>':'')+'</div></div>'+
  '<div class="grid g4 mb14">'+
   kpiHTML(open.length,'Открытые задачи','всего в реестре: '+DB.tasks.length,'tasks','acc',"App.f.tk.st='';App.f.tk.od=false;renderView()")+
   kpiHTML(DB.tasks.filter(t=>t.status==='В работе').length,'В работе','WIP-лимит колонки: '+DB.settings.wip,'play','info',"App.f.tk.st='В работе';renderView()")+
@@ -1739,7 +1790,7 @@ Views.gantt=function(){
  svg+='</svg>';
  const left='<div class="gantt-left"><div class="glh">Задача / исполнитель</div>'+ts.map(t=>'<div class="glr" onclick="openTask(\''+t.id+'\')">'+stDot(t)+'<span class="gt" title="'+esc(t.title)+'">'+(t.type==='milestone'?'◆ ':'')+esc(t.title)+'</span><span class="spacer"></span>'+avatar(U(t.assignee),'sm')+'</div>').join('')+'</div>';
  return '<div class="page-head"><div><h2>Диаграмма Ганта</h2><div class="desc">Календарно-сетевое планирование проекта. Перетащите бар, чтобы сдвинуть сроки: ядро покажет затронутые зависимости и запросит подтверждение. Базовый план отображается серой полосой и не меняется автоматически.</div></div>'+
- '<div class="acts">'+(can('gantt','edit',p)?'<button class="btn" onclick="App.saveBaselineG(\''+p.id+'\')">'+ic('save')+' Сохранить базовый план</button>':'')+'</div></div>'+
+ '<div class="acts">'+(can('gantt','edit',p)?'<button class="btn" onclick="App.saveBaselineG(\''+p.id+'\')">'+ic('save')+' Сохранить базовый план</button>':'')+docBtns('gantt',p.id)+'</div></div>'+
  '<div class="filters">'+
   sel('g-proj',DB.projects.map(pp=>[pp.id,pp.code+' · '+pp.name.slice(0,40)]),g.proj,'onchange="App.gantt.proj=this.value;renderView()"')+
   '<div class="seg"><button class="'+(px===30?'on':'')+'" onclick="App.gantt.px=30;renderView()">Дни</button><button class="'+(px===14?'on':'')+'" onclick="App.gantt.px=14;renderView()">Недели</button><button class="'+(px===6?'on':'')+'" onclick="App.gantt.px=6;renderView()">Обзор</button></div>'+
@@ -1849,7 +1900,7 @@ Views.resources=function(){
   return {bg:'#dcfce7',c:'#15803d'};
  };
  return '<div class="page-head"><div><h2>Загрузка сотрудников</h2><div class="desc">Плановая загрузка на 14 дней: сумма плановых часов активных задач M02, распределённых по рабочим дням, относительно нормы сотрудника. Перегрузка > '+DB.settings.loadOver+'% выделяется красным; недоступность (отпуск) — отдельным статусом, а не нулём.</div></div>'+
- '<div class="acts">'+(can('resources','export')?'<button class="btn" onclick="App.resExport()">'+ic('excel')+' Экспорт</button>':'')+'</div></div>'+
+ '<div class="acts">'+(can('resources','export')?'<button class="btn" onclick="App.resExport()">'+ic('excel')+' CSV</button>':'')+docBtns('resources')+'</div></div>'+
  '<div class="card mb14"><div class="ch">'+ic('users')+'Матрица загрузки, % от нормы<span class="r legend"><span class="li"><span class="sw" style="background:#dcfce7"></span>≤ '+DB.settings.loadWarn+'%</span><span class="li"><span class="sw" style="background:#fef3c7"></span>'+DB.settings.loadWarn+'–'+DB.settings.loadOver+'%</span><span class="li"><span class="sw" style="background:#fee2e2"></span>перегрузка</span><span class="li"><span class="sw" style="background:#e2e8f0"></span>недоступен</span></span></div>'+
  '<div class="cb" style="overflow:auto"><table class="hm"><thead><tr><th style="text-align:left">Сотрудник</th>'+days.map(d=>'<th class="'+(isWk(d)?'wkend':'')+'">'+fmtDs(d)+'<br>'+['вс','пн','вт','ср','чт','пт','сб'][parseD(d).getDay()]+'</th>').join('')+'<th>Среднее</th></tr></thead><tbody>'+
  us.map(u=>{
@@ -1939,7 +1990,7 @@ Views.time=function(){
  const appr=sum(entries.filter(e=>e.status==='Утверждена').map(e=>e.hours));
  const sent=sum(entries.filter(e=>e.status==='Отправлена').map(e=>e.hours));
  return '<div class="page-head"><div><h2>Учёт трудозатрат</h2><div class="desc">Фактические часы по задачам и видам деятельности. Workflow записи: Черновик → Отправлена → Утверждена / Отклонена. Утверждают руководитель проекта (свои проекты) и руководитель подразделения.</div></div>'+
- '<div class="acts">'+(can('time','export')?'<button class="btn" onclick="App.timeExport()">'+ic('excel')+' Экспорт</button>':'')+(can('time','create')?'<button class="btn pri" onclick="App.timeModal()">'+ic('plus')+' Списать часы</button>':'')+'</div></div>'+
+ '<div class="acts">'+(can('time','export')?'<button class="btn" onclick="App.timeExport()">'+ic('excel')+' CSV</button>':'')+docBtns('time')+(can('time','create')?'<button class="btn pri" onclick="App.timeModal()">'+ic('plus')+' Списать часы</button>':'')+'</div></div>'+
  '<div class="filters">'+
   '<button class="btn sm" onclick="App.ts.week--;renderView()">'+ic('chevL')+'</button><b class="nowrap">'+fmtD(mon)+' — '+fmtD(we)+'</b><button class="btn sm" onclick="App.ts.week++;renderView()">'+ic('chevR')+'</button>'+
   (f.week!==0?'<button class="btn sm ghost" onclick="App.ts.week=0;renderView()">текущая неделя</button>':'')+
@@ -2087,7 +2138,7 @@ Views.risks=function(){
  rows.sort((a,b)=>b.p*b.i-a.p*a.i);
  const open=DB.risks.filter(r=>r.status!=='Закрыт');
  return '<div class="page-head"><div><h2>Реестр рисков</h2><div class="desc">Оценка P×I с историей изменений, мероприятия реагирования, остаточная оценка и регистрация реализовавшихся событий. Выполнение мероприятия не закрывает риск автоматически.</div></div>'+
- '<div class="acts">'+(can('risks','export')?'<button class="btn" onclick="App.rkExport()">'+ic('excel')+' Экспорт</button>':'')+(can('risks','create')?'<button class="btn pri" onclick="App.riskModal()">'+ic('plus')+' Новый риск</button>':'')+'</div></div>'+
+ '<div class="acts">'+(can('risks','export')?'<button class="btn" onclick="App.rkExport()">'+ic('excel')+' CSV</button>':'')+docBtns('risks')+(can('risks','create')?'<button class="btn pri" onclick="App.riskModal()">'+ic('plus')+' Новый риск</button>':'')+'</div></div>'+
  '<div class="grid g4 mb14">'+
   kpiHTML(open.length,'Открытые риски','всего в реестре: '+DB.risks.length,'alert','acc',"App.f.rk.st='';App.f.rk.cell='';renderView()")+
   kpiHTML(open.filter(r=>r.p*r.i>=15).length,'Критические','балл ≥ 15','alert',open.filter(r=>r.p*r.i>=15).length?'err':'ok',"App.f.rk.cell='';App.f.rk.st='';renderView()")+
@@ -2405,7 +2456,7 @@ function openCalc(cid){
  '<div class="df">'+
   (can('calcs','approve',c)&&c.status==='Выполнен'?'<button class="btn ok" onclick="App.calcVerify(\''+cid+'\')">'+ic('check')+' Проверить и принять</button>':'')+
   (can('calcs','create')?'<button class="btn" onclick="App.calcRerun(\''+cid+'\')">'+ic('refresh')+' Пересчитать</button>':'')+
-  (can('calcs','export')?'<button class="btn" onclick="App.calcExport(\''+cid+'\')">'+ic('excel')+' В Excel</button>':'')+
+  (can('calcs','export')?'<button class="btn" onclick="App.calcExport(\''+cid+'\')">'+ic('excel')+' CSV</button>':'')+docBtns('calc',cid)+
   '<span class="spacer"></span>'+
   (can('calcs','delete',c)?'<button class="btn danger" onclick="App.calcDelete(\''+cid+'\')">'+ic('trash')+'</button>':'')+
  '</div>',true);
@@ -2632,7 +2683,7 @@ App.reportOpen=function(rid){
  '<div class="mf"><span class="left">'+badge(r.status,r.status==='Утверждён'?'#16a34a':'#0891b2',r.status==='Утверждён'?'#dcfce7':'#cffafe')+'</span>'+
  (can('reports','approve')&&r.status!=='Утверждён'?'<button class="btn ok" onclick="App.reportApprove(\''+rid+'\')">'+ic('check')+' Утвердить</button>':'')+
  '<button class="btn" onclick="App.reportPrint(\''+rid+'\')">'+ic('print')+' Печать / PDF</button>'+
- '<button class="btn" onclick="App.reportDownload(\''+rid+'\')">'+ic('download')+' Скачать HTML</button>'+
+ '<button class="btn" onclick="App.reportDownload(\''+rid+'\')">'+ic('download')+' HTML</button>'+docBtns('report',rid)+
  '<button class="btn" onclick="App.closeModal(true)">Закрыть</button></div>',{xwide:true});
 };
 App.reportApprove=function(rid){
@@ -2735,7 +2786,7 @@ function openMeeting(mid){
   body=dirs.length?'<div class="list-rows">'+dirs.map(t=>'<div class="lr" onclick="openTask(\''+t.id+'\')">'+avatar(U(t.assignee),'sm')+'<div class="lt"><b>'+esc(t.title)+'</b><small>'+t.code+' · срок '+fmtD(t.end)+'</small></div>'+stBadge(t.status)+overdueMark(t)+'</div>').join('')+'</div><div class="small mut mt8">Исполнено: '+dirs.filter(t=>DONE_ST.includes(t.status)).length+' из '+dirs.length+'</div>':emptyBlock('Поручений нет','Создайте поручения из решений на вкладке «Решения»','tasks');
  }
  if(tab==='prot'){
-  body='<div class="flexw mb8"><button class="btn" onclick="App.meetPrint(\''+mid+'\')">'+ic('print')+' Печать / PDF</button><button class="btn" onclick="App.meetDownload(\''+mid+'\')">'+ic('download')+' Скачать HTML</button><span class="spacer"></span>'+
+  body='<div class="flexw mb8"><button class="btn" onclick="App.meetPrint(\''+mid+'\')">'+ic('print')+' Печать</button><button class="btn" onclick="App.meetDownload(\''+mid+'\')">'+ic('download')+' HTML</button>'+docBtns('meeting',mid)+(can('meetings','export')&&can('docs','create')?'<button class="btn pri" onclick="App.meetProtocol(\''+mid+'\')">'+ic('save')+' Протокол в M09 (DOCX+PDF)</button>':'')+'<span class="spacer"></span>'+
   (m.status==='Проведено'&&can('meetings','approve',m)?'<button class="btn ok" onclick="App.meetApprove(\''+mid+'\')">'+ic('check')+' Утвердить протокол</button>':'')+'</div>'+
   '<div class="card"><div class="cb report-doc">'+meetMinutes(m)+'</div></div>';
  }
@@ -2778,6 +2829,12 @@ App.decisionSave=function(mid){
 };
 App.decisionToTask=function(mid,did){
  rpc('meeting.decision.toTask',{id:mid,did}).then(r=>{if(r)openMeeting(mid);});
+};
+App.meetProtocol=function(mid){
+ if(!guard('meetings','export'))return;
+ rpc('meeting.protocol',{id:mid,formats:['docx','pdf']}).then(r=>{
+  if(r&&r.docId){ toast('ok','Протокол зарегистрирован в M09','Версия v'+r.version+' · DOCX и PDF · скачивание в карточке документа'); openDoc(r.docId); }
+ });
 };
 App.meetPrint=function(mid){ const m=MEET(mid); printHTML(m.code,meetMinutes(m)); log('AUDIT','info','meetings','Протокол отправлен на печать','Совещание',mid,{code:m.code}); dbSave(); };
 App.meetDownload=function(mid){
@@ -2923,7 +2980,7 @@ Views.journal=function(){
  if(f.q)rows=rows.filter(e=>(e.action+' '+e.obj+' '+e.objId).toLowerCase().includes(f.q.toLowerCase()));
  const counts={}; DB.events.forEach(e=>counts[e.cat]=(counts[e.cat]||0)+1);
  return '<div class="page-head"><div><h2>Журнал событий</h2><div class="desc">Централизованная регистрация всех действий: AUDIT (изменения данных), BUSINESS (бизнес-операции), TECH (системные), SECURITY (доступ), INTEGRATION (обмен/экспорт). Журнал пишется ядром при каждой мутации — включая отказы в правах.</div></div>'+
- '<div class="acts">'+(can('journal','export')?'<button class="btn" onclick="App.jrExport()">'+ic('excel')+' Экспорт</button>':'')+'</div></div>'+
+ '<div class="acts">'+(can('journal','export')?'<button class="btn" onclick="App.jrExport()">'+ic('excel')+' CSV</button>':'')+docBtns('journal')+'</div></div>'+
  '<div class="grid" style="grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:14px">'+Object.entries(EV_CATS).map(([k,v])=>
   '<div class="kpi tone-acc" onclick="App.f.jr.cat=App.f.jr.cat===\''+k+'\'?\'\':\''+k+'\';renderView()" style="'+(f.cat===k?'border-color:'+v.c+';box-shadow:0 0 0 3px '+v.c+'22':'')+'"><span class="ki" style="background:'+v.c+'18;color:'+v.c+'">'+ic({AUDIT:'journal',BUSINESS:'tasks',TECH:'wrench',SECURITY:'shield',INTEGRATION:'link'}[k])+'</span><span class="kv" style="color:'+v.c+'">'+(counts[k]||0)+'</span><span class="kl">'+v.n+'</span><span class="ks">'+k+'</span></div>').join('')+
  '</div>'+

@@ -18,8 +18,13 @@ try:
 except ImportError:
     print("Требуется psycopg2:  python -m pip install psycopg2-binary"); sys.exit(1)
 
+try:
+    import docgen                      # генератор DOCX/XLSX/PDF (ТЗ §25), только stdlib
+except ImportError:
+    docgen = None
+
 APP_NAME = "СУП-ИП"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -1519,6 +1524,487 @@ def h_client_log(db, cur, u, p):
     db.audit(cur, cat, level, u["id"], mod, str(p.get("action", ""))[:300], str(p.get("obj", ""))[:100], str(p.get("objId", ""))[:50], p.get("details") or {})
     return True, None
 
+# ---------------- Экспорт документов: DOCX / XLSX / PDF / CSV / HTML (ТЗ §25) ----------------
+# Генератор — docgen.py (только stdlib, встроенные шрифты, кириллица). Право «export»
+# проверяется сервером для каждого документа; событие фиксируется в M15.
+
+EXPORT_KINDS = {
+    "portfolio": ("portfolio", "Портфель проектов"),
+    "project":   ("portfolio", "Паспорт проекта"),
+    "tasks":     ("tasks", "Реестр задач"),
+    "gantt":     ("gantt", "Календарный график"),
+    "resources": ("resources", "Загрузка ресурсов"),
+    "time":      ("time", "Табель трудозатрат"),
+    "risks":     ("risks", "Реестр рисков"),
+    "calc":      ("calcs", "Протокол расчёта"),
+    "meeting":   ("meetings", "Протокол совещания"),
+    "report":    ("reports", "Отчёт"),
+    "journal":   ("journal", "Журнал событий"),
+    "dashboard": ("analytics", "Панель показателей"),
+}
+EXPORT_FORMATS = ("docx", "xlsx", "pdf", "csv", "html")
+
+def _fd(s):
+    """Дата в русском формате для документов."""
+    try: return datetime.date.fromisoformat(str(s)).strftime("%d.%m.%Y")
+    except Exception: return str(s or "")
+
+def _uname(db, cur, user_id):
+    if not user_id: return ""
+    cur.execute("SELECT name FROM users WHERE id=%s", (user_id,))
+    r = cur.fetchone()
+    return r["name"] if r else ""
+
+def _pname(db, cur, pid):
+    if not pid: return ""
+    cur.execute("SELECT code, name FROM projects WHERE id=%s", (pid,))
+    r = cur.fetchone()
+    return "%s · %s" % (r["code"], r["name"]) if r else ""
+
+def _proj_progress(db, cur, pid):
+    cur.execute("SELECT COALESCE(SUM(plan_hours*progress),0) AS a, COALESCE(SUM(plan_hours),0) AS b FROM tasks WHERE project_id=%s", (pid,))
+    r = cur.fetchone()
+    return int(round(r["a"] / r["b"])) if r["b"] else 0
+
+def _proj_hours(db, cur, pid):
+    cur.execute("SELECT COALESCE(SUM(hours),0) AS h FROM time_entries WHERE project_id=%s AND status<>'Отклонена'", (pid,))
+    return round(float(cur.fetchone()["h"]), 1)
+
+def _export_meta(db, cur, u, extra=None):
+    m = [("Система", "%s v%s" % (APP_NAME, VERSION)),
+         ("Сформировал", "%s (%s)" % (u["name"], ROLES.get(u["role"], u["role"]))),
+         ("Дата формирования", datetime.datetime.now().strftime("%d.%m.%Y %H:%M"))]
+    return m + list(extra or [])
+
+def build_export(db, cur, u, kind, id_="", params=None):
+    """Строит документ в единой модели docgen.Document. Право export проверяется здесь же."""
+    params = params or {}
+    if kind not in EXPORT_KINDS: raise RpcError("Неизвестный вид документа: %s" % kind, "Экспорт", 404, "UNKNOWN_EXPORT")
+    mod, label = EXPORT_KINDS[kind]
+    guard(db, cur, u, mod, "export")
+    if docgen is None: raise RpcError("Генератор документов недоступен (docgen.py)", "Экспорт", 500, "NO_DOCGEN")
+    D = docgen.Document
+
+    if kind == "portfolio":
+        projects = db.all_ent(cur, "project")
+        d = D("Портфель проектов инженерного подразделения", subtitle="Реестр проектов с показателями хода выполнения",
+              meta=_export_meta(db, cur, u, [("Проектов", len(projects))]))
+        d.toc = True
+        rows = []
+        for p in projects:
+            rows.append([p["code"], p["name"], p["cat"], p["status"], _uname(db, cur, p["pm"]),
+                         _fd(p["start"]), _fd(p["end"]), _proj_progress(db, cur, p["id"]),
+                         p["budgetHours"], _proj_hours(db, cur, p["id"])])
+        d.h1("1. Реестр проектов")
+        d.table(["Код", "Наименование", "Категория", "Статус", "Руководитель", "Начало", "Окончание",
+                 "Прогресс, %", "План, чел·ч", "Факт, чел·ч"], rows,
+                widths=[1, 3, 1.4, 1.4, 1.6, 1, 1, 0.9, 0.9, 0.9],
+                aligns=[None, None, None, None, None, None, None, "right", "right", "right"],
+                title="Портфель", total=["Итого", "", "", "", "", "", "", "",
+                                         sum(p["budgetHours"] for p in projects),
+                                         round(sum(_proj_hours(db, cur, p["id"]) for p in projects), 1)])
+        act = [p for p in projects if p["status"] in ("Выполняется", "Требует внимания", "Приостановлен")]
+        d.h1("2. Структура портфеля")
+        by_status = {}
+        for p in projects: by_status[p["status"]] = by_status.get(p["status"], 0) + 1
+        d.chart("pie", list(by_status), list(by_status.values()), title="Проекты по статусам", unit="шт")
+        d.chart("bar", [p["code"] for p in act], [_proj_progress(db, cur, p["id"]) for p in act],
+                title="Прогресс активных проектов", unit="%")
+        d.h1("3. Основания и примечания")
+        d.p("Данные выгружены из единой базы СУП-ИП (PostgreSQL). Прогресс проекта рассчитан как средневзвешенный "
+            "по плановой трудоёмкости задач; фактические трудозатраты — сумма подтверждённых списаний M06.")
+        return d, "portfel_proektov"
+
+    if kind == "project":
+        p = db.get_ent(cur, "project", id_)
+        if not p: raise RpcError("Проект не найден", "Экспорт", 404, "NOT_FOUND")
+        guard(db, cur, u, "portfolio", "export", p)
+        tasks = [t for t in db.all_ent(cur, "task") if t["projectId"] == id_]
+        risks = [r for r in db.all_ent(cur, "risk") if r["projectId"] == id_]
+        docs_ = [x for x in db.all_ent(cur, "doc") if x["projectId"] == id_]
+        calcs = [c for c in db.all_ent(cur, "calc") if c["projectId"] == id_]
+        d = D("Паспорт проекта %s" % p["code"], subtitle=p["name"],
+              meta=_export_meta(db, cur, u, [("Код проекта", p["code"]), ("Категория", p["cat"]), ("Статус", p["status"])]))
+        d.toc = True
+        d.h1("1. Общие сведения")
+        d.kv([("Наименование", p["name"]), ("Категория", p["cat"]), ("Статус", p["status"]),
+              ("Руководитель проекта", _uname(db, cur, p["pm"])),
+              ("Начало", _fd(p["start"])), ("Окончание", _fd(p["end"])),
+              ("Бюджет трудоёмкости, чел·ч", p["budgetHours"]),
+              ("Команда", ", ".join(_uname(db, cur, x) for x in (p["team"] or []))),
+              ("Прогресс, %", _proj_progress(db, cur, id_)), ("Факт трудозатрат, чел·ч", _proj_hours(db, cur, id_))])
+        if p["desc"]: d.p(p["desc"])
+        if p.get("baseline"):
+            b = p["baseline"]
+            d.h2("1.1. Базовый план")
+            d.kv([("Начало (базовый план)", _fd(b.get("start"))), ("Окончание (базовый план)", _fd(b.get("end"))),
+                  ("Зафиксирован", datetime.datetime.fromtimestamp((p.get("baselineAt") or 0) / 1000).strftime("%d.%m.%Y %H:%M") if p.get("baselineAt") else "")])
+        d.h1("2. Задачи проекта")
+        d.table(["Код", "Задача", "Тип", "Статус", "Исполнитель", "Начало", "Окончание", "План, ч", "Прогресс, %"],
+                [[t["code"], t["title"], t["type"], t["status"], _uname(db, cur, t["assignee"]),
+                  _fd(t["start"]), _fd(t["end"]), t["planHours"], t["progress"]] for t in tasks],
+                widths=[1, 3, 1, 1.4, 1.6, 1, 1, 0.8, 0.9],
+                aligns=[None, None, None, None, None, None, None, "right", "right"],
+                total=["Итого", "", "", "", "", "", "", sum(t["planHours"] for t in tasks), ""])
+        d.h1("3. Риски проекта")
+        d.table(["Код", "Риск", "P", "I", "Балл", "Стратегия", "Владелец", "Статус"],
+                [[r["code"], r["title"], r["p"], r["i"], r["p"] * r["i"], r["strategy"],
+                  _uname(db, cur, r["owner"]), r["status"]] for r in risks],
+                widths=[1, 3, 0.5, 0.5, 0.6, 1.4, 1.6, 1.2],
+                aligns=[None, None, "right", "right", "right", None, None, None])
+        d.h1("4. Документы и расчёты")
+        d.table(["Код", "Наименование", "Тип", "Статус", "Версий"],
+                [[x["code"], x["title"], x["type"], x["status"], len(x.get("versions") or [])] for x in docs_],
+                widths=[1, 3.4, 1.4, 1.4, 0.7], title="Документы (M09)")
+        d.table(["Код", "Расчёт", "Модель", "Версия", "Статус"],
+                [[c["code"], c["title"], c["model"], c["ver"], c["status"]] for c in calcs],
+                widths=[1, 3, 2, 0.8, 1.2], title="Инженерные расчёты (M10)")
+        d.signatures([("Руководитель проекта", _uname(db, cur, p["pm"])), ("Согласовано", "")])
+        return d, "passport_%s" % p["code"]
+
+    if kind == "tasks":
+        tasks = db.all_ent(cur, "task")
+        if params.get("projectId"): tasks = [t for t in tasks if t["projectId"] == params["projectId"]]
+        if params.get("status"): tasks = [t for t in tasks if t["status"] == params["status"]]
+        if params.get("assignee"): tasks = [t for t in tasks if t["assignee"] == params["assignee"]]
+        scope = _pname(db, cur, params.get("projectId")) if params.get("projectId") else "Все доступные проекты"
+        d = D("Реестр задач", subtitle=scope, meta=_export_meta(db, cur, u, [("Задач", len(tasks))]))
+        d.h1("1. Задачи")
+        d.table(["Код", "Задача", "Проект", "Тип", "Статус", "Приоритет", "Исполнитель",
+                 "Начало", "Окончание", "План, ч", "Прогресс, %"],
+                [[t["code"], t["title"], (db.get_ent(cur, "project", t["projectId"]) or {}).get("code", ""),
+                  t["type"], t["status"], t["priority"], _uname(db, cur, t["assignee"]),
+                  _fd(t["start"]), _fd(t["end"]), t["planHours"], t["progress"]] for t in tasks],
+                widths=[0.9, 3, 0.9, 0.9, 1.3, 1, 1.5, 0.9, 0.9, 0.7, 0.8],
+                aligns=[None] * 9 + ["right", "right"],
+                total=["Итого", "", "", "", "", "", "", "", "", sum(t["planHours"] for t in tasks), ""])
+        by_status = {}
+        for t in tasks: by_status[t["status"]] = by_status.get(t["status"], 0) + 1
+        d.h1("2. Распределение по статусам")
+        d.chart("bar", list(by_status), list(by_status.values()), title="Задачи по статусам", unit="шт")
+        overdue = [t for t in tasks if t["end"] < dISO(today()) and t["status"] not in ("Завершена", "Отменена", "Проверена")]
+        if overdue:
+            d.h1("3. Просроченные задачи")
+            d.table(["Код", "Задача", "Исполнитель", "Срок", "Просрочка, дн"],
+                    [[t["code"], t["title"], _uname(db, cur, t["assignee"]), _fd(t["end"]),
+                      diffD(dISO(today()), t["end"])] for t in overdue],
+                    widths=[1, 3.4, 1.8, 1, 1], aligns=[None, None, None, None, "right"])
+        return d, "reestr_zadach"
+
+    if kind == "gantt":
+        pid = params.get("projectId") or id_
+        projects = db.all_ent(cur, "project")
+        if pid: projects = [p for p in projects if p["id"] == pid]
+        d = D("Календарный график работ", subtitle="Диаграмма Ганта · план и факт",
+              meta=_export_meta(db, cur, u, [("Проектов", len(projects))]))
+        for p in projects:
+            tasks = sorted([t for t in db.all_ent(cur, "task") if t["projectId"] == p["id"]], key=lambda t: t["start"])
+            if not tasks: continue
+            d.h1("%s · %s" % (p["code"], p["name"]))
+            d.kv([("Сроки проекта", "%s — %s" % (_fd(p["start"]), _fd(p["end"]))),
+                  ("Статус", p["status"]), ("Прогресс, %", _proj_progress(db, cur, p["id"]))])
+            d.table(["Код", "Работа", "Исполнитель", "Начало", "Окончание", "Длит., дн", "Прогресс, %", "Предшественники"],
+                    [[t["code"], t["title"], _uname(db, cur, t["assignee"]), _fd(t["start"]), _fd(t["end"]),
+                      max(1, diffD(t["end"], t["start"]) + 1), t["progress"],
+                      ", ".join((db.get_ent(cur, "task", x) or {}).get("code", "") for x in (t["deps"] or []))] for t in tasks],
+                    widths=[0.9, 3, 1.5, 0.9, 0.9, 0.7, 0.8, 1.2],
+                    aligns=[None, None, None, None, None, "right", "right", None],
+                    title="График работ")
+            d.chart("bar", [t["code"] for t in tasks], [max(1, diffD(t["end"], t["start"]) + 1) for t in tasks],
+                    title="Длительность работ", unit="дн")
+            d.pagebreak()
+        return d, "kalendarnyy_grafik"
+
+    if kind == "resources":
+        users = [x for x in db.users_public(cur) if x["role"] in ("exec", "pm", "head")]
+        d = D("Загрузка ресурсов подразделения", subtitle="Плановая загрузка и фактические трудозатраты",
+              meta=_export_meta(db, cur, u, [("Сотрудников", len(users))]))
+        rows = []
+        for x in users:
+            cur.execute("SELECT COALESCE(SUM(plan_hours),0) AS p FROM tasks WHERE assignee=%s AND status NOT IN ('Завершена','Отменена')", (x["id"],))
+            plan = int(cur.fetchone()["p"])
+            cur.execute("SELECT COALESCE(SUM(hours),0) AS h FROM time_entries WHERE user_id=%s", (x["id"],))
+            fact = round(float(cur.fetchone()["h"]), 1)
+            cur.execute("SELECT COUNT(*) AS n FROM tasks WHERE assignee=%s AND status NOT IN ('Завершена','Отменена')", (x["id"],))
+            n = cur.fetchone()["n"]
+            rows.append([x["name"], x["position"], ROLES.get(x["role"], x["role"]), x["capacity"], n, plan, fact])
+        d.h1("1. Ресурсный лист")
+        d.table(["Сотрудник", "Должность", "Роль", "Норма, ч/дн", "Активных задач", "План, чел·ч", "Факт, чел·ч"], rows,
+                widths=[2, 2, 1.6, 1, 1, 1, 1], aligns=[None, None, None, "right", "right", "right", "right"],
+                total=["Итого", "", "", "", sum(r[4] for r in rows), sum(r[5] for r in rows), round(sum(r[6] for r in rows), 1)])
+        d.chart("bar", [r[0].split()[0] for r in rows], [r[5] for r in rows], title="Плановая загрузка", unit="чел·ч")
+        return d, "zagruzka_resursov"
+
+    if kind == "time":
+        entries = db.all_ent(cur, "time", order="id")
+        if params.get("from"): entries = [e for e in entries if e["date"] >= params["from"]]
+        if params.get("to"): entries = [e for e in entries if e["date"] <= params["to"]]
+        if params.get("userId"): entries = [e for e in entries if e["userId"] == params["userId"]]
+        if u["role"] == "exec": entries = [e for e in entries if e["userId"] == u["id"]]
+        entries.sort(key=lambda e: (e["date"], e["userId"]))
+        period = "%s — %s" % (_fd(params.get("from") or (entries[0]["date"] if entries else dISO(today()))),
+                              _fd(params.get("to") or dISO(today())))
+        d = D("Табель учёта трудозатрат", subtitle="Период: " + period,
+              meta=_export_meta(db, cur, u, [("Записей", len(entries)),
+                                             ("Всего часов", round(sum(e["hours"] for e in entries), 1))]))
+        d.h1("1. Списания трудозатрат")
+        d.table(["Дата", "Сотрудник", "Проект", "Задача", "Вид деятельности", "Часы", "Статус", "Комментарий"],
+                [[_fd(e["date"]), _uname(db, cur, e["userId"]),
+                  (db.get_ent(cur, "project", e["projectId"]) or {}).get("code", ""),
+                  (db.get_ent(cur, "task", e["taskId"]) or {}).get("code", ""),
+                  e["act"], e["hours"], e["status"], e["comment"]] for e in entries],
+                widths=[1, 1.8, 0.9, 0.9, 1.8, 0.6, 1.2, 2],
+                aligns=[None, None, None, None, None, "right", None, None],
+                total=["Итого", "", "", "", "", round(sum(e["hours"] for e in entries), 1), "", ""])
+        by_user = {}
+        for e in entries: by_user[_uname(db, cur, e["userId"])] = by_user.get(_uname(db, cur, e["userId"]), 0) + e["hours"]
+        d.h1("2. Распределение по сотрудникам")
+        d.chart("bar", [k.split()[0] for k in by_user], [round(v, 1) for v in by_user.values()],
+                title="Трудозатраты по сотрудникам", unit="ч")
+        d.signatures([("Руководитель подразделения", ""), ("Бухгалтерия", "")])
+        return d, "tabel_trudozatrat"
+
+    if kind == "risks":
+        risks = db.all_ent(cur, "risk")
+        if params.get("projectId"): risks = [r for r in risks if r["projectId"] == params["projectId"]]
+        d = D("Реестр рисков", subtitle="Инженерные и организационные риски подразделения",
+              meta=_export_meta(db, cur, u, [("Рисков", len(risks))]))
+        d.h1("1. Реестр")
+        d.table(["Код", "Риск", "Категория", "Проект", "P", "I", "Балл", "Стратегия", "Владелец", "Статус", "Пересмотр"],
+                [[r["code"], r["title"], r["cat"], (db.get_ent(cur, "project", r["projectId"]) or {}).get("code", ""),
+                  r["p"], r["i"], r["p"] * r["i"], r["strategy"], _uname(db, cur, r["owner"]), r["status"], _fd(r["review"])] for r in risks],
+                widths=[0.9, 3, 1.2, 0.9, 0.4, 0.4, 0.5, 1.2, 1.5, 1.2, 0.9],
+                aligns=[None, None, None, None, "right", "right", "right", None, None, None, None])
+        crit = [r for r in risks if r["p"] * r["i"] >= 15]
+        d.h1("2. Критические риски (балл ≥ 15)")
+        if crit:
+            for r in crit:
+                d.h2("%s · %s (балл %d)" % (r["code"], r["title"], r["p"] * r["i"]))
+                if r["desc"]: d.p(r["desc"])
+                ms = r.get("measures") or []
+                if ms:
+                    d.table(["Мероприятие", "Ответственный", "Срок", "Состояние"],
+                            [[m.get("text", ""), _uname(db, cur, m.get("resp")), _fd(m.get("due")),
+                              "выполнено" if m.get("done") else "в работе"] for m in ms],
+                            widths=[3.4, 1.6, 1, 1])
+        else:
+            d.p("Критических рисков не зарегистрировано.")
+        d.chart("pie", ["Низкий", "Средний", "Высокий", "Критический"],
+                [sum(1 for r in risks if r["p"] * r["i"] < 6),
+                 sum(1 for r in risks if 6 <= r["p"] * r["i"] < 12),
+                 sum(1 for r in risks if 12 <= r["p"] * r["i"] < 15),
+                 sum(1 for r in risks if r["p"] * r["i"] >= 15)],
+                title="Профиль рисков", unit="шт")
+        return d, "reestr_riskov"
+
+    if kind == "calc":
+        c = db.get_ent(cur, "calc", id_)
+        if not c: raise RpcError("Расчёт не найден", "Экспорт", 404, "NOT_FOUND")
+        model = CALC_MODELS.get(c["model"], {})
+        labels = {k: n for k, n, lo, hi in model.get("inputs", [])}
+        ranges = {k: (lo, hi) for k, n, lo, hi in model.get("inputs", [])}
+        outs = c["outputs"] or {}
+        d = D("Протокол инженерного расчёта %s" % c["code"], subtitle=c["title"],
+              meta=_export_meta(db, cur, u, [("Методика", model.get("name", c["model"])),
+                                             ("Версия методики", c["ver"]),
+                                             ("Проект", _pname(db, cur, c["projectId"])),
+                                             ("Статус", c["status"])]))
+        d.toc = True
+        d.h1("1. Исходные данные")
+        d.table(["Параметр", "Обозначение", "Значение", "Допустимый диапазон"],
+                [[labels.get(k, k), k, v, "%s … %s" % ranges[k] if k in ranges else ""]
+                 for k, v in (c["inputs"] or {}).items()],
+                widths=[3, 1, 1, 1.4], aligns=[None, None, "right", None])
+        d.h1("2. Результаты расчёта")
+        d.table(["Показатель", "Обозначение", "Значение", "Единица"],
+                [[o.get("n", o.get("k")), o.get("k"), o.get("v"), o.get("u", "")] for o in outs.get("outs", [])],
+                widths=[3, 1, 1, 0.8], aligns=[None, None, "right", None])
+        d.kv([("Заключение методики", outs.get("verdict", "")),
+              ("Условие выполнено", "да" if outs.get("ok") else "нет")])
+        if outs.get("formula"):
+            d.h1("3. Формулы методики")
+            d.p(outs["formula"])
+        runs = c.get("runs") or []
+        if runs:
+            d.h1("4. История выполнения")
+            d.table(["№", "Дата", "Пользователь", "Примечание"],
+                    [[i + 1, datetime.datetime.fromtimestamp(r.get("ts", 0) / 1000).strftime("%d.%m.%Y %H:%M"),
+                      _uname(db, cur, r.get("by")), r.get("note", "")] for i, r in enumerate(runs)],
+                    widths=[0.5, 1.5, 2, 3])
+        d.h1("5. Проверка и подписи")
+        d.kv([("Проверил", _uname(db, cur, c.get("verifiedBy"))),
+              ("Дата проверки", datetime.datetime.fromtimestamp(c["verifiedAt"] / 1000).strftime("%d.%m.%Y %H:%M")
+               if c.get("verifiedAt") else "не проверен")])
+        d.signatures([("Выполнил", _uname(db, cur, c.get("by"))), ("Проверил", _uname(db, cur, c.get("verifiedBy")))])
+        return d, "raschet_%s" % c["code"]
+
+    if kind == "meeting":
+        m = db.get_ent(cur, "meeting", id_)
+        if not m: raise RpcError("Совещание не найдено", "Экспорт", 404, "NOT_FOUND")
+        guard(db, cur, u, "meetings", "export", m)
+        d = meeting_protocol_doc(db, cur, u, m)
+        return d, "protokol_%s" % m["code"]
+
+    if kind == "report":
+        r = db.get_ent(cur, "report", id_)
+        if not r: raise RpcError("Отчёт не найден", "Экспорт", 404, "NOT_FOUND")
+        d = D(r["title"], subtitle="Отчёт %s · снимок данных от %s" %
+              (r["code"], datetime.datetime.fromtimestamp(r["ts"] / 1000).strftime("%d.%m.%Y %H:%M")),
+              meta=_export_meta(db, cur, u, [("Вид отчёта", r["type"]), ("Код отчёта", r["code"]),
+                                             ("Статус", r["status"]), ("Автор снимка", _uname(db, cur, r["by"]))]))
+        d.blocks.extend(docgen.blocks_from_html(r["html"]))
+        d.note("Документ сформирован из сохранённого снимка отчёта (M13). Данные соответствуют моменту формирования снимка.")
+        return d, "otchet_%s" % r["code"]
+
+    if kind == "journal":
+        if u["role"] not in ("admin", "head"): raise RpcError("Выгрузка журнала доступна администратору и руководителю", "Экспорт", 403, "FORBIDDEN")
+        cur.execute("SELECT ts,cat,level,user_id,module,action,obj,obj_id,details FROM events ORDER BY ts DESC LIMIT 5000")
+        rows = cur.fetchall()
+        d = D("Журнал событий системы", subtitle="Выгрузка M15 · последние %d событий" % len(rows),
+              meta=_export_meta(db, cur, u, [("Событий", len(rows))]))
+        d.table(["Время", "Категория", "Уровень", "Пользователь", "Модуль", "Действие", "Объект", "ID"],
+                [[datetime.datetime.fromtimestamp(e["ts"] / 1000).strftime("%d.%m.%Y %H:%M:%S"),
+                  e["cat"], e["level"], _uname(db, cur, e["user_id"]) or e["user_id"],
+                  MODULES.get(e["module"], e["module"]), e["action"], e["obj"], e["obj_id"]] for e in rows],
+                widths=[1.5, 1, 0.7, 1.5, 0.6, 3, 1, 0.9], title="События")
+        return d, "zhurnal_sobytiy"
+
+    if kind == "dashboard":
+        widgets = params.get("widgets") or []
+        title = params.get("title") or "Панель показателей"
+        d = D(title, subtitle="Выгрузка настроенной панели (M17)",
+              meta=_export_meta(db, cur, u, [("Виджетов", len(widgets))]))
+        for w in widgets:
+            wt = w.get("type")
+            d.h1(w.get("title") or "Виджет")
+            if wt == "kpi":
+                d.kv([(w.get("title") or "Показатель", w.get("value"))])
+            elif wt in ("bar", "line", "pie"):
+                d.chart(wt, w.get("labels") or [], w.get("values") or [], title=w.get("title") or "", unit=w.get("unit") or "")
+            elif wt == "table":
+                d.table(w.get("head") or [], w.get("rows") or [], title="")
+            elif wt == "html":
+                d.blocks.extend(docgen.blocks_from_html(w.get("html") or ""))
+            else:
+                d.p(w.get("text") or "")
+        d.note("Значения рассчитаны из единого состояния СУП-ИП с учётом прав пользователя.")
+        return d, "panel_pokazateley"
+
+    raise RpcError("Вид документа не реализован: %s" % kind, "Экспорт", 500, "NOT_IMPLEMENTED")
+
+
+def meeting_protocol_doc(db, cur, u, m):
+    """Протокол совещания по структуре ТЗ §2.8 (M16): 8 обязательных разделов."""
+    att = m.get("attendees") or []
+    decs = m.get("decisions") or []
+    d = docgen.Document("Протокол совещания %s" % m["code"], subtitle=m["title"],
+                        meta=[("Вид совещания", m["type"]), ("Дата", _fd(m["date"])), ("Время", m.get("time") or ""),
+                              ("Председатель", _uname(db, cur, m["chair"])), ("Секретарь", _uname(db, cur, m["secretary"])),
+                              ("Статус", m["status"]), ("Сформировал", u["name"]),
+                              ("Дата формирования", datetime.datetime.now().strftime("%d.%m.%Y %H:%M"))])
+    d.toc = True
+    d.h1("1. Общие сведения")
+    d.kv([("Наименование", m["title"]), ("Вид совещания", m["type"]),
+          ("Дата и время", "%s %s" % (_fd(m["date"]), m.get("time") or "")),
+          ("Председатель", _uname(db, cur, m["chair"])), ("Секретарь", _uname(db, cur, m["secretary"]))])
+    d.h1("2. Присутствовали")
+    if att: d.list(["%s — %s" % (_uname(db, cur, a), _role_of(db, cur, a)) for a in att], numbered=True)
+    else: d.p("Состав участников не зарегистрирован.")
+    d.h1("3. Повестка дня")
+    ag = m.get("agenda") or []
+    if ag:
+        d.table(["№", "Вопрос", "Докладчик"],
+                [[a.get("n", i + 1), a.get("title", ""), _uname(db, cur, a.get("reporter"))] for i, a in enumerate(ag)],
+                widths=[0.5, 4, 1.6])
+    else: d.p("Вопросы повестки не зарегистрированы.")
+    d.h1("4. Рассмотрение вопросов")
+    if ag:
+        for a in ag:
+            d.h2("Вопрос %s. %s" % (a.get("n", ""), a.get("title", "")))
+            d.p("Докладчик: %s." % _uname(db, cur, a.get("reporter")))
+            d.p(a.get("discussion") or "Обсуждение зафиксировано в решениях по вопросу.")
+    else:
+        d.p("Материалы обсуждения не зарегистрированы.")
+    d.h1("5. Принятые решения")
+    if decs:
+        d.table(["№", "Решение", "Ответственный", "Срок", "Поручение"],
+                [[i + 1, x.get("text", ""), _uname(db, cur, x.get("resp")), _fd(x.get("due")),
+                  (db.get_ent(cur, "task", x["taskId"]) or {}).get("code", "") if x.get("taskId") else "—"]
+                 for i, x in enumerate(decs)],
+                widths=[0.5, 3.6, 1.6, 1, 0.9], title="Реестр решений")
+    else: d.p("Решения не зарегистрированы.")
+    d.h1("6. Контроль исполнения")
+    rows = []
+    for x in decs:
+        t = db.get_ent(cur, "task", x["taskId"]) if x.get("taskId") else None
+        if t:
+            over = diffD(dISO(today()), t["end"]) if t["end"] < dISO(today()) and t["status"] not in ("Завершена", "Отменена", "Проверена") else 0
+            rows.append([t["code"], t["title"], _uname(db, cur, t["assignee"]), _fd(t["end"]), t["status"], t["progress"], over])
+        else:
+            rows.append(["—", x.get("text", ""), _uname(db, cur, x.get("resp")), _fd(x.get("due")), "поручение не создано", 0, 0])
+    d.table(["Поручение", "Содержание", "Исполнитель", "Срок", "Состояние", "Прогресс, %", "Просрочка, дн"], rows,
+            widths=[0.9, 3, 1.5, 0.9, 1.3, 0.8, 0.9], aligns=[None, None, None, None, None, "right", "right"])
+    d.h1("7. Подписи")
+    d.signatures([("Председатель совещания", _uname(db, cur, m["chair"])),
+                  ("Секретарь совещания", _uname(db, cur, m["secretary"]))])
+    d.h1("8. Приложения")
+    docs_ = [x for x in db.all_ent(cur, "doc") if x.get("taskId") in [x2.get("taskId") for x2 in decs if x2.get("taskId")]]
+    if docs_:
+        d.table(["Код", "Документ", "Тип", "Статус"],
+                [[x["code"], x["title"], x["type"], x["status"]] for x in docs_], widths=[1, 3.4, 1.4, 1.4])
+    else:
+        d.p("Приложения не зарегистрированы.")
+    return d
+
+def _role_of(db, cur, user_id):
+    if not user_id: return ""
+    cur.execute("SELECT role, position FROM users WHERE id=%s", (user_id,))
+    r = cur.fetchone()
+    return (r["position"] or ROLES.get(r["role"], "")) if r else ""
+
+@reg("meeting.protocol")
+def h_meeting_protocol(db, cur, u, p):
+    """Формирование протокола: DOCX + PDF регистрируются в M09 как версии документа (ТЗ §2.8, §2.12)."""
+    m = get_req(db, cur, "meeting", p["id"])
+    guard(db, cur, u, "meetings", "export", m)
+    guard(db, cur, u, "docs", "create")
+    if docgen is None: raise RpcError("Генератор документов недоступен", "Экспорт", 500, "NO_DOCGEN")
+    d = meeting_protocol_doc(db, cur, u, m)
+    cur.execute("SELECT id FROM docs WHERE task_id IS NULL AND title=%s", ("Протокол совещания %s" % m["code"],))
+    r = cur.fetchone()
+    if r:
+        doc = db.get_ent(cur, "doc", r["id"])
+    else:
+        n = next_seq(db, cur, "doc")
+        doc = dict(id=uid("d"), code="ДОК-%03d" % n, title="Протокол совещания %s" % m["code"], type="Протокол",
+                   projectId=None, taskId=None, riskId=None, status="Проект", author=u["id"], versions=[])
+        db.save_ent(cur, "doc", doc)
+    v = max([x["v"] for x in (doc.get("versions") or [])] or [0]) + 1
+    fmts = [f for f in (p.get("formats") or ["docx", "pdf"])]
+    for fmt in fmts:
+        if fmt not in ("docx", "pdf", "xlsx", "html"): raise RpcError("Недопустимый формат протокола: %s" % fmt)
+    os.makedirs(FILES_DIR, exist_ok=True)
+    stored, primary = [], None
+    for i, fmt in enumerate(fmts):
+        data = docgen.render(d, fmt)
+        fname = "protokol_%s_v%d.%s" % (m["code"], v, fmt)
+        # основное представление — в каноническом пути M09, дополнительные — рядом (DOCX + PDF одной версии)
+        path = file_path(doc["id"], v) if i == 0 else file_path(doc["id"], v) + "." + fmt
+        with open(path, "wb") as f: f.write(data)
+        if i == 0: primary = (fname, len(data))
+        stored.append({"fmt": fmt, "name": fname, "size": len(data)})
+    cur.execute("INSERT INTO doc_versions(doc_id,v,ts,by_user,size,note,file_name,stored) VALUES(%s,%s,%s,%s,%s,%s,%s,TRUE) "
+                "ON CONFLICT (doc_id,v) DO UPDATE SET ts=EXCLUDED.ts, size=EXCLUDED.size, note=EXCLUDED.note, "
+                "file_name=EXCLUDED.file_name, stored=TRUE",
+                (doc["id"], v, now_ms(), u["id"], primary[1],
+                 "Протокол совещания · представления: %s" % ", ".join(f.upper() for f in fmts), primary[0]))
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Сформирован протокол совещания", "Совещание", m["id"],
+             {"code": m["code"], "doc": doc["code"], "v": v, "formats": fmts})
+    db.audit(cur, "AUDIT", "info", u["id"], "docs", "Зарегистрирована версия документа", "Документ", doc["id"],
+             {"v": v, "source": "M16"})
+    return {"docId": doc["id"], "version": v, "files": stored}, msg(
+        "Протокол сформирован (версия %d)" % v, "DOCX и PDF зарегистрированы в M09 · событие в M15")
+
 # ---------------- Диспетчер RPC ----------------
 def dispatch(db, user, action, payload):
     h = HANDLERS.get(action)
@@ -1659,13 +2145,18 @@ def store_file(db, user, doc_id, v, name, body):
         finally:
             db.put(conn)
 
-def read_file_bytes(db, cur, user, doc_id, v):
+def read_file_bytes(db, cur, user, doc_id, v, fmt=None):
     d = db.get_ent(cur, "doc", doc_id)
     if not d: raise RpcError("Документ не найден", "Файл", 404, "NOT_FOUND")
     guard(db, cur, user, "docs", "view", d)
     ver = next((x for x in d["versions"] if x["v"] == v), None)
     if not ver: raise RpcError("Версия не найдена", "Файл", 404, "NOT_FOUND")
     p = file_path(doc_id, v)
+    if fmt and fmt in ("docx", "pdf", "xlsx", "html"):
+        alt = p + "." + fmt
+        if ver["stored"] and os.path.isfile(alt):
+            with open(alt, "rb") as f:
+                return f.read(), re.sub(r"\.[A-Za-z0-9]+$", "", ver["name"]) + "." + fmt, False
     if ver["stored"] and os.path.isfile(p):
         with open(p, "rb") as f: return f.read(), ver["name"], False
     demo = ("%s · демонстрационный файл\n\nДокумент: %s — %s\nВерсия: %d от %s\nСтатус: %s\n\n"
@@ -1744,7 +2235,10 @@ def restore_backup(db, user, data, token=None):
 # ---------------- HTTP-слой ----------------
 MIME = {".html":"text/html; charset=utf-8", ".js":"text/javascript; charset=utf-8", ".css":"text/css; charset=utf-8",
         ".svg":"image/svg+xml", ".png":"image/png", ".jpg":"image/jpeg", ".ico":"image/x-icon",
-        ".woff2":"font/woff2", ".json":"application/json; charset=utf-8", ".txt":"text/plain; charset=utf-8"}
+        ".woff2":"font/woff2", ".json":"application/json; charset=utf-8", ".txt":"text/plain; charset=utf-8",
+        ".docx":"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".xlsx":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".pdf":"application/pdf", ".csv":"text/csv; charset=utf-8"}
 
 class App(http.server.BaseHTTPRequestHandler):
     server_version = "SUP-IP/" + VERSION
@@ -1827,6 +2321,8 @@ class App(http.server.BaseHTTPRequestHandler):
                 res = dispatch(db, u, p.get("action", ""), p.get("payload") or {})
                 status = 200 if res.get("ok") else res.pop("status", 400)
                 return self.send_json(res, status)
+            if path == "/api/export":
+                return self.export_response(db, u, self.body_json())
             m = re.match(r"^/api/files/([A-Za-z0-9_\-]+)/(\d+)$", path)
             if m:
                 q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -1848,8 +2344,51 @@ class App(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json({"ok": False, "error": {"code": "INTERNAL", "title": "Ошибка сервера", "message": str(e)}}, 500)
 
+    def export_response(self, db, u, p):
+        """Выгрузка документа (ТЗ §25): DOCX/XLSX/PDF/CSV/HTML с серверной проверкой прав и аудитом."""
+        kind = p.get("kind") or ""
+        fmt = (p.get("fmt") or "docx").lower()
+        if fmt not in EXPORT_FORMATS:
+            raise RpcError("Недопустимый формат: %s" % fmt, "Экспорт", 400, "BAD_FORMAT")
+        params = dict(p.get("params") or {})
+        for k, v in p.items():
+            if k not in ("kind", "id", "fmt", "params"): params.setdefault(k, v)
+        with db.wlock:
+            conn = db.get()
+            try:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    try:
+                        d, base = build_export(db, cur, u, kind, p.get("id") or "", params)
+                        data = docgen.render(d, fmt)
+                        mod, label = EXPORT_KINDS[kind]
+                        db.audit(cur, "BUSINESS", "info", u["id"], mod,
+                                 "Выгружен документ: %s (%s)" % (label, fmt.upper()), "Документ", p.get("id") or "",
+                                 {"kind": kind, "fmt": fmt, "size": len(data), "title": d.title})
+                        db.bump(cur); conn.commit()
+                    except PermError as e:
+                        conn.rollback()
+                        db.audit(cur, "SECURITY", "warning", u["id"], e.mod, "Отказано в выгрузке документа (недостаточно прав)",
+                                 "Документ", kind, {"op": e.op, "role": u["role"], "fmt": fmt})
+                        conn.commit(); raise
+                    except Exception:
+                        conn.rollback(); raise
+            finally:
+                db.put(conn)
+        fname = "%s.%s" % (base, fmt)
+        self._headers(200, MIME.get("." + fmt, "application/octet-stream"), len(data),
+                      {"Content-Disposition": "attachment; filename*=UTF-8''" + urllib.parse.quote(fname)})
+        self.wfile.write(data)
+
     def api_get(self, path):
         db = self.db
+        if path == "/api/formats":
+            self.need_user()
+            av = docgen.available() if docgen else {}
+            return self.send_json({"ok": True, "formats": av, "kinds": {k: v[1] for k, v in EXPORT_KINDS.items()}})
+        if path == "/api/export":
+            u = self.need_user()
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            return self.export_response(db, u, {k: v[0] for k, v in q.items()})
         if path == "/api/health":
             conn = db.get()
             try:
@@ -1891,7 +2430,9 @@ class App(http.server.BaseHTTPRequestHandler):
             conn = db.get()
             try:
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                    data, name, is_demo = read_file_bytes(db, cur, u, m.group(1), int(m.group(2)))
+                    q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    fmt = (q.get("fmt") or [None])[0]
+                    data, name, is_demo = read_file_bytes(db, cur, u, m.group(1), int(m.group(2)), fmt)
                     if not is_demo:
                         db.audit(cur, "AUDIT", "info", u["id"], "docs", "Скачан файл документа", "Документ", m.group(1), {"v": int(m.group(2)), "name": name})
                         conn.commit()
@@ -2300,6 +2841,11 @@ def selftest():
         except ImportError:
             print("  %s: %s — %s" % (mod, "ОШИБКА" if need else "нет (необязательно)", why))
             ok = ok and not need
+    if docgen is not None:
+        av = docgen.available()
+        print("  Форматы документов: %s" % ", ".join(k.upper() for k, v in av.items() if v))
+        if not av.get("pdf"):
+            print("  Шрифты assets/fonts: ОШИБКА — PDF недоступен"); ok = False
     try:
         os.makedirs(FILES_DIR, exist_ok=True)
         probe = os.path.join(FILES_DIR, ".selftest")
