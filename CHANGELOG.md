@@ -4,6 +4,9 @@
 копия README сохраняется в `versions/README-vX.Y.Z.md`, изменения пушатся в
 https://github.com/pomeshikov78-art/SUP-IP.
 
+## v1.3.2 — 2026-11-24
+- Автосборка EXE доведена до релиза: установщик собирается NSIS на Linux-раннере (не зависит от Chocolatey, который отдавал 504), проверка PE-сигнатуры артефактов, публикация SUP-IP.exe и SUP-IP-Setup-x.y.z.exe в Releases по тегу
+
 ## v1.3.1 — 2026-11-24
 - Исправлен запуск CLI на Windows: принудительный UTF-8 консоли (cp1252 не кодировала кириллицу — падали --install/--selftest/--health/--version), выявлено автосборкой GitHub Actions; --selftest проверяет шрифты PDF
 
