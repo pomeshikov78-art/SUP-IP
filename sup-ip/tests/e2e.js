@@ -12,6 +12,16 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
  page.on('pageerror',e=>errors.push('pageerror: '+e.message));
  page.on('console',m=>{ if(m.type()==='error' && !/401|403|400|429|Failed to load resource/.test(m.text())) errors.push('console: '+m.text()); });
 
+ // эталонный набор до и после испытаний: UI-тесты не зависят от прежнего состояния БД
+ const rpcAs = async (cookie,action,payload)=>{
+  const r = await fetch(BASE+'/api/rpc',{method:'POST',headers:{'Content-Type':'application/json',cookie},
+   body:JSON.stringify({action,payload:payload||{}})});
+  return r.json();
+ };
+ const admSess = await fetch(BASE+'/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({login:'admin',password:'demo'})});
+ const admCookie = (admSess.headers.get('set-cookie')||'').split(';')[0];
+ await rpcAs(admCookie,'admin.reset');
+
  console.log('== Загрузка и вход ==');
  await page.goto(BASE,{waitUntil:'networkidle0'});
  ok('экран входа', await page.$('.login-box')!==null);
@@ -127,9 +137,88 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
  await sleep(300);
  ok('журнал содержит BUSINESS', (await page.evaluate(()=>document.getElementById('view').textContent)).includes('BUSINESS'));
 
+ console.log('== Центр уведомлений и напоминаний (M12 §8) ==');
+ // совещание создаёт другой пользователь (администратор) — приглашение должно прийти в браузер РП
+ const mtRes = await rpcAs(admCookie,'meeting.create',{title:'E2E совещание уведомлений',type:'Оперативное',
+  date:new Date(Date.now()+864e5).toISOString().slice(0,10),time:'11:00',chair:'u2',secretary:'u4',attendees:['u3','u5']});
+ const mid = (mtRes.result||{}).id;
+ ok('совещание создано вторым пользователем', !!mid);
+ await page.evaluate(()=>pollState());
+ await sleep(400);
+ ok('счётчик непрочитанных обновлён', (await page.evaluate(()=>DB.notifUnread))>=1);
+ ok('бейдж уведомлений видим', await page.evaluate(()=>{const b=document.getElementById('notif-bdg');return b&&b.style.display!=='none';}));
+ await page.evaluate(()=>App.notifs());
+ await sleep(200);
+ ok('попап центра уведомлений открыт', await page.$('.notif-pop')!==null);
+ ok('приглашение доставлено сервером', (await page.evaluate(()=>document.getElementById('notif-pop').textContent)).includes('Приглашение: E2E совещание уведомлений'));
+ ok('есть раздел подсказок из состояния', (await page.evaluate(()=>document.getElementById('notif-pop').textContent)).includes('Требует внимания'));
+ await page.screenshot({path:'/tmp/e2e/shot_notifs.png'});
+ const unreadBefore = await page.evaluate(()=>DB.notifUnread);
+ await page.evaluate(()=>{ const i=App._notifs.findIndex(n=>n.title.includes('Приглашение')); App.notifGo(i,'srv'); });
+ await sleep(600);
+ ok('переход к совещанию из уведомления', (await page.evaluate(()=>document.getElementById('drawer-root').textContent)).includes('E2E совещание уведомлений'));
+ ok('уведомление отмечено прочитанным', (await page.evaluate(()=>DB.notifUnread))<unreadBefore);
+ await page.evaluate(()=>{App.closeDrawer&&App.closeDrawer(true);App.notifs();});
+ await sleep(200);
+ await page.evaluate(()=>App.notifReadAll());
+ await sleep(600);
+ ok('«Прочитать все» обнулило счётчик', (await page.evaluate(()=>DB.notifUnread))===0);
+ ok('бейдж скрыт после прочтения', await page.evaluate(()=>{const b=document.getElementById('notif-bdg');return b&&b.style.display==='none';}));
+
+ await page.evaluate(()=>App.notifPrefs());
+ await sleep(400);
+ ok('модалка настроек уведомлений', (await page.evaluate(()=>document.getElementById('modal-root').textContent)).includes('Настройка уведомлений'));
+ ok('чекбоксы типов отрисованы', await page.$('#np-task\\.overdue')!==null);
+ await page.evaluate(()=>{document.getElementById('np-task.overdue').checked=false;});
+ await page.evaluate(()=>App.notifPrefsSave());
+ await sleep(600);
+ const prefsOff = await page.evaluate(async()=>{const r=await rpc('notif.list',{limit:1});return r&&r.prefs['task.overdue']===false;});
+ ok('отключённый тип сохранён на сервере', prefsOff===true);
+ await page.evaluate(()=>rpc('notif.prefs',{prefs:{'task.overdue':true}}));
+ await sleep(300);
+
+ console.log('== Напоминания совещания и события ==');
+ await page.evaluate(m=>{App.f.meetTab='info';openMeeting(m);},mid);
+ await sleep(400);
+ ok('блок напоминаний в карточке совещания', (await page.evaluate(()=>document.getElementById('drawer-root').textContent)).includes('Напоминания'));
+ ok('типовые интервалы отмечены', await page.evaluate(()=>{const a=document.getElementById('rem-meeting-1440'),b=document.getElementById('rem-meeting-60');return a&&a.checked&&b&&b.checked;}));
+ await page.evaluate(()=>{document.getElementById('rem-meeting-10080').checked=true;});
+ await page.evaluate(m=>App.reminderSave('meeting',m),mid);
+ await sleep(700);
+ const remM = await page.evaluate(m=>DB.reminders.filter(r=>r.owner_id===m).map(r=>r.offset_min),mid);
+ ok('напоминания пересчитаны сервером (3 интервала × 4 участника)', remM.length===12, remM.length);
+ ok('новый интервал сохранён', [...new Set(remM)].sort((a,b)=>a-b).join(',')==='60,1440,10080');
+ // перенос совещания другим пользователем: оповещение участников и пересчёт напоминаний
+ const fireBefore = await page.evaluate(m=>DB.reminders.filter(r=>r.owner_id===m).map(r=>r.fire_at).sort().join(','),mid);
+ await rpcAs(admCookie,'meeting.update',{id:mid,date:new Date(Date.now()+3*864e5).toISOString().slice(0,10),time:'12:30'});
+ await page.evaluate(()=>pollState());
+ await sleep(400);
+ ok('участник оповещён о переносе', await page.evaluate(()=>DB.notifications.some(n=>n.title.includes('Совещание перенесено'))));
+ const fireAfter = await page.evaluate(m=>DB.reminders.filter(r=>r.owner_id===m).map(r=>r.fire_at).sort().join(','),mid);
+ ok('напоминания пересчитаны от новой даты', fireBefore!==fireAfter && fireAfter.split(',').length===12);
+
+ await page.evaluate(()=>{App.closeDrawer&&App.closeDrawer(true);App.calEventModal(D(2));});
+ await sleep(300);
+ ok('чекбоксы напоминаний в форме события', await page.evaluate(()=>{const a=document.getElementById('cev-rem-1440'),b=document.getElementById('cev-rem-60');return a&&a.checked&&b&&b.checked;}));
+ await page.evaluate(()=>{
+  document.getElementById('cev-title').value='E2E событие с напоминаниями';
+  document.getElementById('cev-rem-60').checked=false;
+  document.getElementById('cev-rem-10080').checked=true;
+ });
+ await page.evaluate(()=>App.calEventSave());
+ await sleep(900);
+ const evInfo = await page.evaluate(()=>{
+  const e=DB.calEvents.find(x=>x.title==='E2E событие с напоминаниями');
+  return e?{id:e.id,offs:[...new Set(DB.reminders.filter(r=>r.owner_id===e.id).map(r=>r.offset_min))].sort((a,b)=>a-b)}:null;
+ });
+ ok('событие календаря создано', !!(evInfo&&evInfo.id));
+ ok('выбранные интервалы напоминаний применены', evInfo&&evInfo.offs.join(',')==='1440,10080', evInfo&&evInfo.offs.join(','));
+ await page.evaluate(()=>nav('meetings'));
+ await sleep(250);
+
  console.log('== Права: наблюдатель ==');
  await page.evaluate(()=>App.logout());
- await sleep(300);
+ await page.waitForSelector('.login-box',{timeout:10000});
  await page.evaluate(()=>{ App.pickUser('zaytseva'); });
  await page.click('.login-row .btn.pri');
  await page.waitForSelector('.shell',{timeout:10000});
@@ -140,6 +229,20 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
  await sleep(200);
  ok('тост 403 показан', (await page.evaluate(()=>document.getElementById('toasts').textContent)).includes('403'));
 
+ console.log('== M14: планировщик уведомлений ==');
+ await page.evaluate(()=>App.logout());
+ await page.waitForSelector('.login-box',{timeout:10000});
+ await page.evaluate(()=>{ App.pickUser('admin'); });
+ await page.click('.login-row .btn.pri');
+ await page.waitForSelector('.shell',{timeout:10000});
+ await page.evaluate(()=>{ nav('admin'); App.f.adm='sys'; renderView(); });
+ await sleep(400);
+ ok('карточка планировщика в M14', (await page.evaluate(()=>document.getElementById('view').textContent)).includes('Планировщик уведомлений и напоминаний'));
+ await page.evaluate(()=>App.notifTick());
+ await sleep(800);
+ ok('внеочередной цикл планировщика отработал', (await page.evaluate(()=>document.getElementById('toasts').textContent)).includes('Планировщик отработал'));
+ await page.screenshot({path:'/tmp/e2e/shot_notif_admin.png'});
+
  console.log('== Сессия и выход ==');
  await page.evaluate(()=>App.logout());
  await sleep(300);
@@ -149,6 +252,7 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
  ok('нет pageerror/console.error', errors.length===0, errors.slice(0,4).join(' | '));
 
  await browser.close();
+ await rpcAs(admCookie,'admin.reset');   // возврат к эталонному набору
  console.log('\nИТОГ E2E: '+PASS+' ok, '+FAIL+' FAIL');
  process.exit(FAIL?1:0);
 })().catch(e=>{console.error('E2E CRASH:',e);process.exit(2);});

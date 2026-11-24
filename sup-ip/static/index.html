@@ -242,7 +242,7 @@ svg.ic{width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:1.8;str
 .checkline{display:flex;align-items:center;gap:8px;font-size:12.5px;cursor:pointer}
 .checkline input{width:15px;height:15px;accent-color:var(--acc)}
 
-.toasts{position:fixed;bottom:18px;right:18px;z-index:200;display:flex;flex-direction:column;gap:9px;max-width:400px}
+.toasts{position:fixed;bottom:18px;right:18px;z-index:200;display:flex;flex-direction:column;gap:9px;max-width:400px;pointer-events:none}
 .toast{background:#0f1b2d;color:#e8eefb;border-radius:11px;padding:12px 15px;font-size:12.5px;box-shadow:var(--sh2);display:flex;gap:10px;align-items:flex-start;animation:tin .25s;border-left:3px solid var(--acc)}
 .toast.ok{border-left-color:#22c55e}.toast.ok .ic{color:#4ade80}
 .toast.err{border-left-color:#ef4444}.toast.err .ic{color:#f87171}
@@ -799,7 +799,15 @@ function userLoad(uid_, day){
  const cap=u.capacity||8;
  return {hours:+hours.toFixed(1), cap, pct:Math.round(100*hours/cap), tasks:ts};
 }
-function notifList(){
+/* Центр уведомлений (ТЗ M12 §8): доставленные сервером уведомления + производные подсказки.
+   Доставкой, статусом прочтения и защитой от повторов владеет только сервер. */
+const NOTIF_ICON={'task.assigned':'tasks','task.due':'clock','task.overdue':'alert','directive.assigned':'meeting',
+ 'directive.due':'clock','directive.overdue':'alert','directive.stale':'alert','meeting.reminder':'meeting',
+ 'event.reminder':'calendar','meeting.invite':'meeting','protocol.review':'file','protocol.approved':'check',
+ 'protocol.rework':'alert','time.approval':'clock','time.result':'check','doc.approval':'file','doc.approved':'check','calc.verify':'calc','risk.review':'alert'};
+function notifTone(t){ return /overdue|stale|rework/.test(t)?'var(--err)':/due|approval|review|verify/.test(t)?'var(--warn)':'var(--acc)'; }
+function serverNotifs(){ return (DB&&DB.notifications)||[]; }
+function notifHints(){
  const u=App.user, out=[];
  if(!u) return out;
  const myT=DB.tasks.filter(t=>!DONE_ST.includes(t.status)&&t.status!=='Отменена');
@@ -812,6 +820,35 @@ function notifList(){
  DB.risks.filter(r=>r.status!=='Закрыт'&&r.review<=D(3)).slice(0,4).forEach(r=>out.push({icon:'alert',tone:'var(--warn)',title:'Пересмотр риска: '+r.title,sub:r.code+' · срок '+fmtD(r.review),go:()=>openRisk(r.id)}));
  return out;
 }
+function notifList(){ return serverNotifs().map(notifItem).concat(notifHints()); }
+function notifItem(n){
+ return {id:n.id, unread:!n.readAt&&!n.read_at, icon:NOTIF_ICON[n.type]||'info', tone:notifTone(n.type),
+  title:n.title, sub:(n.body||'')+' · '+fmtT(new Date(n.ts)), server:true,
+  go:()=>{ rpc('notif.read',{ids:[n.id]}); notifNavigate(n); }};
+}
+function notifNavigate(n){
+ const id=n.obj_id;
+ if(n.module==='tasks'&&id){ openTask(id); return; }
+ if(n.module==='meetings'&&id&&MEET(id)){ openMeeting(id); return; }
+ if(n.module==='risks'&&id){ openRisk(id); return; }
+ if(n.module==='docs'&&id){ openDoc(id); return; }
+ nav({tasks:'tasks',meetings:'meetings',calendar:'calendar',time:'time',docs:'docs',calcs:'calcs',risks:'risks'}[n.module]||'dash');
+}
+/* Напоминания события (ТЗ M12 §8.2): несколько интервалов, доставка сервером */
+const REM_OFFSETS=[[0,'В момент начала'],[60,'За 1 час'],[1440,'За 1 день'],[4320,'За 3 дня'],[10080,'За 7 дней'],[20160,'За 14 дней']];
+function reminderBlock(ownerType,ownerId,editable){
+ const rs=((DB&&DB.reminders)||[]).filter(r=>r.owner_type===ownerType&&r.owner_id===ownerId);
+ const on=new Set(rs.map(r=>r.offset_min));
+ const sent=rs.filter(r=>r.sent_at).length;
+ return '<div class="card mt8"><div class="ch">'+ic('bell')+'Напоминания'+(rs.length?'<span class="r small mut">доставлено: '+sent+' из '+rs.length+'</span>':'')+'</div><div class="cb">'+
+  REM_OFFSETS.map(([v,l])=>'<label class="checkline"><input type="checkbox" id="rem-'+ownerType+'-'+v+'" '+(on.has(v)?'checked':'')+(editable?'':' disabled')+'> '+l+'</label>').join('')+
+  (editable?'<div class="mt8"><button class="btn sm pri" onclick="App.reminderSave(\''+ownerType+'\',\''+ownerId+'\')">'+ic('save')+' Сохранить напоминания</button></div>':'<p class="small mut">Изменение доступно при праве редактирования события.</p>')+
+  '</div></div>';
+}
+App.reminderSave=function(ownerType,ownerId){
+ const offsets=REM_OFFSETS.filter(([v])=>{const el=document.getElementById('rem-'+ownerType+'-'+v);return el&&el.checked;}).map(([v])=>v);
+ rpc('reminder.set',{ownerType,ownerId,offsets}).then(r=>{ if(!r)return; if(ownerType==='meeting')openMeeting(ownerId); else App.calEventOpen(ownerId); });
+};
 
 /* ---------- UI: тосты, модальные окна, drawer ---------- */
 function toast(tone, title, sub){
@@ -1006,6 +1043,7 @@ function renderLogin(){
  '</div></div>';
 }
 App.pickUser=function(login){ App.loginSel=login; renderLogin(); const p=$('#login-pass'); if(p){p.value='demo';p.focus();} };
+let SESS_GEN=0;   // защита от гонки: ответ позднего выхода не должен сбрасывать новый сеанс
 App.doLogin=async function(){
  const err=$('#login-err'); const login=val('login-user')||App.loginSel; const pass=val('login-pass');
  if(!login||!pass){ err.textContent='Введите логин и пароль'; return; }
@@ -1014,6 +1052,7 @@ App.doLogin=async function(){
   const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({login,password:pass})});
   const j=await r.json();
   if(!j.ok){ err.textContent=(j.error||{}).message||'Вход отклонён'; return; }
+  SESS_GEN++;
   DB=j.state; App.user=DB.users.find(u=>u.id===DB.me); App.lastSync=new Date(); App.loginSel=login;
   App.view=can('dash','view')?'dash':'portfolio';
   renderShell(); startPolling();
@@ -1021,7 +1060,9 @@ App.doLogin=async function(){
  }catch(e){ err.textContent='Сервер недоступен: '+e.message; }
 };
 App.logout=async function(){
+ const gen=SESS_GEN;
  try{ await fetch('/api/logout',{method:'POST'}); }catch(e){}
+ if(gen!==SESS_GEN) return;   // за время запроса выполнен новый вход — экран входа не показываем
  stopPolling(); App.user=null; renderLogin();
 };
 App.resetDemo=function(){
@@ -1063,21 +1104,42 @@ function renderShell(){
  updateNotifBadge();
  renderView();
 }
-function updateNotifBadge(){ const n=notifList().length; const b=$('#notif-bdg'); if(b){ b.style.display=n?'flex':'none'; b.textContent=n>9?'9+':n; } }
+function updateNotifBadge(){ const n=(DB&&DB.notifUnread)||0; const b=$('#notif-bdg'); if(b){ b.style.display=n?'flex':'none'; b.textContent=n>9?'9+':n; } }
 App.closePopups=function(e){
  if(!e.target.closest('.searchbox')){const p=$('#search-pop');if(p)p.innerHTML='';}
  if(!e.target.closest('.notif-pop')&&!e.target.closest('.iconbtn')){const p=$('#notif-pop');if(p)p.remove();}
 };
 App.notifs=function(){
  const ex=$('#notif-pop'); if(ex){ex.remove();return;}
- const items=notifList();
+ const srv=serverNotifs().map(notifItem), hints=notifHints();
+ const unread=(DB&&DB.notifUnread)||0;
  const el=document.createElement('div'); el.className='notif-pop'; el.id='notif-pop';
- el.innerHTML='<h4>'+ic('bell')+' Уведомления и контрольные события</h4>'+
-  (items.length?items.map((n,i)=>'<div class="ni" onclick="App.notifGo('+i+')"><span style="color:'+n.tone+'">'+ic(n.icon)+'</span><div><b>'+esc(n.title)+'</b><small>'+esc(n.sub)+'</small></div></div>').join(''):emptyBlock('Нет активных уведомлений','Просрочек, ожиданий утверждения и ближайших совещаний нет','check'));
- $('.topbar').appendChild(el);
- App._notifs=items;
+ const row=(n,i,kind)=>'<div class="ni" onclick="App.notifGo('+i+',\''+kind+'\')" style="'+(n.unread?'background:var(--acc-bg)':'')+'"><span style="color:'+n.tone+'">'+ic(n.icon)+'</span><div><b>'+esc(n.title)+'</b><small>'+esc(n.sub)+'</small></div></div>';
+ el.innerHTML='<h4>'+ic('bell')+' Уведомления'+(unread?' · новых: '+unread:'')+
+  '<span class="r" style="float:right;display:flex;gap:6px">'+(unread?'<button class="btn sm" onclick="App.notifReadAll()">Прочитать все</button>':'')+
+  '<button class="btn sm" onclick="App.notifPrefs()">'+ic('settings')+'</button></span></h4>'+
+  (srv.length?srv.map((n,i)=>row(n,i,'srv')).join(''):'<div class="ni" style="cursor:default"><span style="color:var(--mut)">'+ic('check')+'</span><div><b>Доставленных уведомлений нет</b><small>Напоминания и контроль сроков выполняет сервер</small></div></div>')+
+  (hints.length?'<h4 style="border-top:1px solid var(--line)">Требует внимания (расчёт из состояния)</h4>'+hints.map((n,i)=>row(n,i,'hint')).join(''):'');
+ document.body.appendChild(el);
+ App._notifs=srv; App._hints=hints;
 };
-App.notifGo=function(i){ const n=App._notifs[i]; const p=$('#notif-pop'); if(p)p.remove(); if(n)n.go(); };
+App.notifReadAll=function(){ rpc('notif.read',{all:true}).then(()=>{const p=$('#notif-pop');if(p)p.remove();}); };
+App.notifPrefs=function(){
+ const p=$('#notif-pop'); if(p)p.remove();
+ rpc('notif.list',{limit:1}).then(r=>{
+  if(!r)return;
+  const prefs=r.prefs||{};
+  openModal(mh('Настройка уведомлений','bell')+'<div class="mb"><p class="small mut">Отключённые типы не доставляются внутренним центром уведомлений. Настройка персональная и сохраняется на сервере (ТЗ M12 §8.3).</p>'+
+   '<div class="list-rows mt8">'+r.types.map(t=>'<label class="lr" style="cursor:pointer"><input type="checkbox" id="np-'+t.key+'" '+(prefs[t.key]===false?'':'checked')+' style="width:auto;margin-right:10px"><div class="lt"><b>'+esc(t.name)+'</b><small>'+esc((MOD[t.module]||{}).code||t.module)+' · '+esc(t.key)+'</small></div></label>').join('')+'</div></div>'+
+   '<div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" onclick="App.notifPrefsSave()">Сохранить</button></div>');
+  App._notifTypes=r.types.map(t=>t.key);
+ });
+};
+App.notifPrefsSave=function(){
+ const prefs={}; (App._notifTypes||[]).forEach(k=>{const el=document.getElementById('np-'+k); if(el)prefs[k]=el.checked;});
+ rpc('notif.prefs',{prefs}).then(r=>{if(r)App.closeModal(true);});
+};
+App.notifGo=function(i,kind){ const n=(kind==='hint'?App._hints:App._notifs)[i]; const p=$('#notif-pop'); if(p)p.remove(); if(n)n.go(); };
 App.search=function(q){
  const pop=$('#search-pop'); if(!pop) return;
  q=q.trim().toLowerCase();
@@ -1147,7 +1209,7 @@ App.about=function(){
  '<rect x="10" y="10" width="840" height="64" rx="10" fill="#eff6ff" stroke="#bfdbfe"/><text x="26" y="36" font-size="13" font-weight="700" fill="#1d4ed8">Уровень 3 · Web UI (браузер в ЛВС, без установки)</text><text x="26" y="56" font-size="11" fill="#3b82f6">SPA-навигация без перезагрузок · карточки · таблицы · графики · фильтры · состояния: загрузка / данные / пусто / ошибка / нет прав</text>'+
  '<rect x="10" y="94" width="840" height="92" rx="10" fill="#f0fdf4" stroke="#bbf7d0"/><text x="26" y="118" font-size="13" font-weight="700" fill="#15803d">Уровень 2 · Функциональные модули</text>'+
  MODULES.map((m,i)=>{const x=26+(i%9)*92, y=130+Math.floor(i/9)*30;return '<rect x="'+x+'" y="'+y+'" width="86" height="24" rx="6" fill="#fff" stroke="#86efac"/><text x="'+(x+43)+'" y="'+(y+16)+'" text-anchor="middle" font-size="10" fill="#166534">'+m.code+' '+({dash:'Дашборд',portfolio:'Проекты',tasks:'Задачи',kanban:'Канбан',gantt:'Гант',calendar:'Календарь',resources:'Ресурсы',time:'Трудозатраты',control:'Контроль',risks:'Риски',docs:'Документы',calcs:'Расчёты',analytics:'Аналитика',reports:'Отчёты',meetings:'Совещания',builder:'Конструктор',admin:'Админ',journal:'Журнал'}[m.key])+'</text>';}).join('')+
- '<rect x="10" y="206" width="840" height="64" rx="10" fill="#fefce8" stroke="#fde68a"/><text x="26" y="232" font-size="13" font-weight="700" fill="#a16207">Уровень 1 · Единое ядро (Core Platform)</text><text x="26" y="252" font-size="11" fill="#ca8a04">PostgreSQL · REST/JSON API · серверная проверка прав · аудит M15 · файлы · расчёты · резервирование · сессии</text>'+
+ '<rect x="10" y="206" width="840" height="64" rx="10" fill="#fefce8" stroke="#fde68a"/><text x="26" y="232" font-size="13" font-weight="700" fill="#a16207">Уровень 1 · Единое ядро (Core Platform)</text><text x="26" y="252" font-size="11" fill="#ca8a04">PostgreSQL · REST/JSON API · серверная проверка прав · аудит M15 · файлы · расчёты · резервирование · сессии · планировщик уведомлений</text>'+
  '<line x1="430" y1="74" x2="430" y2="94" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#ar)"/><line x1="430" y1="186" x2="430" y2="206" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#ar)"/>'+
  '<text x="444" y="88" font-size="10" fill="#64748b">только через API ядра</text><text x="444" y="200" font-size="10" fill="#64748b">регламентированные интерфейсы</text></svg>';
  const scenarios=[
@@ -1156,6 +1218,7 @@ App.about=function(){
   ['Управление отклонениями','M07 показывает просрочки и сдвиги относительно базового плана M04. Создайте корректирующее поручение — оно станет задачей M02 с контролем срока.','control'],
   ['Инженерный расчёт → Excel','M10: выберите модель «Бюджет радиолинии», выполните расчёт по формуле методики, проверьте результат и выгрузите протокол в Excel (CSV).','calcs'],
   ['Совещание → поручения','M16: откройте проведённое совещание, посмотрите решения и созданные из них поручения; статус исполнения виден в M07 и на дашборде.','meetings'],
+  ['Центр уведомлений','Нажмите колокольчик в шапке: доставленные сервером приглашения и напоминания, переход к объекту, «Прочитать все» и настройка типов. Интервалы напоминаний — в карточке совещания и события календаря.','meetings'],
   ['Конструктор дашборда','M17: включите/выключите виджеты и измените порядок — главный дашборд M00 перестроится. Настройки персональны для пользователя.','builder']
  ];
  openModal(mh('О системе: принципы работы СУП-ИП','info')+
@@ -1164,7 +1227,7 @@ App.about=function(){
   '<h4 class="mb8">Трёхуровневая архитектура (ТЗ §2)</h4>'+arch+
   '<h4 style="margin:16px 0 8px">Ключевые принципы, которые можно проверить</h4>'+
   '<div class="grid g2 small" style="gap:6px 18px">'+
-   ['Единая БД: канбан, гант, календарь и дашборд не хранят копий — только представления данных M01/M02.','Каждая мутация проходит через API ядра: проверка прав → операция → аудит → сохранение → обновление всех представлений.','Просрочка — индикатор, а не статус (ТЗ M02 §1.4). Статусные переходы контролируются workflow.','WIP-лимит колонки «В работе» настраивается в M14 и проверяется при перетаскивании.','Базовый план хранится отдельно: сдвиг сроков на ганте не меняет утверждённый базовый план.','Оценка риска = P×I (1–5); история оценок сохраняется, остаточный риск считается после мероприятий.','Документы версионируются; устаревшие версии остаются доступными.','Автономность: никаких внешних ресурсов и CDN — сервер и клиенты работают в изолированной локальной сети.'].map(s=>'<div class="flex" style="align-items:flex-start;gap:7px">'+ic('check','')+'<span>'+s+'</span></div>').join('')+
+   ['Единая БД: канбан, гант, календарь и дашборд не хранят копий — только представления данных M01/M02.','Каждая мутация проходит через API ядра: проверка прав → операция → аудит → сохранение → обновление всех представлений.','Просрочка — индикатор, а не статус (ТЗ M02 §1.4). Статусные переходы контролируются workflow.','WIP-лимит колонки «В работе» настраивается в M14 и проверяется при перетаскивании.','Базовый план хранится отдельно: сдвиг сроков на ганте не меняет утверждённый базовый план.','Оценка риска = P×I (1–5); история оценок сохраняется, остаточный риск считается после мероприятий.','Документы версионируются; устаревшие версии остаются доступными.','Уведомления и напоминания доставляет сервер: планировщик, защита от повторной доставки, персональные настройки типов.','Автономность: никаких внешних ресурсов и CDN — сервер и клиенты работают в изолированной локальной сети.'].map(s=>'<div class="flex" style="align-items:flex-start;gap:7px">'+ic('check','')+'<span>'+s+'</span></div>').join('')+
   '</div>'+
   '<h4 style="margin:16px 0 8px">Демонстрационные сценарии (нажмите, чтобы перейти)</h4>'+
   scenarios.map((s,i)=>'<div class="scenario" onclick="App.closeModal(true);nav(\''+s[2]+'\')"><span class="sn">'+(i+1)+'</span><div><b>'+s[0]+'</b><p>'+s[1]+'</p></div>'+ic('chevR')+'</div>').join('')+
@@ -2579,11 +2642,20 @@ App.calEventModal=function(presetDate){
   '<div class="row">'+field('Дата',inp('cev-date',presetDate||dISO(TODAY),'date'),true)+field('Время',inp('cev-time','10:00','time'))+'</div>'+
   field('Участники',sel('cev-u',DB.users.map(u=>[u.id,u.name]),App.user.id))+
   field('Примечание',inp('cev-note',''))+
+  field('Напоминания участникам','<div class="flexw" style="border:1.5px solid var(--line2);border-radius:8px;padding:9px 11px">'+
+   REM_OFFSETS.map(([v,l])=>'<label class="checkline"><input type="checkbox" id="cev-rem-'+v+'" '+([1440,60].includes(v)?'checked':'')+'> '+l+'</label>').join('')+
+   '<span class="small mut" style="width:100%">Доставка — во внутренний центр уведомлений (без внешней почты и интернета).</span></div>')+
  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" onclick="App.calEventSave()">Сохранить</button></div>');
 };
 App.calEventSave=function(){
  if(!requireFields(['cev-title','cev-date']))return;
- rpc('calendar.create',{title:val('cev-title'),date:val('cev-date'),time:val('cev-time'),participants:[val('cev-u')],note:val('cev-note')}).then(r=>{if(r)App.closeModal(true);});
+ const offsets=REM_OFFSETS.filter(([v])=>{const el=document.getElementById('cev-rem-'+v);return el&&el.checked;}).map(([v])=>v);
+ rpc('calendar.create',{title:val('cev-title'),date:val('cev-date'),time:val('cev-time'),participants:[val('cev-u')],note:val('cev-note')}).then(r=>{
+  if(!r)return;
+  App.closeModal(true);
+  const def=[60,1440], same=offsets.length===def.length&&offsets.every(v=>def.includes(v));
+  if(r.id&&!same)rpc('reminder.set',{ownerType:'calEvent',ownerId:r.id,offsets});
+ });
 };
 App.calEventOpen=function(eid){
  const e=DB.calEvents.find(x=>x.id===eid); if(!e)return;
@@ -2591,6 +2663,7 @@ App.calEventOpen=function(eid){
   '<div class="stat-line"><span>Дата и время</span><b>'+fmtD(e.date)+' '+esc(e.time||'')+'</b></div>'+
   '<div class="stat-line"><span>Участники</span><b>'+e.participants.map(u=>esc(U(u).name)).join(', ')+'</b></div>'+
   (e.note?'<div class="stat-line"><span>Примечание</span><b>'+esc(e.note)+'</b></div>':'')+
+  reminderBlock('calEvent',eid,can('calendar','edit'))+
  '</div><div class="mf">'+(can('calendar','edit')?'<button class="btn danger" onclick="App.calEventDelete(\''+eid+'\')">'+ic('trash')+' Удалить</button>':'')+'<button class="btn" onclick="App.closeModal(true)">Закрыть</button></div>');
 };
 App.calEventDelete=function(eid){
@@ -2766,6 +2839,7 @@ function openMeeting(mid){
    '<div class="stat-line"><span>Секретарь</span><b>'+esc(U(m.secretary).name)+'</b></div>'+
    '<div class="stat-line"><span>Статус</span>'+badge(m.status,m.status==='Запланировано'?'#2563eb':m.status==='Проведено'?'#d97706':'#16a34a',m.status==='Запланировано'?'#dbeafe':m.status==='Проведено'?'#fef3c7':'#dcfce7')+'</div>'+
   '</div></div>'+
+  reminderBlock('meeting',mid,editable)+
   '<h4 style="margin:14px 0 8px">Участники ('+m.attendees.length+')</h4>'+
   '<div class="list-rows">'+m.attendees.map(u=>'<div class="lr" style="cursor:default">'+avatar(U(u))+'<div class="lt"><b>'+esc(U(u).name)+'</b><small>'+esc(U(u).position)+'</small></div>'+(u===m.chair?'<span class="chip">председатель</span>':u===m.secretary?'<span class="chip">секретарь</span>':'')+'</div>').join('')+'</div>';
  }
@@ -2903,6 +2977,14 @@ Views.admin=function(){
    '</div>'+
   '</div></div>'+
   '</div>'+
+  '<div class="card mt14"><div class="ch">'+ic('bell')+'Планировщик уведомлений и напоминаний</div><div class="cb">'+
+   '<div class="stat-line"><span>Напоминаний настроено</span><b>'+((DB.reminders||[]).length)+'</b></div>'+
+   '<div class="stat-line"><span>Ожидают срабатывания / доставлено</span><b>'+((DB.reminders||[]).filter(r=>!r.sent_at).length)+' / '+((DB.reminders||[]).filter(r=>r.sent_at).length)+'</b></div>'+
+   '<div class="stat-line"><span>Цикл планировщика</span><b>каждые 30 с (фоновый поток сервера)</b></div>'+
+   '<div class="stat-line"><span>Канал доставки</span><b>внутренний центр уведомлений (ЛВС, без интернета)</b></div>'+
+   '<div class="flexw mt14"><button class="btn" onclick="App.notifTick()">'+ic('refresh')+' Внеочередной цикл планировщика</button></div>'+
+   '<p class="small mut mt8">Доставка напоминаний, контроль сроков задач и поручений, очереди утверждения, пересмотр рисков. Повторная доставка одного события исключена (ТЗ M12 §8.4, M16 §2.11.1).</p>'+
+  '</div></div>'+
   '<div class="help-note mt14">'+ic('info')+'<div>Развёртывание: сервер СУП-ИП (Python + PostgreSQL) на Windows 10/11 x64 или Linux; автономный EXE собирается PyInstaller (build_exe.bat). Резервная копия — JSON-дамп всех таблиц; восстановление полностью заменяет данные и рассылается всем клиентам.</div></div>';
  }
  return '<div class="page-head"><div><h2>Администрирование</h2><div class="desc">Пользователи, роли и матрица прав, справочники, workflow и системные параметры. Все изменения фиксируются в журнале M14→M15.</div></div></div>'+
@@ -2968,6 +3050,7 @@ App.restore=function(input){
  rd.readAsText(f);
 };
 App.diag=function(){ rpc('admin.diag'); };
+App.notifTick=function(){ if(!guard('admin','edit'))return; rpc('notif.tick'); };
 
 /* ---------- M15: журнал событий ---------- */
 Views.journal=function(){

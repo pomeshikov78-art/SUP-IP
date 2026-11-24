@@ -39,7 +39,7 @@ except ImportError:
     docgen = None
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.3.4"
+VERSION = "1.4.0"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -333,6 +333,18 @@ CREATE TABLE IF NOT EXISTS events(
   obj TEXT NOT NULL DEFAULT '', obj_id TEXT NOT NULL DEFAULT '', details JSONB NOT NULL DEFAULT '{}');
 CREATE INDEX IF NOT EXISTS ix_events_ts ON events(ts DESC);
 CREATE TABLE IF NOT EXISTS settings(id INT PRIMARY KEY DEFAULT 1, data JSONB NOT NULL);
+CREATE TABLE IF NOT EXISTS notifications(
+  id TEXT PRIMARY KEY, ts BIGINT NOT NULL, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  type TEXT NOT NULL, module TEXT NOT NULL, obj TEXT NOT NULL DEFAULT '', obj_id TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT 'web',
+  status TEXT NOT NULL DEFAULT 'sent', error TEXT NOT NULL DEFAULT '', read_at BIGINT,
+  dedupe TEXT NOT NULL UNIQUE);
+CREATE INDEX IF NOT EXISTS ix_notif_user ON notifications(user_id, ts DESC);
+CREATE TABLE IF NOT EXISTS reminders(
+  id TEXT PRIMARY KEY, owner_type TEXT NOT NULL, owner_id TEXT NOT NULL, user_id TEXT NOT NULL,
+  offset_min INT NOT NULL, fire_at BIGINT NOT NULL, sent_at BIGINT, key TEXT NOT NULL UNIQUE,
+  created_by TEXT, created_at BIGINT NOT NULL);
+CREATE INDEX IF NOT EXISTS ix_reminders_fire ON reminders(fire_at) WHERE sent_at IS NULL;
 """
 # kind -> (table, [(jsKey, column, type)])  type: t=text i=int f=real j=jsonb b=bool
 ENT = {
@@ -374,7 +386,7 @@ class DB:
             with conn.cursor() as cur:
                 cur.execute(SCHEMA)
                 cur.execute("INSERT INTO meta(k,v) VALUES('rev','1') ON CONFLICT DO NOTHING")
-                cur.execute("INSERT INTO meta(k,v) VALUES('schema','1') ON CONFLICT DO NOTHING")
+                cur.execute("INSERT INTO meta(k,v) VALUES('schema',%s) ON CONFLICT DO NOTHING", (str(SCHEMA_VERSION),))
             conn.commit()
         finally: self.put(conn)
     def get(self): return self.pool.getconn()
@@ -454,6 +466,11 @@ class DB:
         s["events"] = [{"id":r["id"],"ts":r["ts"],"cat":r["cat"],"level":r["level"],"user":r["user_id"],"module":r["module"],
                         "action":r["action"],"obj":r["obj"],"objId":r["obj_id"],"details":r["details"]} for r in cur.fetchall()]
         s["settings"] = self.settings(cur)
+        items, unread = notif_list(self, cur, me_id, 100)
+        s["notifications"] = items
+        s["notifUnread"] = unread
+        cur.execute("SELECT id,owner_type,owner_id,user_id,offset_min,fire_at,sent_at FROM reminders ORDER BY fire_at")
+        s["reminders"] = [dict(r) for r in cur.fetchall()]
         return s
 
 # ---------------- Демо-данные (эталонный набор) ----------------
@@ -792,6 +809,10 @@ def h_task_create(db, cur, u, p):
     t = dict(id=uid("t"), code="З-%03d" % tn, status=st, progress=0, result="", blockReason="", comments=[],
              createdAt=now_ms(), createdBy=u["id"], meetingId=None, riskId=None, **data)
     db.save_ent(cur, "task", t)
+    if t.get("assignee") and t["assignee"] != u["id"]:
+        notify(db, cur, t["assignee"], "task.assigned", "Назначена задача: %s" % t["title"],
+               "%s · срок %s · постановщик %s" % (t["code"], _fd(t["end"]), u["name"]), "Задача", t["id"],
+               dedupe="task.assigned:%s:%s" % (t["assignee"], t["id"]))
     db.audit(cur, "BUSINESS", "info", u["id"], "tasks", "Создана задача", "Задача", t["id"], {"title": t["title"], "project": p["projectId"]})
     return t, msg("Задача создана в M02", "Она сразу доступна в канбане, ганте и календаре")
 
@@ -802,6 +823,10 @@ def h_task_update(db, cur, u, p):
     before = {k: t[k] for k in ("title", "start", "end", "assignee", "priority")}
     t.update(data)
     db.save_ent(cur, "task", t)
+    if t.get("assignee") and t["assignee"] != before.get("assignee") and t["assignee"] != u["id"]:
+        notify(db, cur, t["assignee"], "task.assigned", "Вам передана задача: %s" % t["title"],
+               "%s · срок %s · передал %s" % (t["code"], _fd(t["end"]), u["name"]), "Задача", t["id"],
+               dedupe="task.assigned:%s:%s:%s" % (t["assignee"], t["id"], now_ms()))
     db.audit(cur, "AUDIT", "info", u["id"], "tasks", "Задача изменена", "Задача", t["id"], {"before": before, "after": {k: t[k] for k in before}})
     return t, msg("Задача обновлена", t["code"])
 
@@ -995,6 +1020,9 @@ def h_time_status(db, cur, u, p):
     else: raise RpcError("Недопустимый статус")
     e["status"] = to
     db.save_ent(cur, "time", e)
+    notify(db, cur, e["userId"], "time.result", "Трудозатраты %s" % to.lower(),
+           "%s · %s ч · %s" % (_fd(e["date"]), e["hours"], u["name"]), "Трудозатраты", e["id"],
+           dedupe="time.result:%s:%s" % (e["id"], to))
     db.audit(cur, "BUSINESS", "info", u["id"], "time", "Трудозатраты: " + to.lower(), "Трудозатраты", e["id"], {"hours": e["hours"], "status": to})
     return e, msg("Запись " + to.lower())
 
@@ -1010,6 +1038,10 @@ def h_time_send_week(db, cur, u, p):
     total = 0
     for id_ in ids:
         e = db.get_ent(cur, "time", id_); e["status"] = "Отправлена"; total += e["hours"]; db.save_ent(cur, "time", e)
+    notify_many(db, cur, [x for x in _approvers(db, cur, "time") if x != u["id"]], "time.approval",
+                "Трудозатраты на утверждение: %s ч" % round(total, 1),
+                "%s · %d записей за неделю %s" % (u["name"], len(ids), _fd(p["mon"])), "Очередь", "time",
+                dedupe_suffix="week:%s:%s" % (u["id"], p["mon"]))
     db.audit(cur, "BUSINESS", "info", u["id"], "time", "Трудозатраты отправлены на утверждение", "Трудозатраты", "", {"entries": len(ids), "hours": total})
     return True, msg("%d записей отправлено (%s ч)" % (len(ids), total))
 
@@ -1144,6 +1176,13 @@ def h_doc_status(db, cur, u, p):
     guard(db, cur, u, "docs", "approve" if to == "Утверждён" else "edit", d)
     d["status"] = to
     db.save_ent(cur, "doc", d)
+    if to == "На согласовании":
+        notify_many(db, cur, [x for x in _approvers(db, cur, "docs") if x != u["id"]], "doc.approval",
+                    "На согласование: %s" % d["title"], "%s · %s" % (d["code"], u["name"]), "Документ", d["id"])
+    elif to == "Утверждён" and d.get("author"):
+        notify(db, cur, d["author"], "doc.approved", "Документ утверждён: %s" % d["title"],
+               "%s · утвердил %s" % (d["code"], u["name"]), "Документ", d["id"],
+               dedupe="doc.approved:%s" % d["id"])
     db.audit(cur, "BUSINESS", "info", u["id"], "docs", "Документ: " + to, "Документ", d["id"], {"code": d["code"], "status": to})
     return d, msg("Статус документа: «%s»" % to)
 
@@ -1178,6 +1217,8 @@ def h_calc_run(db, cur, u, p):
              status="Выполнен", verifiedBy=None, verifiedAt=None, inputs=vals, outputs=outputs,
              runs=[{"ts": now_ms(), "by": u["id"], "inputs": dict(vals), "ok": outputs["ok"]}])
     db.save_ent(cur, "calc", c)
+    notify_many(db, cur, [x for x in _approvers(db, cur, "calcs") if x != u["id"]], "calc.verify",
+                "Расчёт ожидает проверки: %s" % c["title"], "%s · %s" % (c["code"], m["name"]), "Расчёт", c["id"])
     db.audit(cur, "INTEGRATION", "info", u["id"], "calcs", "Расчёт выполнен", "Расчёт", c["id"], {"model": m["name"] + " v" + m["ver"], "ok": outputs["ok"]})
     return c, msg("Расчёт выполнен", outputs["verdict"], "ok" if outputs["ok"] else "warn")
 
@@ -1220,16 +1261,39 @@ def h_meeting_create(db, cur, u, p):
              attendees=p.get("attendees", []), status="Запланировано", agenda=[], decisions=[])
     db.save_ent(cur, "meeting", m)
     db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Создано совещание", "Совещание", m["id"], {"title": m["title"], "date": m["date"]})
-    return m, msg("Совещание создано", "Приглашения участникам — в календаре M12")
+    invite = list(dict.fromkeys([m["chair"], m["secretary"]] + (m["attendees"] or [])))
+    notify_many(db, cur, [x for x in invite if x != u["id"]], "meeting.invite",
+                "Приглашение: %s" % m["title"], "%s · %s %s" % (m["code"], _fd(m["date"]), m["time"]),
+                "Совещание", m["id"], dedupe_suffix="invite")
+    reminders_set(db, cur, "meeting", m, invite, DEFAULT_REMINDERS, u["id"])
+    return m, msg("Совещание создано", "Приглашения разосланы, напоминания: за 1 день и за 1 час")
 
 @reg("meeting.update")
 def h_meeting_update(db, cur, u, p):
     m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    before = {k: m[k] for k in ("date", "time", "chair", "secretary", "attendees")}
     for k in ("title", "type", "date", "time", "chair", "secretary", "attendees"):
         if k in p: m[k] = p[k]
     db.save_ent(cur, "meeting", m)
     db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Совещание изменено", "Совещание", m["id"], {"code": m["code"]})
-    return m, msg("Совещание обновлено")
+    invite = list(dict.fromkeys([m["chair"], m["secretary"]] + (m.get("attendees") or [])))
+    was = set([before["chair"], before["secretary"]] + (before["attendees"] or []))
+    added = [x for x in invite if x not in was and x != u["id"]]
+    if added:
+        notify_many(db, cur, added, "meeting.invite", "Приглашение: %s" % m["title"],
+                    "%s · %s %s" % (m["code"], _fd(m["date"]), m["time"]), "Совещание", m["id"],
+                    dedupe_suffix="invite")
+    moved = (before["date"], before["time"]) != (m["date"], m["time"])
+    if moved or set(invite) != was:
+        # перенос совещания или изменение состава: напоминания пересчитываются от новой даты (ТЗ §2.5, M12 §8.2)
+        offs = sorted({r["offset_min"] for r in reminders_of(db, cur, "meeting", m["id"])}) or DEFAULT_REMINDERS
+        reminders_set(db, cur, "meeting", m, invite, offs, u["id"])
+    if moved:
+        notify_many(db, cur, [x for x in invite if x != u["id"]], "meeting.reminder",
+                    "Совещание перенесено: %s" % m["title"],
+                    "%s · новое время %s %s" % (m["code"], _fd(m["date"]), m["time"]), "Совещание", m["id"],
+                    dedupe_suffix="move:%s:%s" % (m["date"], m["time"]))
+    return m, msg("Совещание обновлено", "Участники оповещены, напоминания пересчитаны" if (moved or added) else "")
 
 @reg("meeting.conduct")
 def h_meeting_conduct(db, cur, u, p):
@@ -1247,7 +1311,10 @@ def h_meeting_approve(db, cur, u, p):
     m["status"] = "Протокол утверждён"
     db.save_ent(cur, "meeting", m)
     db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Утверждён протокол совещания", "Совещание", m["id"], {"code": m["code"], "decisions": len(m["decisions"])})
-    return m, msg("Протокол утверждён")
+    notify_many(db, cur, [x for x in list(dict.fromkeys([m["chair"], m["secretary"]] + (m.get("attendees") or []))) if x != u["id"]],
+                "protocol.approved", "Протокол утверждён: %s" % m["title"],
+                "%s · решений: %d" % (m["code"], len(m["decisions"])), "Совещание", m["id"], dedupe_suffix="approved")
+    return m, msg("Протокол утверждён", "Участники оповещены")
 
 @reg("meeting.agenda.add")
 def h_meeting_agenda(db, cur, u, p):
@@ -1273,6 +1340,9 @@ def _directive_from_decision(db, cur, u, m, d):
              createdBy=u["id"], meetingId=m["id"], riskId=None, desc="Поручение по решению совещания " + m["code"])
     db.save_ent(cur, "task", t)
     d["taskId"] = t["id"]
+    notify(db, cur, t["assignee"], "directive.assigned", "Поручение: %s" % t["title"],
+           "%s · по решению совещания %s · срок %s" % (t["code"], m["code"], _fd(t["end"])),
+           "Поручение", t["id"], dedupe="directive.assigned:%s:%s" % (t["assignee"], t["id"]))
     db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Создано поручение из решения совещания", "Совещание", m["id"], {"meeting": m["code"], "task": t["code"]})
     return t
 
@@ -1335,7 +1405,8 @@ def h_cal_create(db, cur, u, p):
              participants=p.get("participants", [u["id"]]), note=p.get("note", "")[:500])
     db.save_ent(cur, "calEvent", e)
     db.audit(cur, "BUSINESS", "info", u["id"], "calendar", "Создано событие календаря", "Событие", e["id"], {"title": e["title"]})
-    return e, msg("Событие добавлено в календарь")
+    reminders_set(db, cur, "calEvent", e, e["participants"] or [u["id"]], DEFAULT_REMINDERS, u["id"])
+    return e, msg("Событие добавлено в календарь", "Напоминания участникам: за 1 день и за 1 час")
 
 @reg("calendar.delete")
 def h_cal_delete(db, cur, u, p):
@@ -1494,7 +1565,7 @@ def h_admin_reset(db, cur, u, p):
     guard(db, cur, u, "admin", "delete")
     cur.execute("SELECT token, user_id, created FROM sessions")
     keep_sessions = cur.fetchall()
-    for tbl in ("doc_versions","docs","calcs","time_entries","tasks","risks","meetings","projects","cal_events","reports","events","settings","users"):
+    for tbl in ("notifications","reminders","doc_versions","docs","calcs","time_entries","tasks","risks","meetings","projects","cal_events","reports","events","settings","users"):
         cur.execute("DELETE FROM " + tbl)
     cur.execute("DELETE FROM sessions WHERE user_id NOT IN (SELECT id FROM users)")
     conn = cur.connection
@@ -2020,6 +2091,299 @@ def h_meeting_protocol(db, cur, u, p):
     return {"docId": doc["id"], "version": v, "files": stored}, msg(
         "Протокол сформирован (версия %d)" % v, "DOCX и PDF зарегистрированы в M09 · событие в M15")
 
+# ---------------- Центр уведомлений и напоминаний (ТЗ M12 §8, M16 §2.11.1) ----------------
+# Единый контур доставки: уведомления хранятся на сервере (кому, тип, дата, канал, статус,
+# ошибка, дата прочтения), повторная доставка одного и того же события исключается ключом
+# dedupe. Напоминания — настраиваемые интервалы для событий календаря и совещаний.
+
+NOTIF_TYPES = {
+    "task.assigned":      ("Назначена задача", "tasks"),
+    "task.due":           ("Приближается срок задачи", "tasks"),
+    "task.overdue":       ("Задача просрочена", "tasks"),
+    "directive.assigned": ("Назначено поручение совещания", "meetings"),
+    "directive.due":      ("Приближается срок поручения", "meetings"),
+    "directive.overdue":  ("Поручение просрочено", "meetings"),
+    "directive.stale":    ("Поручение без обновления состояния", "meetings"),
+    "meeting.reminder":   ("Напоминание о совещании", "calendar"),
+    "event.reminder":     ("Напоминание о событии календаря", "calendar"),
+    "meeting.invite":     ("Приглашение на совещание", "meetings"),
+    "protocol.review":    ("Протокол направлен на согласование", "meetings"),
+    "protocol.approved":  ("Протокол утверждён", "meetings"),
+    "protocol.rework":    ("Протокол возвращён на доработку", "meetings"),
+    "time.approval":      ("Трудозатраты ожидают утверждения", "time"),
+    "time.result":        ("Трудозатраты рассмотрены", "time"),
+    "doc.approval":       ("Документ на согласовании", "docs"),
+    "doc.approved":       ("Документ утверждён", "docs"),
+    "calc.verify":        ("Расчёт ожидает проверки", "calcs"),
+    "risk.review":        ("Наступил срок пересмотра риска", "risks"),
+}
+# типовые интервалы напоминаний (ТЗ M12 §8.2), минуты до события
+REMINDER_OFFSETS = [(0, "В момент начала"), (60, "За 1 час"), (1440, "За 1 день"),
+                    (4320, "За 3 дня"), (10080, "За 7 дней"), (20160, "За 14 дней")]
+DEFAULT_REMINDERS = [1440, 60]
+NOTIF_CHANNEL = "web"          # автономная ЛВС: внутренний центр уведомлений (ТЗ §8.3)
+NOTIF_KEEP_DAYS = 90
+
+def notif_prefs(db, cur, user_id):
+    s = db.settings(cur) or {}
+    return (s.get("notifPrefs") or {}).get(user_id, {})
+
+def notify(db, cur, user_id, type_, title, body="", obj="", obj_id="", dedupe=None, ts=None):
+    """Доставка уведомления во внутренний центр (идемпотентно по ключу dedupe)."""
+    if not user_id or user_id == "system": return None
+    if type_ not in NOTIF_TYPES: return None
+    prefs = notif_prefs(db, cur, user_id)
+    if prefs.get(type_) is False: return None
+    module = NOTIF_TYPES[type_][1]
+    key = dedupe or "%s:%s:%s:%s" % (type_, user_id, obj_id or title, dISO(today()))
+    nid = uid("n")
+    cur.execute(
+        "INSERT INTO notifications(id,ts,user_id,type,module,obj,obj_id,title,body,channel,status,error,read_at,dedupe) "
+        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'sent','',NULL,%s) ON CONFLICT (dedupe) DO NOTHING",
+        (nid, ts or now_ms(), user_id, type_, module, obj, obj_id or "", title[:300], body[:1000], NOTIF_CHANNEL, key))
+    return nid if cur.rowcount else None
+
+def notify_many(db, cur, user_ids, type_, title, body="", obj="", obj_id="", dedupe_suffix=""):
+    n = 0
+    for uid_ in dict.fromkeys([x for x in user_ids if x]):
+        if notify(db, cur, uid_, type_, title, body, obj, obj_id,
+                  dedupe=("%s:%s:%s:%s" % (type_, uid_, obj_id, dedupe_suffix or dISO(today())))): n += 1
+    return n
+
+def event_dt(date_s, time_s):
+    """Дата/время события → миллисекунды (локальное время сервера)."""
+    try: d = parseD(date_s)
+    except Exception: return None
+    hh, mm = 9, 0
+    if time_s and re.match(r"^\d{1,2}:\d{2}$", str(time_s)):
+        hh, mm = [int(x) for x in str(time_s).split(":")]
+    return int(time.mktime(datetime.datetime(d.year, d.month, d.day, min(hh, 23), min(mm, 59)).timetuple())) * 1000
+
+def reminders_set(db, cur, owner_type, obj, user_ids, offsets, by_user):
+    """Замена набора напоминаний события (ТЗ M12 §8.2: несколько напоминаний на событие)."""
+    base = event_dt(obj.get("date"), obj.get("time"))
+    if base is None: raise RpcError("У события не задана дата")
+    offs = sorted({int(o) for o in offsets if int(o) in [x[0] for x in REMINDER_OFFSETS] or 0 <= int(o) <= 60 * 24 * 60})
+    cur.execute("DELETE FROM reminders WHERE owner_type=%s AND owner_id=%s", (owner_type, obj["id"]))
+    made = 0
+    for uid_ in dict.fromkeys([x for x in user_ids if x]):
+        for off in offs:
+            key = "%s:%s:%s:%d" % (owner_type, obj["id"], uid_, off)
+            cur.execute("INSERT INTO reminders(id,owner_type,owner_id,user_id,offset_min,fire_at,sent_at,key,created_by,created_at) "
+                        "VALUES(%s,%s,%s,%s,%s,%s,NULL,%s,%s,%s) ON CONFLICT (key) DO NOTHING",
+                        (uid("rm"), owner_type, obj["id"], uid_, off, base - off * 60_000, key, by_user, now_ms()))
+            made += 1
+    db.audit(cur, "AUDIT", "info", by_user, "calendar", "Настроены напоминания события",
+             "Событие" if owner_type == "calEvent" else "Совещание", obj["id"],
+             {"offsets": offs, "users": len(set(user_ids)), "count": made, "event": "calendar.reminder.created"})
+    return made
+
+def reminders_of(db, cur, owner_type, owner_id):
+    cur.execute("SELECT id,owner_type,owner_id,user_id,offset_min,fire_at,sent_at FROM reminders "
+                "WHERE owner_type=%s AND owner_id=%s ORDER BY offset_min DESC", (owner_type, owner_id))
+    return [dict(r) for r in cur.fetchall()]
+
+def notif_list(db, cur, user_id, limit=100, unread_only=False):
+    q = "SELECT id,ts,type,module,obj,obj_id,title,body,channel,status,error,read_at FROM notifications WHERE user_id=%s"
+    if unread_only: q += " AND read_at IS NULL"
+    q += " ORDER BY ts DESC LIMIT %s"
+    cur.execute(q, (user_id, int(limit)))
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT COUNT(*) AS n FROM notifications WHERE user_id=%s AND read_at IS NULL", (user_id,))
+    return rows, cur.fetchone()["n"]
+
+@reg("notif.list")
+def h_notif_list(db, cur, u, p):
+    items, unread = notif_list(db, cur, u["id"], p.get("limit", 100), bool(p.get("unread")))
+    return {"items": items, "unread": unread, "prefs": notif_prefs(db, cur, u["id"]),
+            "types": [{"key": k, "name": v[0], "module": v[1]} for k, v in NOTIF_TYPES.items()]}, None
+
+@reg("notif.read")
+def h_notif_read(db, cur, u, p):
+    if p.get("all"):
+        cur.execute("UPDATE notifications SET read_at=%s WHERE user_id=%s AND read_at IS NULL", (now_ms(), u["id"]))
+    else:
+        ids = [str(x) for x in (p.get("ids") or [])][:200]
+        if not ids: raise RpcError("Не указаны уведомления")
+        cur.execute("UPDATE notifications SET read_at=%s WHERE user_id=%s AND id = ANY(%s) AND read_at IS NULL",
+                    (now_ms(), u["id"], ids))
+    n = cur.rowcount
+    items, unread = notif_list(db, cur, u["id"])
+    return {"read": n, "unread": unread}, msg("Отмечено прочитанным: %d" % n) if n else None
+
+@reg("notif.prefs")
+def h_notif_prefs(db, cur, u, p):
+    s = db.settings(cur) or {}
+    prefs = s.setdefault("notifPrefs", {}).setdefault(u["id"], {})
+    for k, v in (p.get("prefs") or {}).items():
+        if k in NOTIF_TYPES: prefs[k] = bool(v)
+    db.save_settings(cur, s)
+    db.audit(cur, "AUDIT", "info", u["id"], "admin", "Изменены настройки уведомлений", "Пользователь", u["id"],
+             {"off": [k for k, v in prefs.items() if v is False]})
+    return prefs, msg("Настройки уведомлений сохранены", "Отключённые типы не доставляются")
+
+@reg("reminder.set")
+def h_reminder_set(db, cur, u, p):
+    ot = p.get("ownerType")
+    if ot not in ("meeting", "calEvent"): raise RpcError("Напоминания доступны для совещаний и событий календаря")
+    obj = get_req(db, cur, "meeting" if ot == "meeting" else "calEvent", p.get("ownerId"))
+    guard(db, cur, u, "meetings" if ot == "meeting" else "calendar", "edit", obj)
+    if ot == "meeting":
+        users = list(dict.fromkeys(([obj.get("chair"), obj.get("secretary")] + (obj.get("attendees") or []))))
+    else:
+        users = obj.get("participants") or [u["id"]]
+    users = p.get("users") or users
+    n = reminders_set(db, cur, ot, obj, users, p.get("offsets", DEFAULT_REMINDERS), u["id"])
+    return {"count": n, "reminders": reminders_of(db, cur, ot, obj["id"])}, msg(
+        "Напоминания настроены (%d)" % n, "Доставка — во внутренний центр уведомлений")
+
+@reg("reminder.list")
+def h_reminder_list(db, cur, u, p):
+    ot = p.get("ownerType", "meeting")
+    if ot not in ("meeting", "calEvent"): raise RpcError("Неизвестный тип события")
+    get_req(db, cur, "meeting" if ot == "meeting" else "calEvent", p.get("ownerId"))
+    return reminders_of(db, cur, ot, p["ownerId"]), None
+
+@reg("reminder.remove")
+def h_reminder_remove(db, cur, u, p):
+    cur.execute("SELECT owner_type, owner_id FROM reminders WHERE id=%s", (p.get("id"),))
+    r = cur.fetchone()
+    if not r: raise RpcError("Напоминание не найдено")
+    obj = get_req(db, cur, "meeting" if r["owner_type"] == "meeting" else "calEvent", r["owner_id"])
+    guard(db, cur, u, "meetings" if r["owner_type"] == "meeting" else "calendar", "edit", obj)
+    cur.execute("DELETE FROM reminders WHERE id=%s", (p["id"],))
+    db.audit(cur, "AUDIT", "info", u["id"], "calendar", "Напоминание удалено", "Событие", r["owner_id"], {})
+    return True, msg("Напоминание удалено")
+
+@reg("notif.tick")
+def h_notif_tick(db, cur, u, p):
+    """Немедленный цикл планировщика (M14 «Диагностика», приёмочные испытания)."""
+    guard(db, cur, u, "admin", "edit")
+    n = notification_cycle_cur(db, cur)
+    db.audit(cur, "TECH", "info", u["id"], "admin", "Внеочередной цикл планировщика уведомлений", "Система", "", {"delivered": n})
+    return {"delivered": n}, msg("Планировщик отработал", "Доставлено уведомлений: %d" % n)
+
+def _approvers(db, cur, module):
+    """Кому адресовать уведомления о необходимости утверждения (по матрице прав)."""
+    s = db.settings(cur) or {}
+    perms = s.get("perms") or BASE_PERMS
+    out = []
+    for usr in db.users_public(cur):
+        if usr["blocked"]: continue
+        if "approve" in (perms.get(usr["role"], {}).get(module) or []): out.append(usr["id"])
+    return out
+
+def notification_cycle_cur(db, cur):
+    """Тело цикла планировщика на переданном курсоре (используется и по расписанию, и из M14)."""
+    delivered = 0
+    now = now_ms()
+    # 1. Напоминания событий и совещаний
+    cur.execute("SELECT * FROM reminders WHERE sent_at IS NULL AND fire_at<=%s ORDER BY fire_at LIMIT 200", (now,))
+    for r in cur.fetchall():
+        if r["owner_type"] == "meeting":
+            cur.execute("SELECT id,code,title,date,mtime,status FROM meetings WHERE id=%s", (r["owner_id"],))
+            m = cur.fetchone()
+            if not m or m["status"] in ("Отменено", "Протокол утверждён"):
+                cur.execute("UPDATE reminders SET sent_at=%s WHERE id=%s", (now, r["id"])); continue
+            title = "Совещание %s %s: %s" % (_fd(m["date"]), m["mtime"] or "", m["title"])
+            body = "%s · напоминание %s" % (m["code"], dict(REMINDER_OFFSETS).get(r["offset_min"], "за %d мин" % r["offset_min"]))
+            type_ = "meeting.reminder"; obj = "Совещание"
+        else:
+            cur.execute("SELECT id,title,date,mtime FROM cal_events WHERE id=%s", (r["owner_id"],))
+            e = cur.fetchone()
+            if not e:
+                cur.execute("UPDATE reminders SET sent_at=%s WHERE id=%s", (now, r["id"])); continue
+            title = "Событие %s %s: %s" % (_fd(e["date"]), e["mtime"] or "", e["title"])
+            body = "Напоминание %s" % dict(REMINDER_OFFSETS).get(r["offset_min"], "за %d мин" % r["offset_min"])
+            type_ = "event.reminder"; obj = "Событие"
+        got = notify(db, cur, r["user_id"], type_, title, body, obj, r["owner_id"], dedupe=r["key"])
+        cur.execute("UPDATE reminders SET sent_at=%s WHERE id=%s", (now, r["id"]))
+        if got:
+            delivered += 1
+            db.audit(cur, "BUSINESS", "info", "system", "calendar", "Доставлено напоминание",
+                     obj, r["owner_id"], {"user": r["user_id"], "offset": r["offset_min"],
+                                          "event": "calendar.reminder.sent"})
+    # 2. Сроки задач и поручений
+    today_s = dISO(today()); tomorrow = D(1)
+    cur.execute("SELECT id,code,title,status,assignee,\"end\",type,meeting_id,created_at FROM tasks "
+                "WHERE status NOT IN ('Завершена','Отменена','Проверена') AND assignee IS NOT NULL")
+    for t in cur.fetchall():
+        dir_ = t["type"] == "directive"
+        if t["end"] < today_s:
+            days = diffD(today_s, t["end"])
+            notify(db, cur, t["assignee"], "directive.overdue" if dir_ else "task.overdue",
+                   "Просрочено: %s" % t["title"], "%s · просрочка %d дн" % (t["code"], days),
+                   "Поручение" if dir_ else "Задача", t["id"])
+            delivered += 1
+        elif t["end"] <= tomorrow:
+            notify(db, cur, t["assignee"], "directive.due" if dir_ else "task.due",
+                   "Срок истекает: %s" % t["title"], "%s · срок %s" % (t["code"], _fd(t["end"])),
+                   "Поручение" if dir_ else "Задача", t["id"])
+            delivered += 1
+    # 3. Поручения без обновления состояния более 7 дней — председателю и секретарю
+    cur.execute("SELECT t.id,t.code,t.title,t.meeting_id,m.chair,m.secretary FROM tasks t "
+                "JOIN meetings m ON m.id=t.meeting_id WHERE t.type='directive' "
+                "AND t.status NOT IN ('Завершена','Отменена','Проверена') AND t.created_at < %s",
+                (now - 7 * DAY * 1000,))
+    for t in cur.fetchall():
+        for uid_ in (t["chair"], t["secretary"]):
+            notify(db, cur, uid_, "directive.stale", "Поручение без обновления: %s" % t["title"],
+                   "%s · требуется контроль исполнения" % t["code"], "Поручение", t["id"],
+                   dedupe="directive.stale:%s:%s:%s" % (uid_, t["id"], today_s))
+    # 4. Пересмотр рисков
+    cur.execute("SELECT id,code,title,owner FROM risks WHERE status<>'Закрыт' AND review<=%s AND owner IS NOT NULL", (today_s,))
+    for r in cur.fetchall():
+        notify(db, cur, r["owner"], "risk.review", "Пересмотр риска: %s" % r["title"],
+               "%s · срок пересмотра %s" % (r["code"], _fd(r["review"])), "Риск", r["id"])
+    # 5. Очереди утверждения (ежедневная сводка, без повторов)
+    cur.execute("SELECT COUNT(*) AS n FROM time_entries WHERE status='Отправлена'")
+    n = cur.fetchone()["n"]
+    if n:
+        notify_many(db, cur, _approvers(db, cur, "time"), "time.approval",
+                    "Трудозатраты ожидают утверждения: %d" % n, "Модуль M06 · Учёт трудозатрат", "Очередь", "time")
+    cur.execute("SELECT COUNT(*) AS n FROM docs WHERE status='На согласовании'")
+    n = cur.fetchone()["n"]
+    if n:
+        notify_many(db, cur, _approvers(db, cur, "docs"), "doc.approval",
+                    "Документы на согласовании: %d" % n, "Модуль M09 · Документы", "Очередь", "docs")
+    cur.execute("SELECT COUNT(*) AS n FROM calcs WHERE status='Выполнен'")
+    n = cur.fetchone()["n"]
+    if n:
+        notify_many(db, cur, _approvers(db, cur, "calcs"), "calc.verify",
+                    "Расчёты ожидают проверки: %d" % n, "Модуль M10 · Инженерные расчёты", "Очередь", "calcs")
+    # 6. Хранение: очистка старых прочитанных уведомлений
+    cur.execute("DELETE FROM notifications WHERE read_at IS NOT NULL AND ts < %s", (now - NOTIF_KEEP_DAYS * DAY * 1000,))
+    return delivered
+
+def notification_cycle(db):
+    """Один цикл планировщика: доставка напоминаний и контроль сроков (ТЗ M12 §8.4, M16 §2.11.1)."""
+    delivered = 0
+    with db.wlock:
+        conn = db.get()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                delivered = notification_cycle_cur(db, cur)
+                if delivered: db.bump(cur)
+                conn.commit()
+        except Exception as e:
+            conn.rollback()
+            try:
+                with conn.cursor() as cur2:
+                    db.audit(cur2, "TECH", "error", "system", "calendar", "Ошибка планировщика уведомлений: %s" % e,
+                             "Система", "", {"event": "calendar.reminder.failed"})
+                conn.commit()
+            except Exception: pass
+        finally:
+            db.put(conn)
+    return delivered
+
+def notification_worker(db, period=30):
+    """Фоновый планировщик уведомлений (автономно, без внешних служб)."""
+    while True:
+        try: notification_cycle(db)
+        except Exception: pass
+        time.sleep(period)
+
 # ---------------- Диспетчер RPC ----------------
 def dispatch(db, user, action, payload):
     h = HANDLERS.get(action)
@@ -2181,7 +2545,10 @@ def read_file_bytes(db, cur, user, doc_id, v, fmt=None):
     return demo, re.sub(r"\.[A-Za-z0-9]+$", "", ver["name"]) + "_demo.txt", True
 
 # ---------------- Резервное копирование (M14) ----------------
-BACKUP_TABLES = ["users","projects","meetings","risks","tasks","docs","doc_versions","calcs","time_entries","cal_events","reports","events","settings"]
+BACKUP_TABLES = ["users","projects","meetings","risks","tasks","docs","doc_versions","calcs","time_entries","cal_events","reports","events","settings",
+                 "notifications","reminders"]
+# копии прежних версий (13 таблиц) восстанавливаются: новые таблицы считаются пустыми
+BACKUP_REQUIRED = ["users","projects","meetings","risks","tasks","docs","doc_versions","calcs","time_entries","cal_events","reports","events","settings"]
 
 def make_backup(db, user):
     with db.wlock:
@@ -2203,8 +2570,10 @@ def make_backup(db, user):
 def restore_backup(db, user, data, token=None):
     if not isinstance(data, dict) or "tables" not in data: raise RpcError("Некорректный файл резервной копии", "Восстановление")
     tables = data["tables"]
-    if any(t not in tables or not isinstance(tables[t], list) for t in BACKUP_TABLES):
+    if any(t not in tables or not isinstance(tables[t], list) for t in BACKUP_REQUIRED):
         raise RpcError("В копии отсутствуют обязательные таблицы", "Восстановление")
+    for t in BACKUP_TABLES:
+        tables.setdefault(t, [])
     with db.wlock:
         conn = db.get()
         try:
@@ -2229,7 +2598,7 @@ def restore_backup(db, user, data, token=None):
                         else: rest.append(row)
                     if len(rest) == len(pending): raise RpcError("Циклическая иерархия задач в копии", "Восстановление")
                     pending = rest; guard_n += 1
-                for t in ["docs","doc_versions","calcs","time_entries","cal_events","reports","events","settings"]:
+                for t in ["docs","doc_versions","calcs","time_entries","cal_events","reports","events","settings","reminders","notifications"]:
                     for row in tables[t]: ins(t, row)
                 cur.execute("UPDATE meta SET v=(v::bigint+1)::text WHERE k='rev'")
                 db.audit(cur, "SECURITY", "warning", user["id"], "admin", "БД восстановлена из резервной копии", "БД", "",
@@ -2578,7 +2947,9 @@ def main():
     print("  СУБД: PostgreSQL · хранилище файлов: %s" % FILES_DIR)
     print("  Адрес: %s://%s:%d  (веб-клиенты ЛВС — по IP этого ПК)" % (scheme, host, port))
     print("  Демо-вход: u1…u8, пароль demo (u1 — администратор)")
+    print("  Центр уведомлений: планировщик запущен (интервал 30 с)")
     print("=" * 62)
+    threading.Thread(target=notification_worker, args=(db,), daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -2588,8 +2959,23 @@ def main():
 
 # ================= Установка и настройка через EXE (ТЗ §7) =================
 CONFIG_PATH = os.path.join(BASE_DIR, "supip.ini")
-SCHEMA_VERSION = 1
-MIGRATIONS = {}  # {версия: [SQL, ...]} — применяется по порядку при старте/обновлении
+SCHEMA_VERSION = 2   # 2 — центр уведомлений и напоминаний (v1.4.0); MIGRATIONS обновляет прежние БД
+MIGRATIONS = {   # {версия: [SQL, ...]} — применяется по порядку при старте/обновлении
+    2: [  # v1.4.0: центр уведомлений и напоминаний
+        """CREATE TABLE IF NOT EXISTS notifications(
+             id TEXT PRIMARY KEY, ts BIGINT NOT NULL, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+             type TEXT NOT NULL, module TEXT NOT NULL, obj TEXT NOT NULL DEFAULT '', obj_id TEXT NOT NULL DEFAULT '',
+             title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT 'web',
+             status TEXT NOT NULL DEFAULT 'sent', error TEXT NOT NULL DEFAULT '', read_at BIGINT,
+             dedupe TEXT NOT NULL UNIQUE)""",
+        "CREATE INDEX IF NOT EXISTS ix_notif_user ON notifications(user_id, ts DESC)",
+        """CREATE TABLE IF NOT EXISTS reminders(
+             id TEXT PRIMARY KEY, owner_type TEXT NOT NULL, owner_id TEXT NOT NULL, user_id TEXT NOT NULL,
+             offset_min INT NOT NULL, fire_at BIGINT NOT NULL, sent_at BIGINT, key TEXT NOT NULL UNIQUE,
+             created_by TEXT, created_at BIGINT NOT NULL)""",
+        "CREATE INDEX IF NOT EXISTS ix_reminders_fire ON reminders(fire_at) WHERE sent_at IS NULL",
+    ],
+}
 
 def migrate(db):
     """Миграции схемы БД (ТЗ §7.6: обновление выполняет миграции)."""
@@ -2745,7 +3131,7 @@ def run_install(auto_path=None):
     dsn = "host=%s port=%s dbname=%s user=%s password=%s" % (pg_host, pg_port, app_db, app_user, app_pass)
     db = DB(dsn)
     applied = migrate(db)
-    report.append("Схема БД создана/проверена (версия %d)%s" % (SCHEMA_VERSION + len(MIGRATIONS), "; миграции: %s" % applied if applied else ""))
+    report.append("Схема БД создана/проверена (версия %d)%s" % (SCHEMA_VERSION, "; миграции: %s" % applied if applied else ""))
     seeded = seed(db)
     report.append("Демо-данные: %s" % ("создан эталонный набор" if seeded else "уже присутствуют"))
     # 5. Пароль администратора
@@ -2935,6 +3321,7 @@ def service_command(action, cfg=None):
                         srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
                         TLS_ON = True
                     self._srv = srv
+                    threading.Thread(target=notification_worker, args=(db,), daemon=True).start()
                     srv.serve_forever()
                 except Exception as e:
                     servicemanager.LogErrorMsg("СУП-ИП: %s" % e)

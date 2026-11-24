@@ -1,7 +1,8 @@
 name: Сборка и испытания СУП-ИП
 
 # ТЗ §7 (развёртывание одним EXE) и §15 (приёмочные испытания).
-#   tests    — интеграционные испытания API и генератора документов на PostgreSQL (Linux);
+#   tests    — интеграционные испытания API, генератора документов и центра уведомлений
+#              на PostgreSQL (Linux);
 #   windows  — сборка SUP-IP.exe (PyInstaller, one-file) и самотестирование поставки;
 #   installer— сборка SUP-IP-Setup-x.y.z.exe (NSIS; makensis собирает Windows-установщик
 #              и на Linux, что исключает зависимость от Chocolatey на раннере),
@@ -64,6 +65,9 @@ jobs:
       - name: Испытания выгрузки DOCX/XLSX/PDF
         working-directory: sup-ip
         run: python tests/export_test.py --base http://127.0.0.1:8000
+      - name: Испытания центра уведомлений и напоминаний
+        working-directory: sup-ip
+        run: python tests/notif_test.py --base http://127.0.0.1:8000
       - name: Журнал сервера (при сбое)
         if: failure()
         run: cat sup-ip/server.log
