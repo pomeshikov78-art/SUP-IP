@@ -141,6 +141,9 @@ jobs:
               print(f, 'Windows PE' if sig == b'MZ' else 'ОШИБКА СИГНАТУРЫ', sig)
               assert sig == b'MZ', f
           EOF
+      - name: Стабильные имена файлов для постоянных ссылок
+        working-directory: sup-ip
+        run: cp "dist/SUP-IP-Setup-${{ steps.ver.outputs.version }}.exe" dist/SUP-IP-Setup.exe
       - name: Артефакты поставки
         uses: actions/upload-artifact@v4
         with:
@@ -156,5 +159,5 @@ jobs:
         run: |
           v=${{ steps.ver.outputs.version }}
           gh release create "v$v" --title "СУП-ИП v$v" --notes-file CHANGELOG.md \
-            "sup-ip/dist/SUP-IP.exe" "sup-ip/dist/SUP-IP-Setup-$v.exe" "SUP-IP_server.zip" \
-          || gh release upload "v$v" "sup-ip/dist/SUP-IP.exe" "sup-ip/dist/SUP-IP-Setup-$v.exe" "SUP-IP_server.zip" --clobber
+            "sup-ip/dist/SUP-IP.exe" "sup-ip/dist/SUP-IP-Setup-$v.exe" "sup-ip/dist/SUP-IP-Setup.exe" "SUP-IP_server.zip" \
+          || gh release upload "v$v" "sup-ip/dist/SUP-IP.exe" "sup-ip/dist/SUP-IP-Setup-$v.exe" "sup-ip/dist/SUP-IP-Setup.exe" "SUP-IP_server.zip" --clobber

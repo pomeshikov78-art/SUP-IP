@@ -1,6 +1,6 @@
 # СУП-ИП — система управления проектами инженерного подразделения
 
-**Версия 1.3.3 · клиент-серверная реализация по ТТ-2 (редакция ТЗ 3.0)**
+**Версия 1.3.4 · клиент-серверная реализация по ТТ-2 (редакция ТЗ 3.0)**
 
 Автономная многопользовательская система для локальной сети: сервер на Python 3 + **PostgreSQL**,
 веб-клиенты в браузере без установки. Все 18 модулей M00–M17, серверная проверка прав на каждую
@@ -11,15 +11,17 @@
 
 ## 0. Скачать готовый EXE (Windows 10/11 x64)
 
-Последняя проверенная сборка — **[Releases → v1.3.2](https://github.com/pomeshikov78-art/SUP-IP/releases/latest)**:
+Постоянные ссылки на **последнюю проверенную сборку** (всегда ведут на актуальный Release):
 
 | Файл | Назначение | Размер |
 |---|---|---|
-| [`SUP-IP-Setup-1.3.2.exe`](https://github.com/pomeshikov78-art/SUP-IP/releases/download/v1.3.2/SUP-IP-Setup-1.3.2.exe) | **Установщик**: установка и настройка одним файлом (мастер параметров → PostgreSQL → БД → HTTPS → служба → брандмауэр → проверка) | 15,8 МБ |
-| [`SUP-IP.exe`](https://github.com/pomeshikov78-art/SUP-IP/releases/download/v1.3.2/SUP-IP.exe) | Автономный сервер (Python и веб-клиент внутри), режимы `--install`, `--service`, `--health` | 16,1 МБ |
-| [`SUP-IP_server.zip`](https://github.com/pomeshikov78-art/SUP-IP/releases/download/v1.3.2/SUP-IP_server.zip) | Исходники поставки (сервер, клиент, генератор документов, тесты, сценарий установщика) | 0,9 МБ |
+| **[SUP-IP-Setup.exe](https://github.com/pomeshikov78-art/SUP-IP/releases/latest/download/SUP-IP-Setup.exe)** | **Установщик**: установка и настройка одним файлом (мастер параметров → PostgreSQL → БД → HTTPS → служба → брандмауэр → проверка) | ≈16 МБ |
+| [SUP-IP.exe](https://github.com/pomeshikov78-art/SUP-IP/releases/latest/download/SUP-IP.exe) | Автономный сервер (Python и веб-клиент внутри), режимы `--install`, `--service`, `--health` | ≈16 МБ |
+| [SUP-IP_server.zip](https://github.com/pomeshikov78-art/SUP-IP/releases/latest/download/SUP-IP_server.zip) | Исходники поставки (сервер, клиент, генератор документов, тесты, сценарий установщика) | ≈1 МБ |
 
-**Порядок установки:** запустите `SUP-IP-Setup-1.3.2.exe` от имени администратора → укажите
+Все выпуски и файлы с номерами версий — в **[Releases](https://github.com/pomeshikov78-art/SUP-IP/releases)**.
+
+**Порядок установки:** запустите `SUP-IP-Setup.exe` от имени администратора → укажите
 пароль суперпользователя PostgreSQL, порт веб-сервера и пароль администратора приложения →
 мастер сам создаст роль и БД, схему, демо-данные, сертификат HTTPS, службу Windows с
 автозапуском и автоперезапуском, правило брандмауэра и отчёт `data\install-report.txt`.
