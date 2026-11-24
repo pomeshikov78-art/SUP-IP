@@ -901,7 +901,13 @@ const emptyBlock=(title,hint,icon)=>'<div class="empty">'+ic(icon||'search')+'<b
 function overdueMark(t){ return taskOverdue(t)?'<span class="overdue">'+ic('alert')+'просрочка '+overDays(t)+' дн</span>':''; }
 function field(label, inner, req, hint){ return '<div class="field"><label>'+label+(req?' <span class="req">*</span>':'')+'</label>'+inner+(hint?'<div class="fh">'+hint+'</div>':'')+'</div>'; }
 const inp=(id,val,type,attrs)=>'<input id="'+id+'" type="'+(type||'text')+'" value="'+esc(val==null?'':val)+'" oninput="App.markDirty()" '+(attrs||'')+'>';
-const sel=(id,opts,val,attrs)=>'<select id="'+id+'" onchange="App.markDirty()" '+(attrs||'')+'>'+opts.map(o=>{const v=Array.isArray(o)?o[0]:o, l=Array.isArray(o)?o[1]:o;return '<option value="'+esc(v)+'"'+(String(v)===String(val)?' selected':'')+'>'+esc(l)+'</option>';}).join('')+'</select>';
+const sel=(id,opts,val,attrs)=>{
+ // обработчик из attrs объединяется с отметкой изменения: повторный атрибут onchange браузером игнорируется
+ let a=attrs||'', h='App.markDirty()';
+ const mm=a.match(/onchange="([^"]*)"/);
+ if(mm){ h+=';'+mm[1]; a=a.replace(mm[0],''); }
+ return '<select id="'+id+'" onchange="'+h+'" '+a+'>'+opts.map(o=>{const v=Array.isArray(o)?o[0]:o, l=Array.isArray(o)?o[1]:o;return '<option value="'+esc(v)+'"'+(String(v)===String(val)?' selected':'')+'>'+esc(l)+'</option>';}).join('')+'</select>';
+};
 const ta=(id,val,rows)=>'<textarea id="'+id+'" rows="'+(rows||3)+'" oninput="App.markDirty()">'+esc(val||'')+'</textarea>';
 const val=id=>{const el=document.getElementById(id);return el?el.value.trim():'';};
 const num=id=>parseFloat(val(id).replace(',','.'));
@@ -1236,6 +1242,7 @@ App.about=function(){
   ['Управление отклонениями','M07 показывает просрочки и сдвиги относительно базового плана M04. Создайте корректирующее поручение — оно станет задачей M02 с контролем срока.','control'],
   ['Инженерный расчёт → Excel','M10: выберите модель «Бюджет радиолинии», выполните расчёт по формуле методики, проверьте результат и выгрузите протокол в Excel (CSV).','calcs'],
   ['Совещание → поручения','M16: откройте проведённое совещание, посмотрите решения и созданные из них поручения; статус исполнения виден в M07 и на дашборде.','meetings'],
+  ['Протокол: маршрут и редакции','M16 §2.9: вкладка «Протокол» — настройте маршрут согласования, направьте протокол, дайте результат или замечания, утвердите редакцию (DOCX+PDF в M09) и опубликуйте. Изменение утверждённого протокола — только через новую редакцию с сохранением истории.','meetings'],
   ['Центр уведомлений','Нажмите колокольчик в шапке: доставленные сервером приглашения и напоминания, переход к объекту, «Прочитать все» и настройка типов. Интервалы напоминаний — в карточке совещания и события календаря.','meetings'],
   ['Конструктор дашборда','M17: включите/выключите виджеты и измените порядок — главный дашборд M00 перестроится. Настройки персональны для пользователя.','builder']
  ];
@@ -1245,7 +1252,7 @@ App.about=function(){
   '<h4 class="mb8">Трёхуровневая архитектура (ТЗ §2)</h4>'+arch+
   '<h4 style="margin:16px 0 8px">Ключевые принципы, которые можно проверить</h4>'+
   '<div class="grid g2 small" style="gap:6px 18px">'+
-   ['Единая БД: канбан, гант, календарь и дашборд не хранят копий — только представления данных M01/M02.','Каждая мутация проходит через API ядра: проверка прав → операция → аудит → сохранение → обновление всех представлений.','Просрочка — индикатор, а не статус (ТЗ M02 §1.4). Статусные переходы контролируются workflow.','WIP-лимит колонки «В работе» настраивается в M14 и проверяется при перетаскивании.','Базовый план хранится отдельно: сдвиг сроков на ганте не меняет утверждённый базовый план.','Оценка риска = P×I (1–5); история оценок сохраняется, остаточный риск считается после мероприятий.','Документы версионируются; устаревшие версии остаются доступными.','Уведомления и напоминания доставляет сервер: планировщик, защита от повторной доставки, персональные настройки типов.','Автономность: никаких внешних ресурсов и CDN — сервер и клиенты работают в изолированной локальной сети.'].map(s=>'<div class="flex" style="align-items:flex-start;gap:7px">'+ic('check','')+'<span>'+s+'</span></div>').join('')+
+   ['Единая БД: канбан, гант, календарь и дашборд не хранят копий — только представления данных M01/M02.','Каждая мутация проходит через API ядра: проверка прав → операция → аудит → сохранение → обновление всех представлений.','Просрочка — индикатор, а не статус (ТЗ M02 §1.4). Статусные переходы контролируются workflow.','WIP-лимит колонки «В работе» настраивается в M14 и проверяется при перетаскивании.','Базовый план хранится отдельно: сдвиг сроков на ганте не меняет утверждённый базовый план.','Оценка риска = P×I (1–5); история оценок сохраняется, остаточный риск считается после мероприятий.','Документы версионируются; устаревшие версии остаются доступными.','Уведомления и напоминания доставляет сервер: планировщик, защита от повторной доставки, персональные настройки типов.','Протокол совещания проходит настраиваемый маршрут согласования; утверждённый протокол хранится отдельной редакцией со снимком содержания.','Автономность: никаких внешних ресурсов и CDN — сервер и клиенты работают в изолированной локальной сети.'].map(s=>'<div class="flex" style="align-items:flex-start;gap:7px">'+ic('check','')+'<span>'+s+'</span></div>').join('')+
   '</div>'+
   '<h4 style="margin:16px 0 8px">Демонстрационные сценарии (нажмите, чтобы перейти)</h4>'+
   scenarios.map((s,i)=>'<div class="scenario" onclick="App.closeModal(true);nav(\''+s[2]+'\')"><span class="sn">'+(i+1)+'</span><div><b>'+s[0]+'</b><p>'+s[1]+'</p></div>'+ic('chevR')+'</div>').join('')+
@@ -2797,9 +2804,10 @@ Views.meetings=function(){
  let rows=DB.meetings.slice();
  if(f.tab==='next')rows=rows.filter(m=>m.date>=dISO(TODAY));
  if(f.tab==='past')rows=rows.filter(m=>m.date<dISO(TODAY));
+ if(f.tab==='prot')rows=rows.filter(m=>protOf(m).status!=='Подготовка');
  rows.sort((a,b)=>f.tab==='past'?(a.date>b.date?-1:1):(a.date<b.date?-1:1));
  const dirs=DB.tasks.filter(t=>t.type==='directive'&&t.status!=='Отменена');
- return '<div class="page-head"><div><h2>Совещания</h2><div class="desc">Повестка, участники, решения и контроль исполнения. Решение совещания одним нажатием превращается в поручение — задачу M02 с ответственным и сроком; исполнение видно в M07 и на дашборде.</div></div>'+
+ return '<div class="page-head"><div><h2>Совещания</h2><div class="desc">Повестка, участники, решения и контроль исполнения. Протокол проходит маршрут согласования и утверждается отдельной редакцией (§2.9). Решение совещания одним нажатием превращается в поручение — задачу M02 с ответственным и сроком; исполнение видно в M07 и на дашборде.</div></div>'+
  '<div class="acts">'+(can('meetings','create')?'<button class="btn pri" onclick="App.meetModal()">'+ic('plus')+' Новое совещание</button>':'')+'</div></div>'+
  '<div class="grid g4 mb14">'+
   kpiHTML(DB.meetings.filter(m=>m.date>=dISO(TODAY)&&m.status==='Запланировано').length,'Предстоящие','запланированные совещания','meeting','acc',"App.f.mt.tab='next';renderView()")+
@@ -2807,9 +2815,9 @@ Views.meetings=function(){
   kpiHTML(dirs.length,'Поручений активно','создано из решений','tasks','info',"nav('control')")+
   kpiHTML(dirs.filter(taskOverdue).length,'Поручений просрочено','требуют эскалации','alert',dirs.filter(taskOverdue).length?'err':'ok',"nav('control')")+
  '</div>'+
- '<div class="tabs"><button class="'+(f.tab==='next'?'on':'')+'" onclick="App.f.mt.tab=\'next\';renderView()">Предстоящие и текущие</button><button class="'+(f.tab==='past'?'on':'')+'" onclick="App.f.mt.tab=\'past\';renderView()">Проведённые</button><button class="'+(f.tab==='all'?'on':'')+'" onclick="App.f.mt.tab=\'all\';renderView()">Все</button></div>'+
- '<div class="card"><div class="tbl-wrap"><table class="tbl"><thead><tr><th>Код</th><th>Совещание</th><th>Тип</th><th>Дата</th><th>Председатель</th><th>Участники</th><th>Решения</th><th>Статус</th></tr></thead><tbody>'+
- (rows.length?rows.map(m=>'<tr onclick="openMeeting(\''+m.id+'\')"><td class="b nowrap">'+m.code+'</td><td><b>'+esc(m.title)+'</b></td><td class="small">'+esc(m.type)+'</td><td class="nowrap">'+fmtD(m.date)+' '+esc(m.time)+'</td><td><div class="flex">'+avatar(U(m.chair),'sm')+'<span class="small">'+esc(U(m.chair).name)+'</span></div></td><td class="small">'+m.attendees.length+' чел.</td><td class="num">'+m.decisions.length+'</td><td>'+badge(m.status,m.status==='Запланировано'?'#2563eb':m.status==='Проведено'?'#d97706':'#16a34a',m.status==='Запланировано'?'#dbeafe':m.status==='Проведено'?'#fef3c7':'#dcfce7')+'</td></tr>').join(''):'<tr class="nohover"><td colspan="8">'+emptyBlock('Совещаний нет','Создайте совещание или измените вкладку','meeting')+'</td></tr>')+
+ '<div class="tabs"><button class="'+(f.tab==='next'?'on':'')+'" onclick="App.f.mt.tab=\'next\';renderView()">Предстоящие и текущие</button><button class="'+(f.tab==='past'?'on':'')+'" onclick="App.f.mt.tab=\'past\';renderView()">Проведённые</button><button class="'+(f.tab==='prot'?'on':'')+'" onclick="App.f.mt.tab=\'prot\';renderView()">Протоколы</button><button class="'+(f.tab==='all'?'on':'')+'" onclick="App.f.mt.tab=\'all\';renderView()">Все</button></div>'+
+ '<div class="card"><div class="tbl-wrap"><table class="tbl"><thead><tr><th>Код</th><th>Совещание</th><th>Тип</th><th>Дата</th><th>Председатель</th><th>Участники</th><th>Решения</th><th>Протокол</th><th>Статус</th></tr></thead><tbody>'+
+ (rows.length?rows.map(m=>'<tr onclick="openMeeting(\''+m.id+'\')"><td class="b nowrap">'+m.code+'</td><td><b>'+esc(m.title)+'</b></td><td class="small">'+esc(m.type)+'</td><td class="nowrap">'+fmtD(m.date)+' '+esc(m.time)+'</td><td><div class="flex">'+avatar(U(m.chair),'sm')+'<span class="small">'+esc(U(m.chair).name)+'</span></div></td><td class="small">'+m.attendees.length+' чел.</td><td class="num">'+m.decisions.length+'</td><td class="nowrap">'+prBadge(protOf(m).status)+(protOf(m).version?' <span class="chip">ред. '+protOf(m).version+'</span>':'')+'</td><td>'+badge(m.status,m.status==='Запланировано'?'#2563eb':m.status==='Проведено'?'#d97706':'#16a34a',m.status==='Запланировано'?'#dbeafe':m.status==='Проведено'?'#fef3c7':'#dcfce7')+'</td></tr>').join(''):'<tr class="nohover"><td colspan="9">'+emptyBlock('Совещаний нет','Создайте совещание или измените вкладку','meeting')+'</td></tr>')+
  '</tbody></table></div></div>';
 };
 App.meetModal=function(mid){
@@ -2840,8 +2848,165 @@ function meetMinutes(m){
  '<h2>Повестка дня</h2>'+(m.agenda.length?rptTable(['№','Вопрос','Докладчик'],m.agenda.map(a=>[a.n,a.title,U(a.reporter).name])):'<p>Повестка не сформирована.</p>')+
  '<h2>Принятые решения</h2>'+(m.decisions.length?rptTable(['№','Решение','Ответственный','Срок','Поручение'],m.decisions.map((d,i)=>[i+1,d.text,U(d.resp).name,fmtD(d.due),d.taskId?(T_(d.taskId)||{}).code||'—':'не создано'])):'<p>Решения не зарегистрированы.</p>')+
  '<h2>Контроль исполнения</h2>'+(dirs.length?rptTable(['Поручение','Статус','Срок','Просрочка'],dirs.map(t=>[t.title,t.status,fmtD(t.end),taskOverdue(t)?overDays(t)+' дн':'—'])):'<p>Поручения не создавались.</p>')+
+ '<h2>Согласование и утверждение</h2>'+rptTable(['Показатель','Значение'],[
+   ['Статус согласования',protOf(m).status],
+   ['Номер версии протокола',protOf(m).version?String(protOf(m).version):'не утверждён'],
+   ['Дата направления',protOf(m).sentAt?fmtDT(protOf(m).sentAt):'—'],
+   ['Согласующие',protOf(m).route.map(x=>U(x.user).name+' ('+(x.role||'Согласующий')+': '+(x.state==='Ожидает'?'ожидает':x.state)+')').join('; ')||'маршрут не настроен'],
+   ['Дата утверждения',protOf(m).approvedAt?fmtDT(protOf(m).approvedAt):'—'],
+   ['Утверждающее лицо',protOf(m).approvedBy?U(protOf(m).approvedBy).name:'—']])+
  '<div class="sig"><div>Председатель / '+esc(U(m.chair).name)+'</div><div>Секретарь / '+esc(U(m.secretary).name)+'</div></div>';
 }
+/* ---------- M16 §2.9: маршрут согласования и версии протокола ---------- */
+const PR_ST={'Подготовка':['#64748b','#f1f5f9'],'Черновик':['#2563eb','#dbeafe'],
+ 'Направлен на согласование':['#d97706','#fef3c7'],'На доработке':['#dc2626','#fee2e2'],
+ 'Согласован':['#0891b2','#cffafe'],'Утверждён':['#16a34a','#dcfce7'],
+ 'Опубликован':['#7c3aed','#ede9fe'],'Архивный':['#475569','#e2e8f0']};
+const PR_ROLES=['Секретарь','Председатель','Руководитель подразделения','Согласующий'];
+const PR_EDIT=['Подготовка','Черновик','На доработке'];
+const prBadge=s=>{const c=PR_ST[s]||['#64748b','#f1f5f9'];return badge(s,c[0],c[1]);};
+function protOf(m){
+ const p=Object.assign({status:'Подготовка',route:[],versions:[],comments:[],version:0,
+  sentAt:null,sentBy:null,approvedAt:null,approvedBy:null,publishedAt:null},(m&&m.protocol)||{});
+ ['route','versions','comments'].forEach(k=>{if(!Array.isArray(p[k]))p[k]=[];});
+ return p;
+}
+function protStep(pr){ return pr.route.findIndex(s=>s.state==='Ожидает'); }
+function protBlock(m){
+ const pr=protOf(m), mid=m.id, editable=can('meetings','edit',m), approver=can('meetings','approve',m);
+ const idx=protStep(pr), step=idx>=0?pr.route[idx]:null;
+ const myTurn=!!step&&(step.user===App.user.id||App.user.role==='admin');
+ const conducted=['Проведено','Протокол утверждён'].includes(m.status);
+ let acts='';
+ if(editable&&PR_EDIT.includes(pr.status)&&conducted)acts+='<button class="btn sm pri" id="pr-send" onclick="App.protSend(\''+mid+'\')">'+ic('send')+' Направить на согласование</button>';
+ if(pr.status==='Направлен на согласование'&&myTurn)acts+='<button class="btn sm ok" id="pr-agree" onclick="App.protAgree(\''+mid+'\')">'+ic('check')+' Согласовать</button><button class="btn sm danger" id="pr-rework" onclick="App.protRework(\''+mid+'\')">'+ic('alert')+' Замечания</button>';
+ if(approver&&conducted&&['Согласован','Подготовка','Черновик'].includes(pr.status))acts+='<button class="btn sm ok" id="pr-approve" onclick="App.protApprove(\''+mid+'\')">'+ic('check')+' Утвердить</button>';
+ if(editable&&['Утверждён','Опубликован','Архивный'].includes(pr.status))acts+='<button class="btn sm" id="pr-newver" onclick="App.protNewVersion(\''+mid+'\')">'+ic('edit')+' Новая редакция</button>';
+ if(approver&&pr.status==='Утверждён')acts+='<button class="btn sm pri" id="pr-publish" onclick="App.protPublish(\''+mid+'\')">'+ic('send')+' Опубликовать</button>';
+ if(approver&&['Утверждён','Опубликован'].includes(pr.status))acts+='<button class="btn sm" id="pr-archive" onclick="App.protArchive(\''+mid+'\')">'+ic('folder')+' В архив</button>';
+ const routeTbl=pr.route.length?'<div class="tbl-wrap"><table class="tbl" id="pr-route"><thead><tr><th>№</th><th>Согласующий</th><th>Роль в маршруте</th><th>Результат</th><th>Дата</th><th>Замечания</th></tr></thead><tbody>'+
+  pr.route.map((s,i)=>'<tr class="nohover"><td class="num">'+(i+1)+'</td><td><div class="flex">'+avatar(U(s.user),'sm')+'<b class="small">'+esc(U(s.user).name)+'</b>'+(i===idx&&pr.status==='Направлен на согласование'?'<span class="chip" style="color:#d97706">очередь</span>':'')+'</div></td>'+
+   '<td class="small">'+esc(s.role||'Согласующий')+'</td><td>'+(s.state==='Согласовано'?badge('Согласовано','#16a34a','#dcfce7'):s.state==='Замечания'?badge('Замечания','#dc2626','#fee2e2'):'<span class="small mut">ожидает</span>')+'</td>'+
+   '<td class="small nowrap">'+(s.ts?fmtDT(s.ts):'—')+'</td><td class="small">'+esc(s.comment||'—')+'</td></tr>').join('')+'</tbody></table></div>'
+  :'<div class="small mut">Маршрут не настроен — при направлении будет применён типовой: секретарь → председатель → руководитель подразделения.</div>';
+ const vers=pr.versions.length?'<div class="cb timeline">'+pr.versions.slice().reverse().map(v=>
+  '<div class="ti"><span class="td" style="background:'+(v.v===pr.version?'var(--acc)':'#cbd5e1')+'"></span><div class="tc">'+
+  '<b>Редакция '+v.v+' · '+esc(v.docCode||'')+' v'+v.docV+'</b>'+
+  '<div class="small">'+esc(v.note||'Утверждённый протокол')+' · вопросов: '+(v.agenda||[]).length+' · решений: '+(v.decisions||[]).length+'</div>'+
+  '<small>'+fmtDT(v.ts)+' · утвердил: '+esc(U(v.by).name)+'</small></div>'+
+  (can('docs','view')?'<button class="btn sm" title="DOCX утверждённой редакции" onclick="App.docDownload(\''+v.docId+'\','+v.docV+')">'+ic('download')+' DOCX</button><button class="btn sm" title="PDF утверждённой редакции" onclick="App.protFile(\''+v.docId+'\','+v.docV+',\'pdf\')">'+ic('download')+' PDF</button><button class="btn sm" onclick="App.protVersion(\''+mid+'\','+v.v+')">'+ic('journal')+'</button>':'')+
+  '</div>').join('')+'</div>':'<div class="cb small mut">Утверждённых редакций нет.</div>';
+ const cmts=pr.comments.slice(-8).reverse();
+ return '<div class="card mb14" id="prot-card"><div class="ch">'+ic('meeting')+'Согласование протокола (ТЗ §2.9)'+
+  '<span class="r flexw">'+prBadge(pr.status)+(pr.version?'<span class="chip">редакция '+pr.version+'</span>':'')+'</span></div><div class="cb">'+
+  '<div class="stat-line"><span>Дата направления</span><b>'+(pr.sentAt?fmtDT(pr.sentAt)+' · '+esc(U(pr.sentBy).name):'—')+'</b></div>'+
+  '<div class="stat-line"><span>Текущий согласующий</span><b>'+(step&&pr.status==='Направлен на согласование'?esc(U(step.user).name)+' · '+esc(step.role||'Согласующий'):'—')+'</b></div>'+
+  '<div class="stat-line"><span>Дата утверждения</span><b>'+(pr.approvedAt?fmtDT(pr.approvedAt)+' · '+esc(U(pr.approvedBy).name):'—')+'</b></div>'+
+  '<div class="stat-line"><span>Дата публикации</span><b>'+(pr.publishedAt?fmtDT(pr.publishedAt):'—')+'</b></div>'+
+  '<div class="flexw mt8">'+acts+(editable&&PR_EDIT.includes(pr.status)?'<button class="btn sm" id="pr-route-btn" onclick="App.protRoute(\''+mid+'\')">'+ic('users')+' Маршрут</button>':'')+'</div>'+
+  '<h4 style="margin:14px 0 8px">Маршрут согласования ('+pr.route.length+')</h4>'+routeTbl+
+  '</div></div>'+
+  '<div class="card mb14"><div class="ch">'+ic('journal')+'История редакций ('+pr.versions.length+')</div>'+vers+'</div>'+
+  (cmts.length?'<div class="card mb14"><div class="ch">'+ic('journal')+'Замечания и отметки маршрута</div><div class="cb list-rows">'+
+   cmts.map(c=>'<div class="lr" style="cursor:default">'+avatar(U(c.by),'sm')+'<div class="lt"><b>'+esc(c.kind)+' · '+esc(U(c.by).name)+'</b><small>'+esc(c.text||'без комментария')+'</small></div><span class="small mut nowrap">'+fmtDT(c.ts)+'</span></div>').join('')+'</div></div>':'')+
+  '<div class="help-note">'+ic('info')+'<div>Утверждённый протокол сохраняется отдельной версией (DOCX+PDF в M09). Изменение утверждённого протокола выполняется только через новую редакцию с сохранением истории предыдущей.</div></div>';
+}
+App.protFile=function(did,v,fmt){
+ const a=document.createElement('a'); a.href='/api/files/'+did+'/'+v+'?fmt='+fmt; a.download='';
+ document.body.appendChild(a); a.click(); a.remove();
+ toast('ok','Файл редакции скачивается',fmt.toUpperCase()+' · скачивание зафиксировано в журнале M15');
+};
+App.protRoute=function(mid){
+ if(!guard('meetings','edit',MEET(mid)))return;
+ const m=MEET(mid), pr=protOf(m);
+ App._prMid=mid;
+ App._pr=pr.route.map(s=>({user:s.user,role:s.role||'Согласующий'}));
+ if(!App._pr.length)App._pr=[{user:m.secretary,role:'Секретарь'},{user:m.chair,role:'Председатель'}];
+ App.protRouteDraw(mid);
+};
+App.protRouteDraw=function(mid){
+ openModal(mh('Маршрут согласования протокола','meeting')+'<div class="mb form">'+
+  '<div class="small mut mb8">Порядок согласования задаётся вручную: секретарь, председатель, руководитель подразделения и иные назначенные согласующие (ТЗ §2.9). Не более 8 согласующих; повторные назначения исключаются.</div>'+
+  '<div id="pr-rows">'+App._pr.map((s,i)=>'<div class="flexw mb8">'+
+   '<span class="chip">№'+(i+1)+'</span>'+
+   sel('pr-u'+i,DB.users.filter(u=>!u.blocked).map(u=>[u.id,u.name]),s.user,'style="flex:1;min-width:180px" onchange="App._pr['+i+'].user=this.value"')+
+   sel('pr-r'+i,PR_ROLES.map(r=>[r,r]),s.role,'onchange="App._pr['+i+'].role=this.value"')+
+   '<button class="btn sm" title="Выше" onclick="App.protRouteMove('+i+',-1)">'+ic('up')+'</button>'+
+   '<button class="btn sm" title="Ниже" onclick="App.protRouteMove('+i+',1)">'+ic('down')+'</button>'+
+   '<button class="btn sm danger" title="Убрать" onclick="App.protRouteDel('+i+')">'+ic('trash')+'</button>'+
+  '</div>').join('')+'</div>'+
+  '<div class="flexw mt8"><button class="btn sm" onclick="App.protRouteAdd()">'+ic('plus')+' Согласующий</button>'+
+  '<button class="btn sm" onclick="App.protRouteDefault(\''+mid+'\')">'+ic('refresh')+' Типовой маршрут</button></div>'+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="pr-route-save" onclick="App.protRouteSave(\''+mid+'\')">Сохранить маршрут</button></div>');
+};
+App.protRouteAdd=function(){ if(App._pr.length>=8){toast('warn','Не более 8 согласующих','Ограничение маршрута по ТЗ');return;} App._pr.push({user:DB.users.find(u=>!u.blocked).id,role:'Согласующий'}); App.protRouteDraw(App._prMid); };
+App.protRouteDel=function(i){ App._pr.splice(i,1); App.protRouteDraw(App._prMid); };
+App.protRouteMove=function(i,d){ const j=i+d; if(j<0||j>=App._pr.length)return; const x=App._pr[i]; App._pr[i]=App._pr[j]; App._pr[j]=x; App.protRouteDraw(App._prMid); };
+App.protRouteDefault=function(mid){
+ const m=MEET(mid), out=[];
+ const push=(u,r)=>{ if(u&&!out.some(x=>x.user===u))out.push({user:u,role:r}); };
+ push(m.secretary,'Секретарь'); push(m.chair,'Председатель');
+ const h=DB.users.find(u=>u.role==='head'&&!u.blocked); if(h)push(h.id,'Руководитель подразделения');
+ App._pr=out; App.protRouteDraw(mid);
+};
+App.protRouteSave=function(mid){
+ rpc('protocol.route',{id:mid,route:App._pr}).then(r=>{ if(r){App.closeModal(true);openMeeting(mid);} });
+};
+App.protSend=function(mid){
+ openModal(mh('Направление протокола на согласование','send')+'<div class="mb form">'+
+  '<div class="small mut mb8">Фиксируется дата направления и запускается маршрут согласования. Первый согласующий получит уведомление.</div>'+
+  field('Комментарий к направлению',ta('pr-note','',3))+'</div>'+
+  '<div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="pr-send-go" onclick="App.protSendGo(\''+mid+'\')">Направить</button></div>');
+};
+App.protSendGo=function(mid){ rpc('protocol.send',{id:mid,note:val('pr-note')}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}}); };
+App.protAgree=function(mid){
+ openModal(mh('Согласование протокола','check')+'<div class="mb form">'+
+  '<div class="small mut mb8">Результат «Согласовано» передаёт протокол следующему согласующему по маршруту.</div>'+
+  field('Комментарий',ta('pr-cmt','',3))+'</div>'+
+  '<div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn ok" id="pr-agree-go" onclick="App.protReviewGo(\''+mid+'\',\'Согласовано\')">Согласовать</button></div>');
+};
+App.protRework=function(mid){
+ openModal(mh('Замечания к протоколу','alert')+'<div class="mb form">'+
+  '<div class="small mut mb8">Протокол возвращается секретарю на доработку. Текст замечаний обязателен (ТЗ §2.9).</div>'+
+  field('Замечания',ta('pr-cmt','',4),true)+'</div>'+
+  '<div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn danger" id="pr-rework-go" onclick="App.protReviewGo(\''+mid+'\',\'Замечания\')">Вернуть на доработку</button></div>');
+};
+App.protReviewGo=function(mid,decision){
+ const c=val('pr-cmt');
+ if(decision==='Замечания'&&!c){toast('warn','Замечания должны содержать текст','Опишите, что требуется доработать');return;}
+ rpc('protocol.review',{id:mid,decision:decision,comment:c}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.protApprove=function(mid){
+ openModal(mh('Утверждение протокола','check')+'<div class="mb form">'+
+  '<div class="small mut mb8">Утверждённый протокол сохраняется отдельной редакцией: файлы DOCX и PDF в M09 и снимок повестки и решений.</div>'+
+  field('Отметка об утверждении',ta('pr-note','',3))+'</div>'+
+  '<div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn ok" id="pr-approve-go" onclick="App.protApproveGo(\''+mid+'\')">Утвердить</button></div>');
+};
+App.protApproveGo=function(mid){ rpc('protocol.approve',{id:mid,note:val('pr-note')}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}}); };
+App.protNewVersion=function(mid){
+ const pr=protOf(MEET(mid));
+ if(!confirm('Создать новую редакцию протокола? Утверждённая редакция '+pr.version+' сохранится в истории, протокол вернётся в статус «Черновик».'))return;
+ rpc('protocol.newVersion',{id:mid,note:'Новая редакция после утверждённой '+pr.version}).then(r=>{if(r)openMeeting(mid);});
+};
+App.protPublish=function(mid){ rpc('protocol.publish',{id:mid}).then(r=>{if(r)openMeeting(mid);}); };
+App.protArchive=function(mid){
+ if(!confirm('Перевести протокол в архив? История редакций сохраняется, новая редакция остаётся возможной.'))return;
+ rpc('protocol.archive',{id:mid}).then(r=>{if(r)openMeeting(mid);});
+};
+App.protVersion=function(mid,v){
+ const pr=protOf(MEET(mid)), x=pr.versions.find(y=>y.v===v); if(!x)return;
+ const rows=(x.agenda||[]).map(a=>[a.n,a.title,U(a.reporter).name]);
+ const dec=(x.decisions||[]).map((d,i)=>[i+1,d.text,U(d.resp).name,fmtD(d.due)]);
+ openModal(mh('Утверждённая редакция '+x.v,'journal')+'<div class="mb">'+
+  '<div class="small mut mb8">'+fmtDT(x.ts)+' · утвердил: '+esc(U(x.by).name)+' · документ '+esc(x.docCode||'')+' v'+x.docV+'</div>'+
+  '<h4 style="margin:10px 0 6px">Повестка на момент утверждения</h4>'+
+  (rows.length?rptTable(['№','Вопрос','Докладчик'],rows):'<div class="small mut">Повестка не была сформирована.</div>')+
+  '<h4 style="margin:10px 0 6px">Решения на момент утверждения</h4>'+
+  (dec.length?rptTable(['№','Решение','Ответственный','Срок'],dec):'<div class="small mut">Решения не фиксировались.</div>')+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Закрыть</button>'+
+  '<button class="btn" onclick="App.docDownload(\''+x.docId+'\','+x.docV+')">'+ic('download')+' DOCX</button>'+
+  '<button class="btn pri" onclick="App.protFile(\''+x.docId+'\','+x.docV+',\'pdf\')">'+ic('download')+' PDF</button></div>');
+};
 function openMeeting(mid){
  const m=MEET(mid); if(!m)return;
  if(!can('meetings','view')){deny('meetings','view',m);return;}
@@ -2879,11 +3044,12 @@ function openMeeting(mid){
  }
  if(tab==='prot'){
   body='<div class="flexw mb8"><button class="btn" onclick="App.meetPrint(\''+mid+'\')">'+ic('print')+' Печать</button><button class="btn" onclick="App.meetDownload(\''+mid+'\')">'+ic('download')+' HTML</button>'+docBtns('meeting',mid)+(can('meetings','export')&&can('docs','create')?'<button class="btn pri" onclick="App.meetProtocol(\''+mid+'\')">'+ic('save')+' Протокол в M09 (DOCX+PDF)</button>':'')+'<span class="spacer"></span>'+
-  (m.status==='Проведено'&&can('meetings','approve',m)?'<button class="btn ok" onclick="App.meetApprove(\''+mid+'\')">'+ic('check')+' Утвердить протокол</button>':'')+'</div>'+
+  '</div>'+
+  protBlock(m)+
   '<div class="card"><div class="cb report-doc">'+meetMinutes(m)+'</div></div>';
  }
- const tabs=[['info','Информация'],['agenda','Повестка ('+m.agenda.length+')'],['dec','Решения ('+m.decisions.length+')'],['dir','Поручения ('+dirs.length+')'],['prot','Протокол']];
- openDrawer(dh(m.code+' · '+m.type,m.title,badge(m.status,m.status==='Запланировано'?'#2563eb':m.status==='Проведено'?'#d97706':'#16a34a',m.status==='Запланировано'?'#dbeafe':m.status==='Проведено'?'#fef3c7':'#dcfce7')+' <span class="chip">'+fmtD(m.date)+' '+esc(m.time)+'</span>')+
+ const tabs=[['info','Информация'],['agenda','Повестка ('+m.agenda.length+')'],['dec','Решения ('+m.decisions.length+')'],['dir','Поручения ('+dirs.length+')'],['prot','Протокол'+(protOf(m).version?' (ред. '+protOf(m).version+')':'')]];
+ openDrawer(dh(m.code+' · '+m.type,m.title,badge(m.status,m.status==='Запланировано'?'#2563eb':m.status==='Проведено'?'#d97706':'#16a34a',m.status==='Запланировано'?'#dbeafe':m.status==='Проведено'?'#fef3c7':'#dcfce7')+' <span class="chip">'+fmtD(m.date)+' '+esc(m.time)+'</span>'+prBadge(protOf(m).status))+
  '<div class="db"><div class="tabs">'+tabs.map(([k,n])=>'<button class="'+(tab===k?'on':'')+'" onclick="App.f.meetTab=\''+k+'\';openMeeting(\''+mid+'\')">'+n+'</button>').join('')+'</div>'+body+'</div>'+
  '<div class="df">'+
   (editable?'<button class="btn" onclick="App.meetModal(\''+mid+'\')">'+ic('edit')+' Редактировать</button>':'')+

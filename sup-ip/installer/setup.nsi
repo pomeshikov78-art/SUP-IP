@@ -9,7 +9,7 @@
 Unicode true
 ManifestDPIAware true
 !ifndef VERSION
-  !define VERSION "1.4.1"
+  !define VERSION "1.5.0"
 !endif
 !define APPNAME "SUP-IP"
 !define DISPLAY "СУП-ИП — управление проектами"

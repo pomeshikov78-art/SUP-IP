@@ -39,7 +39,7 @@ except ImportError:
     docgen = None
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.4.2"
+VERSION = "1.5.0"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -283,7 +283,8 @@ CREATE TABLE IF NOT EXISTS meetings(
   id TEXT PRIMARY KEY, code TEXT UNIQUE NOT NULL, title TEXT NOT NULL, type TEXT NOT NULL,
   date TEXT NOT NULL, mtime TEXT NOT NULL DEFAULT '', chair TEXT REFERENCES users(id) ON DELETE SET NULL,
   secretary TEXT REFERENCES users(id) ON DELETE SET NULL, attendees JSONB NOT NULL DEFAULT '[]',
-  status TEXT NOT NULL, agenda JSONB NOT NULL DEFAULT '[]', decisions JSONB NOT NULL DEFAULT '[]');
+  status TEXT NOT NULL, agenda JSONB NOT NULL DEFAULT '[]', decisions JSONB NOT NULL DEFAULT '[]',
+  protocol JSONB NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS risks(
   id TEXT PRIMARY KEY, code TEXT UNIQUE NOT NULL, title TEXT NOT NULL, cat TEXT NOT NULL,
   project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, p INT NOT NULL, i INT NOT NULL,
@@ -368,7 +369,7 @@ ENT = {
    ("date","date","t"),("hours","hours","f"),("act","act","t"),("comment","comment","t"),("status","status","t"),("approvedBy","approved_by","t")]),
  "meeting": ("meetings", [("id","id","t"),("code","code","t"),("title","title","t"),("type","type","t"),("date","date","t"),
    ("time","mtime","t"),("chair","chair","t"),("secretary","secretary","t"),("attendees","attendees","j"),
-   ("status","status","t"),("agenda","agenda","j"),("decisions","decisions","j")]),
+   ("status","status","t"),("agenda","agenda","j"),("decisions","decisions","j"),("protocol","protocol","j")]),
  "calEvent": ("cal_events", [("id","id","t"),("title","title","t"),("date","date","t"),("time","mtime","t"),
    ("type","type","t"),("participants","participants","j"),("note","note","t")]),
  "report": ("reports", [("id","id","t"),("code","code","t"),("type","type","t"),("title","title","t"),("params","params","j"),
@@ -1258,7 +1259,8 @@ def h_meeting_create(db, cur, u, p):
     n = next_seq(db, cur, "meet")
     m = dict(id=uid("m"), code="СОВ-%d-%03d" % (today().year, n), title=p["title"].strip()[:300], type=p["type"],
              date=p["date"], time=p["time"], chair=p["chair"], secretary=p["secretary"],
-             attendees=p.get("attendees", []), status="Запланировано", agenda=[], decisions=[])
+             attendees=p.get("attendees", []), status="Запланировано", agenda=[], decisions=[],
+             protocol=protocol_default())
     db.save_ent(cur, "meeting", m)
     db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Создано совещание", "Совещание", m["id"], {"title": m["title"], "date": m["date"]})
     invite = list(dict.fromkeys([m["chair"], m["secretary"]] + (m["attendees"] or [])))
@@ -1300,21 +1302,20 @@ def h_meeting_conduct(db, cur, u, p):
     m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
     if m["date"] > dISO(today()): raise RpcError("Нельзя провести совещание раньше его даты")
     m["status"] = "Проведено"
+    pr = prot_of(m)
+    if pr["status"] == "Подготовка": pr["status"] = "Черновик"   # ТЗ §2.9: черновик протокола после проведения
+    m["protocol"] = pr
     db.save_ent(cur, "meeting", m)
     db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Совещание проведено", "Совещание", m["id"], {"code": m["code"]})
     return m, msg("Статус: «Проведено»", "Зафиксируйте решения и утвердите протокол")
 
 @reg("meeting.approve")
 def h_meeting_approve(db, cur, u, p):
+    """Утверждение протокола (совместимость с M16 §2.8): единый контур §2.9 с версией и историей."""
     m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "approve", m)
     if m["status"] != "Проведено": raise RpcError("Утверждать можно протокол проведённого совещания")
-    m["status"] = "Протокол утверждён"
-    db.save_ent(cur, "meeting", m)
-    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Утверждён протокол совещания", "Совещание", m["id"], {"code": m["code"], "decisions": len(m["decisions"])})
-    notify_many(db, cur, [x for x in list(dict.fromkeys([m["chair"], m["secretary"]] + (m.get("attendees") or []))) if x != u["id"]],
-                "protocol.approved", "Протокол утверждён: %s" % m["title"],
-                "%s · решений: %d" % (m["code"], len(m["decisions"])), "Совещание", m["id"], dedupe_suffix="approved")
-    return m, msg("Протокол утверждён", "Участники оповещены")
+    _protocol_approve(db, cur, u, m, p.get("note", ""))
+    return m, msg("Протокол утверждён", "Сохранена отдельная версия, участники оповещены")
 
 @reg("meeting.agenda.add")
 def h_meeting_agenda(db, cur, u, p):
@@ -2064,6 +2065,64 @@ def h_meeting_protocol(db, cur, u, p):
     m = get_req(db, cur, "meeting", p["id"])
     guard(db, cur, u, "meetings", "export", m)
     guard(db, cur, u, "docs", "create")
+    fmts = [f for f in (p.get("formats") or ["docx", "pdf"])]
+    reg = _protocol_register(db, cur, u, m, fmts,
+                             "Протокол совещания · представления: %s" % ", ".join(f.upper() for f in fmts))
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Сформирован протокол совещания", "Совещание", m["id"],
+             {"code": m["code"], "doc": reg["docCode"], "v": reg["docV"], "formats": fmts})
+    return {"docId": reg["docId"], "version": reg["docV"], "files": reg["files"]}, msg(
+        "Протокол сформирован (версия %d)" % reg["docV"], "DOCX и PDF зарегистрированы в M09 · событие в M15")
+
+# ---------------- Маршрут согласования и версии протокола (ТЗ M16 §2.9) ----------------
+# Статусы протокола, настраиваемый маршрут (секретарь → председатель → руководитель → иные
+# согласующие), регистрация даты направления, согласующего, результата и замечаний.
+# Утверждённый протокол сохраняется отдельной версией (DOCX+PDF в M09 + снимок содержания);
+# изменение утверждённого протокола возможно только через новую редакцию с сохранением истории.
+
+PROTOCOL_STATUSES = ["Подготовка", "Черновик", "Направлен на согласование", "На доработке",
+                     "Согласован", "Утверждён", "Опубликован", "Архивный"]
+PROTOCOL_ROLES = ["Секретарь", "Председатель", "Руководитель подразделения", "Согласующий"]
+PROTOCOL_EDITABLE = ("Подготовка", "Черновик", "На доработке")
+
+def protocol_default():
+    return {"status": "Подготовка", "route": [], "sentAt": None, "sentBy": None,
+            "approvedAt": None, "approvedBy": None, "publishedAt": None,
+            "version": 0, "versions": [], "comments": []}
+
+def prot_of(m):
+    """Состояние протокола совещания (для записей прежних версий — значения по умолчанию)."""
+    p = dict(protocol_default())
+    p.update(m.get("protocol") or {})
+    for k in ("route", "versions", "comments"):
+        if not isinstance(p.get(k), list): p[k] = []
+    return p
+
+def _prot_step_pending(pr):
+    for i, s in enumerate(pr["route"]):
+        if s.get("state") == "Ожидает": return i, s
+    return None, None
+
+def _prot_comment(pr, u, kind, text):
+    pr["comments"].append({"ts": now_ms(), "by": u["id"], "kind": kind, "text": (text or "")[:1000]})
+    pr["comments"] = pr["comments"][-100:]
+
+def _prot_default_route(db, cur, m):
+    """Типовой маршрут: секретарь → председатель → руководитель подразделения (ТЗ §2.9)."""
+    route = []
+    if m.get("secretary"): route.append({"user": m["secretary"], "role": "Секретарь"})
+    if m.get("chair") and m["chair"] != m.get("secretary"): route.append({"user": m["chair"], "role": "Председатель"})
+    for usr in db.users_public(cur):
+        if usr["role"] == "head" and not usr["blocked"] and usr["id"] not in [x["user"] for x in route]:
+            route.append({"user": usr["id"], "role": "Руководитель подразделения"}); break
+    return route
+
+def _prot_notify_step(db, cur, m, pr, step):
+    notify(db, cur, step["user"], "protocol.review", "Протокол на согласование: %s" % m["title"],
+           "%s · роль в маршруте: %s" % (m["code"], step.get("role", "Согласующий")), "Совещание", m["id"],
+           dedupe="protocol.review:%s:%s:%s:%s" % (m["id"], step["user"], pr["version"], pr.get("sentAt")))
+
+def _protocol_register(db, cur, u, m, fmts, note):
+    """Формирование файлов протокола и регистрация версии в M09 (общий код для §2.8 и §2.9)."""
     if docgen is None: raise RpcError("Генератор документов недоступен", "Экспорт", 500, "NO_DOCGEN")
     d = meeting_protocol_doc(db, cur, u, m)
     cur.execute("SELECT id FROM docs WHERE task_id IS NULL AND title=%s", ("Протокол совещания %s" % m["code"],))
@@ -2076,7 +2135,6 @@ def h_meeting_protocol(db, cur, u, p):
                    projectId=None, taskId=None, riskId=None, status="Проект", author=u["id"], versions=[])
         db.save_ent(cur, "doc", doc)
     v = max([x["v"] for x in (doc.get("versions") or [])] or [0]) + 1
-    fmts = [f for f in (p.get("formats") or ["docx", "pdf"])]
     for fmt in fmts:
         if fmt not in ("docx", "pdf", "xlsx", "html"): raise RpcError("Недопустимый формат протокола: %s" % fmt)
     os.makedirs(FILES_DIR, exist_ok=True)
@@ -2084,7 +2142,6 @@ def h_meeting_protocol(db, cur, u, p):
     for i, fmt in enumerate(fmts):
         data = docgen.render(d, fmt)
         fname = "protokol_%s_v%d.%s" % (m["code"], v, fmt)
-        # основное представление — в каноническом пути M09, дополнительные — рядом (DOCX + PDF одной версии)
         path = file_path(doc["id"], v) if i == 0 else file_path(doc["id"], v) + "." + fmt
         with open(path, "wb") as f: f.write(data)
         if i == 0: primary = (fname, len(data))
@@ -2092,14 +2149,190 @@ def h_meeting_protocol(db, cur, u, p):
     cur.execute("INSERT INTO doc_versions(doc_id,v,ts,by_user,size,note,file_name,stored) VALUES(%s,%s,%s,%s,%s,%s,%s,TRUE) "
                 "ON CONFLICT (doc_id,v) DO UPDATE SET ts=EXCLUDED.ts, size=EXCLUDED.size, note=EXCLUDED.note, "
                 "file_name=EXCLUDED.file_name, stored=TRUE",
-                (doc["id"], v, now_ms(), u["id"], primary[1],
-                 "Протокол совещания · представления: %s" % ", ".join(f.upper() for f in fmts), primary[0]))
-    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Сформирован протокол совещания", "Совещание", m["id"],
-             {"code": m["code"], "doc": doc["code"], "v": v, "formats": fmts})
+                (doc["id"], v, now_ms(), u["id"], primary[1], note, primary[0]))
     db.audit(cur, "AUDIT", "info", u["id"], "docs", "Зарегистрирована версия документа", "Документ", doc["id"],
              {"v": v, "source": "M16"})
-    return {"docId": doc["id"], "version": v, "files": stored}, msg(
-        "Протокол сформирован (версия %d)" % v, "DOCX и PDF зарегистрированы в M09 · событие в M15")
+    return {"docId": doc["id"], "docCode": doc["code"], "docV": v, "files": stored}
+
+@reg("protocol.route")
+def h_protocol_route(db, cur, u, p):
+    """Настройка маршрута согласования (ТЗ §2.9): состав и порядок согласующих."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    pr = prot_of(m)
+    if pr["status"] not in PROTOCOL_EDITABLE:
+        raise RpcError("Маршрут нельзя менять в статусе «%s»" % pr["status"], "Протокол")
+    route = []
+    for item in (p.get("route") or [])[:8]:
+        uid_ = item.get("user") if isinstance(item, dict) else item
+        if not uid_: continue
+        cur.execute("SELECT id FROM users WHERE id=%s AND NOT blocked", (uid_,))
+        if not cur.fetchone(): raise RpcError("Согласующий не найден: %s" % uid_)
+        if uid_ in [x["user"] for x in route]: continue
+        role = (item.get("role") if isinstance(item, dict) else None) or "Согласующий"
+        if role not in PROTOCOL_ROLES: role = "Согласующий"
+        route.append({"user": uid_, "role": role, "state": "Ожидает", "ts": None, "comment": ""})
+    pr["route"] = route
+    m["protocol"] = pr
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Настроен маршрут согласования протокола", "Совещание", m["id"],
+             {"code": m["code"], "route": [x["user"] for x in route], "event": "MEETING_PROTOCOL_ROUTE_SET"})
+    return m, msg("Маршрут согласования сохранён", "Согласующих: %d" % len(route))
+
+@reg("protocol.send")
+def h_protocol_send(db, cur, u, p):
+    """Направление протокола на согласование: фиксируется дата, маршрут и первый согласующий."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    if m["status"] not in ("Проведено", "Протокол утверждён"):
+        raise RpcError("Направить можно протокол проведённого совещания", "Протокол")
+    pr = prot_of(m)
+    if pr["status"] not in PROTOCOL_EDITABLE:
+        raise RpcError("Протокол уже в статусе «%s»" % pr["status"], "Протокол")
+    if not pr["route"]:
+        pr["route"] = [dict(x, state="Ожидает", ts=None, comment="") for x in _prot_default_route(db, cur, m)]
+    if not pr["route"]: raise RpcError("Маршрут согласования пуст: назначьте согласующих", "Протокол")
+    for s in pr["route"]: s.update(state="Ожидает", ts=None, comment="")
+    pr["status"] = "Направлен на согласование"
+    pr["sentAt"] = now_ms(); pr["sentBy"] = u["id"]
+    _prot_comment(pr, u, "Направление", p.get("note", ""))
+    m["protocol"] = pr
+    db.save_ent(cur, "meeting", m)
+    _prot_notify_step(db, cur, m, pr, pr["route"][0])
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Протокол направлен на согласование", "Совещание", m["id"],
+             {"code": m["code"], "route": [x["user"] for x in pr["route"]], "event": "MEETING_PROTOCOL_SENT_FOR_APPROVAL"})
+    return m, msg("Протокол направлен на согласование", "Первый согласующий: %s" % _uname(db, cur, pr["route"][0]["user"]))
+
+@reg("protocol.review")
+def h_protocol_review(db, cur, u, p):
+    """Результат согласования: «Согласовано» либо «Замечания» (возврат на доработку)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "view", m)
+    pr = prot_of(m)
+    if pr["status"] != "Направлен на согласование":
+        raise RpcError("Протокол не на согласовании (статус «%s»)" % pr["status"], "Протокол")
+    idx, step = _prot_step_pending(pr)
+    if not step: raise RpcError("Все согласующие уже дали результат", "Протокол")
+    if step["user"] != u["id"] and u["role"] != "admin":
+        raise RpcError("Сейчас очередь согласующего: %s" % _uname(db, cur, step["user"]),
+                       "403 · Не ваша очередь согласования", 403, "FORBIDDEN")
+    decision = p.get("decision")
+    if decision not in ("Согласовано", "Замечания"): raise RpcError("Укажите результат: Согласовано или Замечания")
+    comment = (p.get("comment") or "")[:1000]
+    if decision == "Замечания" and not comment.strip():
+        raise RpcError("Замечания должны содержать текст", "Протокол")
+    step.update(state=decision, ts=now_ms(), comment=comment)
+    _prot_comment(pr, u, decision, comment)
+    if decision == "Замечания":
+        pr["status"] = "На доработке"
+        for uid_ in dict.fromkeys([m.get("secretary"), pr.get("sentBy")]):
+            if uid_ and uid_ != u["id"]:
+                notify(db, cur, uid_, "protocol.rework", "Протокол возвращён на доработку: %s" % m["title"],
+                       "%s · %s: %s" % (m["code"], u["name"], comment[:200]), "Совещание", m["id"],
+                       dedupe="protocol.rework:%s:%s:%s" % (m["id"], uid_, now_ms()))
+        msg_ = msg("Протокол возвращён на доработку", "Замечания направлены секретарю")
+        ev = "MEETING_PROTOCOL_REWORK"
+    else:
+        nxt_idx, nxt = _prot_step_pending(pr)
+        if nxt:
+            _prot_notify_step(db, cur, m, pr, nxt)
+            msg_ = msg("Согласовано", "Следующий согласующий: %s" % _uname(db, cur, nxt["user"]))
+        else:
+            pr["status"] = "Согласован"
+            for uid_ in dict.fromkeys([m.get("chair"), m.get("secretary")]):
+                if uid_ and uid_ != u["id"]:
+                    notify(db, cur, uid_, "protocol.approved", "Протокол согласован: %s" % m["title"],
+                           "%s · готов к утверждению" % m["code"], "Совещание", m["id"],
+                           dedupe="protocol.agreed:%s:%s:%s" % (m["id"], uid_, pr["version"]))
+            msg_ = msg("Протокол согласован", "Все согласующие дали положительный результат")
+        ev = "MEETING_PROTOCOL_AGREED"
+    m["protocol"] = pr
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Согласование протокола: " + decision, "Совещание", m["id"],
+             {"code": m["code"], "step": idx + 1, "comment": comment, "event": ev})
+    return m, msg_
+
+def _protocol_approve(db, cur, u, m, note=""):
+    """Утверждение протокола: отдельная версия с файлами и снимком содержания (ТЗ §2.9)."""
+    pr = prot_of(m)
+    if pr["status"] not in ("Согласован", "Подготовка", "Черновик"):
+        raise RpcError("Утвердить можно согласованный протокол (статус «%s»)" % pr["status"], "Протокол")
+    if pr["route"] and pr["status"] != "Согласован":
+        raise RpcError("Протокол должен пройти маршрут согласования", "Протокол")
+    reg = _protocol_register(db, cur, u, m, ["docx", "pdf"],
+                             "Утверждённый протокол %s · редакция %d" % (m["code"], pr["version"] + 1))
+    pr["version"] += 1
+    pr["versions"].append({"v": pr["version"], "ts": now_ms(), "by": u["id"], "note": (note or "")[:500],
+                           "docId": reg["docId"], "docCode": reg["docCode"], "docV": reg["docV"], "files": reg["files"],
+                           "agenda": json.loads(json.dumps(m.get("agenda") or [])),
+                           "decisions": json.loads(json.dumps(m.get("decisions") or []))})
+    pr["status"] = "Утверждён"
+    pr["approvedAt"] = now_ms(); pr["approvedBy"] = u["id"]
+    m["protocol"] = pr
+    m["status"] = "Протокол утверждён"
+    db.save_ent(cur, "meeting", m)
+    notify_many(db, cur, [x for x in dict.fromkeys([m["chair"], m["secretary"]] + (m.get("attendees") or [])) if x != u["id"]],
+                "protocol.approved", "Протокол утверждён: %s" % m["title"],
+                "%s · редакция %d" % (m["code"], pr["version"]), "Совещание", m["id"],
+                dedupe_suffix="approved:%d" % pr["version"])
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Утверждён протокол совещания", "Совещание", m["id"],
+             {"code": m["code"], "version": pr["version"], "doc": reg["docCode"], "decisions": len(m["decisions"]),
+              "event": "MEETING_PROTOCOL_APPROVED"})
+    LOG.info("Протокол %s утверждён (редакция %d, документ %s v%d)", m["code"], pr["version"], reg["docCode"], reg["docV"])
+    return reg
+
+@reg("protocol.approve")
+def h_protocol_approve(db, cur, u, p):
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "approve", m)
+    if m["status"] not in ("Проведено", "Протокол утверждён"):
+        raise RpcError("Утверждать можно протокол проведённого совещания", "Протокол")
+    reg = _protocol_approve(db, cur, u, m, p.get("note", ""))
+    pr = prot_of(m)
+    return {"meeting": m, "version": pr["version"], "docId": reg["docId"], "files": reg["files"]}, msg(
+        "Протокол утверждён (редакция %d)" % pr["version"], "Версия сохранена в M09, участники оповещены")
+
+@reg("protocol.newVersion")
+def h_protocol_new_version(db, cur, u, p):
+    """Новая редакция утверждённого протокола: история предыдущих редакций сохраняется."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    pr = prot_of(m)
+    if pr["status"] not in ("Утверждён", "Опубликован", "Архивный"):
+        raise RpcError("Новая редакция создаётся из утверждённого протокола", "Протокол")
+    pr["status"] = "Черновик"
+    pr["sentAt"] = None; pr["sentBy"] = None; pr["approvedAt"] = None; pr["approvedBy"] = None; pr["publishedAt"] = None
+    for s in pr["route"]: s.update(state="Ожидает", ts=None, comment="")
+    _prot_comment(pr, u, "Новая редакция", p.get("note", ""))
+    m["protocol"] = pr
+    m["status"] = "Проведено"
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "AUDIT", "warning", u["id"], "meetings", "Создана новая редакция протокола", "Совещание", m["id"],
+             {"code": m["code"], "prevVersion": pr["version"], "event": "MEETING_PROTOCOL_VERSION_CREATED"})
+    return m, msg("Создана новая редакция", "Утверждённая редакция %d сохранена в истории" % pr["version"])
+
+@reg("protocol.publish")
+def h_protocol_publish(db, cur, u, p):
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "approve", m)
+    pr = prot_of(m)
+    if pr["status"] != "Утверждён": raise RpcError("Опубликовать можно утверждённый протокол", "Протокол")
+    pr["status"] = "Опубликован"; pr["publishedAt"] = now_ms()
+    m["protocol"] = pr
+    db.save_ent(cur, "meeting", m)
+    notify_many(db, cur, [x for x in dict.fromkeys([m["chair"], m["secretary"]] + (m.get("attendees") or [])) if x != u["id"]],
+                "protocol.published", "Протокол опубликован: %s" % m["title"],
+                "%s · редакция %d" % (m["code"], pr["version"]), "Совещание", m["id"],
+                dedupe_suffix="published:%d" % pr["version"])
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Протокол опубликован", "Совещание", m["id"],
+             {"code": m["code"], "version": pr["version"], "event": "MEETING_PROTOCOL_PUBLISHED"})
+    return m, msg("Протокол опубликован", "Участники оповещены")
+
+@reg("protocol.archive")
+def h_protocol_archive(db, cur, u, p):
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "approve", m)
+    pr = prot_of(m)
+    if pr["status"] not in ("Утверждён", "Опубликован"): raise RpcError("В архив переводится утверждённый протокол", "Протокол")
+    pr["status"] = "Архивный"
+    m["protocol"] = pr
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Протокол переведён в архив", "Совещание", m["id"],
+             {"code": m["code"], "version": pr["version"], "event": "MEETING_PROTOCOL_ARCHIVED"})
+    return m, msg("Протокол в архиве", "История редакций сохранена")
 
 # ---------------- Центр уведомлений и напоминаний (ТЗ M12 §8, M16 §2.11.1) ----------------
 # Единый контур доставки: уведомления хранятся на сервере (кому, тип, дата, канал, статус,
@@ -2120,6 +2353,7 @@ NOTIF_TYPES = {
     "protocol.review":    ("Протокол направлен на согласование", "meetings"),
     "protocol.approved":  ("Протокол утверждён", "meetings"),
     "protocol.rework":    ("Протокол возвращён на доработку", "meetings"),
+    "protocol.published": ("Протокол опубликован", "meetings"),
     "time.approval":      ("Трудозатраты ожидают утверждения", "time"),
     "time.result":        ("Трудозатраты рассмотрены", "time"),
     "doc.approval":       ("Документ на согласовании", "docs"),
@@ -2715,6 +2949,10 @@ def restore_backup(db, user, data, token=None):
                                 (token, user["id"], now_ms(), now_ms()))
                     conn.commit()
                 return {"relogin": not alive}
+        except RpcError as e:
+            conn.rollback()
+            LOG.warning("Восстановление БД отклонено: %s", e)
+            raise
         except Exception as e:
             conn.rollback()
             LOG.error("Восстановление БД не выполнено: %s\n%s", e, traceback.format_exc())
@@ -3120,7 +3358,7 @@ def main():
 
 # ================= Установка и настройка через EXE (ТЗ §7) =================
 CONFIG_PATH = os.path.join(BASE_DIR, "supip.ini")
-SCHEMA_VERSION = 2   # 2 — центр уведомлений и напоминаний (v1.4.0); MIGRATIONS обновляет прежние БД
+SCHEMA_VERSION = 3   # 2 — уведомления (v1.4.0), 3 — маршрут согласования протокола (v1.5.0)
 MIGRATIONS = {   # {версия: [SQL, ...]} — применяется по порядку при старте/обновлении
     2: [  # v1.4.0: центр уведомлений и напоминаний
         """CREATE TABLE IF NOT EXISTS notifications(
@@ -3135,6 +3373,9 @@ MIGRATIONS = {   # {версия: [SQL, ...]} — применяется по п
              offset_min INT NOT NULL, fire_at BIGINT NOT NULL, sent_at BIGINT, key TEXT NOT NULL UNIQUE,
              created_by TEXT, created_at BIGINT NOT NULL)""",
         "CREATE INDEX IF NOT EXISTS ix_reminders_fire ON reminders(fire_at) WHERE sent_at IS NULL",
+    ],
+    3: [  # v1.5.0: маршрут согласования и версии протокола (ТЗ M16 §2.9)
+        "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS protocol JSONB NOT NULL DEFAULT '{}'",
     ],
 }
 
