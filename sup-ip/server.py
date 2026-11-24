@@ -39,7 +39,7 @@ except ImportError:
     docgen = None
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -1529,6 +1529,217 @@ def h_meeting_delete(db, cur, u, p):
     db.audit(cur, "AUDIT", "warning", u["id"], "meetings", "Совещание удалено", "Совещание", m["id"], {"code": m["code"]})
     return True, msg("Совещание удалено", "Созданные поручения остались в M02")
 
+# ---------------- Реестр поручений и контроль исполнения (ТЗ M16 §2.11, §19.5–19.6) ----------------
+# Поручение — задача M02 (единая система задач). Реестр является представлением задач типа
+# «поручение» с производным статусом, синхронизированным со статусом задачи, и отдельным
+# контролем принятия результата руководителем: технически закрытая задача не означает,
+# что решение совещания исполнено и принято.
+
+DIRECTIVE_STATUSES = ["Не начато", "В работе", "Ожидает информации", "На проверке",
+                      "Ожидает подтверждения", "Выполнено", "Просрочено", "Приостановлено", "Отменено"]
+DIRECTIVE_ACCEPT = ("Принято", "На доработку")
+
+def dir_of(t):
+    """Реквизиты поручения из карточки задачи (для записей прежних версий — значения по умолчанию)."""
+    d = {"source": "", "criteria": "", "coassignees": [], "postedAt": None, "postedBy": None,
+         "postedDate": None, "meetingId": None, "meetingCode": "", "decisionId": None, "decisionN": None,
+         "agendaN": None, "protocolV": None, "protocolDoc": None, "dueHistory": [], "acceptance": None,
+         "docs": [], "factDate": None, "comment": ""}
+    d.update(t.get("directive") or {})
+    for k in ("coassignees", "dueHistory", "docs"):
+        if not isinstance(d.get(k), list): d[k] = []
+    return d
+
+def directive_overdue(t):
+    """Просрочка вычисляется автоматически (ТЗ §19.6): срок прошёл, работа не завершена."""
+    return (t.get("end") or "") < dISO(today()) and t["status"] not in DONE_ST + ["Отменена"]
+
+def directive_status(t):
+    """Статус поручения в реестре — производный от статуса задачи и приёмки результата (§2.11)."""
+    dr = dir_of(t)
+    acc = dr.get("acceptance") or {}
+    if t["status"] == "Отменена": return "Отменено"
+    if acc.get("verdict") == "Принято": return "Выполнено"
+    if t["status"] == "На проверке": return "На проверке"
+    if t["status"] in DONE_ST: return "Ожидает подтверждения"
+    if directive_overdue(t): return "Просрочено"
+    if t["status"] == "Приостановлена": return "Приостановлено"
+    if t["status"] == "Заблокирована": return "Ожидает информации"
+    if t["status"] in ("В работе", "Возвращена на доработку"): return "В работе"
+    return "Не начато"
+
+def directive_row(db, cur, t):
+    """Строка реестра поручений со всеми полями ТЗ §2.11."""
+    dr = dir_of(t)
+    m = db.get_ent(cur, "meeting", dr.get("meetingId")) if dr.get("meetingId") else None
+    dec = next((x for x in (m.get("decisions") or []) if x["id"] == dr.get("decisionId")), None) if m else None
+    pr = prot_of(m) if m else {}
+    return {"id": t["id"], "code": t["code"], "meetingId": dr.get("meetingId"),
+            "meetingCode": (m or {}).get("code") or dr.get("meetingCode") or "",
+            "meetingTitle": (m or {}).get("title", ""), "meetingDate": (m or {}).get("date"),
+            "protocolV": dr.get("protocolV") or pr.get("version"), "protocolStatus": pr.get("status"),
+            "decisionN": dr.get("decisionN"), "decisionText": (dec or {}).get("text", ""),
+            "agendaN": dr.get("agendaN"), "title": t["title"], "projectId": t["projectId"],
+            "assignee": t["assignee"], "coassignees": dr["coassignees"], "postedDate": dr.get("postedDate"),
+            "postedBy": dr.get("postedBy"), "due": t["end"], "status": directive_status(t),
+            "taskStatus": t["status"], "progress": 100 if t["status"] in DONE_ST else t["progress"],
+            "factDate": dr.get("factDate"), "result": t.get("result", ""), "comment": dr.get("comment", ""),
+            "criteria": dr.get("criteria", ""), "source": dr.get("source", ""), "priority": t["priority"],
+            "docs": dr["docs"], "dueHistory": dr["dueHistory"], "acceptance": dr.get("acceptance"),
+            "overdueDays": diffD(dISO(today()), t["end"]) if directive_overdue(t) else 0}
+
+def _directive_req(db, cur, u, p, op="edit"):
+    t = get_req(db, cur, "task", p["id"])
+    if t.get("type") != "directive": raise RpcError("Задача не является поручением совещания", "Поручение")
+    guard(db, cur, u, "tasks", op, t)
+    return t
+
+def _directive_notify(db, cur, t, dr, type_, title, body, extra=()):
+    m = db.get_ent(cur, "meeting", dr.get("meetingId")) if dr.get("meetingId") else None
+    rec = [t.get("assignee")] + list(dr.get("coassignees") or [])
+    if m: rec += [m.get("chair"), m.get("secretary")]
+    rec += list(extra)
+    for uid_ in dict.fromkeys([x for x in rec if x]):
+        notify(db, cur, uid_, type_, title, body, "Поручение", t["id"],
+               dedupe="%s:%s:%s:%s" % (type_, uid_, t["id"], now_ms()))
+
+@reg("directive.list")
+def h_directive_list(db, cur, u, p):
+    """Реестр поручений (ТЗ §2.11): фильтры по совещанию, исполнителю, проекту, статусу, срокам."""
+    guard(db, cur, u, "meetings", "view")
+    rows = [directive_row(db, cur, t) for t in db.all_ent(cur, "task", order="code") if t.get("type") == "directive"]
+    f = p or {}
+    if f.get("meetingId"): rows = [r for r in rows if r["meetingId"] == f["meetingId"]]
+    if f.get("projectId"): rows = [r for r in rows if r["projectId"] == f["projectId"]]
+    if f.get("assignee"): rows = [r for r in rows if r["assignee"] == f["assignee"] or f["assignee"] in r["coassignees"]]
+    if f.get("status"): rows = [r for r in rows if r["status"] == f["status"]]
+    if f.get("overdue"): rows = [r for r in rows if r["overdueDays"] > 0]
+    if f.get("from"): rows = [r for r in rows if (r["due"] or "") >= f["from"]]
+    if f.get("to"): rows = [r for r in rows if (r["due"] or "") <= f["to"]]
+    if f.get("q"):
+        q = f["q"].lower()
+        rows = [r for r in rows if q in (r["title"] + " " + r["decisionText"] + " " + r["code"]).lower()]
+    return {"rows": rows, "total": len(rows),
+            "byStatus": {s: sum(1 for r in rows if r["status"] == s) for s in DIRECTIVE_STATUSES}}, None
+
+@reg("directive.update")
+def h_directive_update(db, cur, u, p):
+    """Карточка поручения: соисполнители, критерии, комментарий, результат, дата фактического исполнения."""
+    t = _directive_req(db, cur, u, p)
+    dr = dir_of(t)
+    if "coassignees" in p:
+        co = []
+        for uid_ in (p.get("coassignees") or [])[:10]:
+            if uid_ == t["assignee"] or uid_ in co: continue
+            cur.execute("SELECT id FROM users WHERE id=%s AND NOT blocked", (uid_,))
+            if not cur.fetchone(): raise RpcError("Соисполнитель не найден: %s" % uid_, "Поручение")
+            co.append(uid_)
+        dr["coassignees"] = co
+    if "criteria" in p: dr["criteria"] = (p["criteria"] or "")[:2000]
+    if "comment" in p: dr["comment"] = (p["comment"] or "")[:2000]
+    if "result" in p: t["result"] = (p["result"] or "")[:4000]
+    if "factDate" in p:
+        fd = p["factDate"] or None
+        if fd:
+            check_date(fd, "дата фактического исполнения")
+            if fd > dISO(today()): raise RpcError("Дата фактического исполнения не может быть в будущем", "Поручение")
+        dr["factDate"] = fd
+    if "progress" in p:
+        v = int(p["progress"])
+        if not 0 <= v <= 100: raise RpcError("Процент выполнения: 0…100", "Поручение")
+        t["progress"] = v
+    t["directive"] = dr
+    db.save_ent(cur, "task", t)
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Карточка поручения изменена", "Поручение", t["id"],
+             {"code": t["code"], "status": directive_status(t), "event": "MEETING_DIRECTIVE_UPDATED"})
+    return directive_row(db, cur, t), msg("Поручение обновлено", "Реестр M16 и карточка задачи M02 синхронизированы")
+
+@reg("directive.extend")
+def h_directive_extend(db, cur, u, p):
+    """Продление срока: фиксируется в истории с инициатором и основанием (ТЗ §19.6)."""
+    t = _directive_req(db, cur, u, p)
+    dr = dir_of(t)
+    req(p, "due", "reason"); check_date(p["due"], "дата нового срока")
+    reason = (p["reason"] or "").strip()
+    if not reason: raise RpcError("Основание продления обязательно", "Поручение")
+    if p["due"] <= t["end"]: raise RpcError("Новый срок должен быть позже текущего (%s)" % _fd(t["end"]), "Поручение")
+    if t["status"] in DONE_ST + ["Отменена"]: raise RpcError("Срок завершённого поручения не продлевается", "Поручение")
+    old = t["end"]
+    dr["dueHistory"].append({"ts": now_ms(), "by": u["id"], "from": old, "to": p["due"], "reason": reason[:1000]})
+    t["end"] = p["due"]; t["directive"] = dr
+    db.save_ent(cur, "task", t)
+    _directive_notify(db, cur, t, dr, "directive.extended", "Срок поручения продлён: %s" % t["title"],
+                      "%s · %s → %s · %s" % (t["code"], _fd(old), _fd(p["due"]), reason[:150]))
+    db.audit(cur, "BUSINESS", "warning", u["id"], "meetings", "Срок поручения продлён", "Поручение", t["id"],
+             {"code": t["code"], "from": old, "to": p["due"], "reason": reason[:300], "event": "MEETING_DIRECTIVE_EXTENDED"})
+    return directive_row(db, cur, t), msg("Срок продлён до %s" % _fd(p["due"]), "Продление зафиксировано в истории с основанием")
+
+@reg("directive.accept")
+def h_directive_accept(db, cur, u, p):
+    """Отдельный контроль результата: принятие исполнения решения руководителем (ТЗ §2.11)."""
+    t = get_req(db, cur, "task", p["id"])
+    if t.get("type") != "directive": raise RpcError("Задача не является поручением совещания", "Поручение")
+    guard(db, cur, u, "meetings", "approve", t)
+    dr = dir_of(t)
+    verdict = p.get("verdict")
+    if verdict not in DIRECTIVE_ACCEPT: raise RpcError("Укажите результат приёмки: Принято или На доработку", "Поручение")
+    comment = (p.get("comment") or "").strip()[:2000]
+    if verdict == "На доработку" and not comment:
+        raise RpcError("Возврат на доработку требует комментария", "Поручение")
+    if t["status"] not in ("На проверке",) + tuple(DONE_ST) and verdict == "Принято":
+        raise RpcError("Принять можно поручение, переданное на проверку (статус задачи «%s»)" % t["status"], "Поручение")
+    dr["acceptance"] = {"verdict": verdict, "by": u["id"], "ts": now_ms(), "comment": comment}
+    if verdict == "Принято":
+        if not dr.get("factDate"): dr["factDate"] = dISO(today())
+        apply_task_status(t, "Закрыта")
+        t["result"] = t.get("result") or comment
+        ev, tone = "MEETING_DIRECTIVE_ACCEPTED", "ok"
+        title = "Поручение принято: %s" % t["title"]
+        sub = "%s · решение совещания исполнено и принято" % t["code"]
+        ntype = "directive.accepted"
+    else:
+        apply_task_status(t, "Возвращена на доработку")
+        dr["factDate"] = None
+        ev, tone = "MEETING_DIRECTIVE_REWORK", "warn"
+        title = "Поручение возвращено на доработку: %s" % t["title"]
+        sub = "%s · %s" % (t["code"], comment[:150])
+        ntype = "directive.rework"
+    t["directive"] = dr
+    db.save_ent(cur, "task", t)
+    _directive_notify(db, cur, t, dr, ntype, title, sub)
+    db.audit(cur, "BUSINESS", "info" if verdict == "Принято" else "warning", u["id"], "meetings",
+             "Приёмка результата поручения: " + verdict, "Поручение", t["id"],
+             {"code": t["code"], "verdict": verdict, "comment": comment, "event": ev})
+    return directive_row(db, cur, t), msg("Результат поручения: " + verdict, sub, tone)
+
+@reg("directive.attach")
+def h_directive_attach(db, cur, u, p):
+    """Документы, подтверждающие выполнение поручения (связь с M09, без копирования данных)."""
+    t = _directive_req(db, cur, u, p)
+    dr = dir_of(t)
+    d = get_req(db, cur, "doc", p["docId"]); guard(db, cur, u, "docs", "view", d)
+    if any(x["docId"] == d["id"] for x in dr["docs"]): raise RpcError("Документ уже приложен к поручению", "Поручение")
+    if len(dr["docs"]) >= 20: raise RpcError("Не более 20 подтверждающих документов", "Поручение")
+    v = max([x["v"] for x in (d.get("versions") or [])] or [0])
+    dr["docs"].append({"docId": d["id"], "code": d["code"], "title": d["title"], "v": v, "ts": now_ms(), "by": u["id"]})
+    t["directive"] = dr
+    db.save_ent(cur, "task", t)
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "К поручению приложен подтверждающий документ", "Поручение", t["id"],
+             {"code": t["code"], "doc": d["code"], "event": "MEETING_DIRECTIVE_DOC_ATTACHED"})
+    return directive_row(db, cur, t), msg("Документ приложен", d["code"] + " · " + d["title"])
+
+@reg("directive.detach")
+def h_directive_detach(db, cur, u, p):
+    t = _directive_req(db, cur, u, p)
+    dr = dir_of(t)
+    n = len(dr["docs"])
+    dr["docs"] = [x for x in dr["docs"] if x["docId"] != p.get("docId")]
+    if len(dr["docs"]) == n: raise RpcError("Документ не найден среди приложенных", "Поручение")
+    t["directive"] = dr
+    db.save_ent(cur, "task", t)
+    db.audit(cur, "AUDIT", "warning", u["id"], "meetings", "Подтверждающий документ откреплён от поручения", "Поручение", t["id"],
+             {"code": t["code"], "doc": p.get("docId")})
+    return directive_row(db, cur, t), msg("Документ откреплён", "Сам документ остался в M09")
 # ---------------- M13: отчёты ----------------
 @reg("report.save")
 def h_report_save(db, cur, u, p):
@@ -2511,6 +2722,9 @@ NOTIF_TYPES = {
     "directive.due":      ("Приближается срок поручения", "meetings"),
     "directive.overdue":  ("Поручение просрочено", "meetings"),
     "directive.stale":    ("Поручение без обновления состояния", "meetings"),
+    "directive.extended": ("Срок поручения продлён", "meetings"),
+    "directive.accepted": ("Результат поручения принят", "meetings"),
+    "directive.rework":   ("Поручение возвращено на доработку", "meetings"),
     "meeting.reminder":   ("Напоминание о совещании", "calendar"),
     "event.reminder":     ("Напоминание о событии календаря", "calendar"),
     "meeting.invite":     ("Приглашение на совещание", "meetings"),
