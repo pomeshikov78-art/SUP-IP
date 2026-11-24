@@ -992,7 +992,7 @@ function renderShell(){
  $('#app').innerHTML=
  '<div class="shell">'+
   '<aside class="sidebar">'+
-   '<div class="logo"><span class="mark">СУП</span><b>СУП-ИП<small>управление проектами · v1.0</small></b></div>'+
+   '<div class="logo"><span class="mark">СУП</span><b>СУП-ИП<small>управление проектами · v'+esc(SERVER.version)+'</small></b></div>'+
    '<nav class="nav">'+navHTML+'</nav>'+
    '<div class="side-foot">'+
     '<button onclick="App.about()">'+ic('info')+'<span class="txt">О системе и принципы</span></button>'+
@@ -1118,7 +1118,7 @@ App.about=function(){
   '<h4 style="margin:16px 0 8px">Демонстрационные сценарии (нажмите, чтобы перейти)</h4>'+
   scenarios.map((s,i)=>'<div class="scenario" onclick="App.closeModal(true);nav(\''+s[2]+'\')"><span class="sn">'+(i+1)+'</span><div><b>'+s[0]+'</b><p>'+s[1]+'</p></div>'+ic('chevR')+'</div>').join('')+
  '</div>'+
- '<div class="mf"><span class="left">СУП-ИП · v1.0 · '+DB.users.length+' пользователей · '+DB.projects.length+' проектов · '+DB.tasks.length+' задач</span><button class="btn pri" onclick="App.closeModal(true)">Понятно</button></div>', {wide:true});
+ '<div class="mf"><span class="left">СУП-ИП · v'+esc(SERVER.version)+' · '+DB.users.length+' пользователей · '+DB.projects.length+' проектов · '+DB.tasks.length+' задач</span><button class="btn pri" onclick="App.closeModal(true)">Понятно</button></div>', {wide:true});
 };
 
 /* ---------- Сквозной контроль отклонений (M07) ---------- */

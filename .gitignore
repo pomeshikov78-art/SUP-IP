@@ -1,0 +1,15 @@
+# runtime-данные сервера (БД-файлы, бэкапы)
+sup-ip/data/
+data/
+# сборки и кеши
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+node_modules/
+.venv/
+# секреты
+*.pem
+*.key
+supip.ini

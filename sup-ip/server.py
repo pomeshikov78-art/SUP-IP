@@ -19,7 +19,7 @@ except ImportError:
     print("Требуется psycopg2:  python -m pip install psycopg2-binary"); sys.exit(1)
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
