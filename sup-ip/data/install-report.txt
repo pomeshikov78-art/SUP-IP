@@ -1,0 +1,19 @@
+СУП-ИП v1.0.1 — отчёт об установке (24.11.2026 16:52:53)
+
+ОС: Linux (режим разработки; целевая платформа — Windows 10/11 x64)
+Свободно на диске: 8.6 ГБ — достаточно
+Роль PostgreSQL «supip» создана
+База данных «supip» создана
+Схема БД создана/проверена (версия 1)
+Демо-данные: создан эталонный набор
+Учётная запись администратора: admin / demo (смените после входа!)
+Файловое хранилище: /tmp/arena/tenants/71ebd7cc-b365-41c5-863c-79f587b1df1f/sessions/962ceb5f-3fc4-58bc-b0b9-422bad7d7f2f/workspace/sup-ip/data/files
+HTTPS: отключён мастером (включите: --cert/--key или supip.ini)
+Конфигурация сохранена: /tmp/arena/tenants/71ebd7cc-b365-41c5-863c-79f587b1df1f/sessions/962ceb5f-3fc4-58bc-b0b9-422bad7d7f2f/workspace/sup-ip/supip.ini
+Служба Windows: пропущено (не Windows); используйте systemd/run.sh
+Проверка БД: соединение OK
+Проверка порта 8000: свободен
+
+ГОТОВО. Запуск: python3 server.py
+Клиенты в ЛВС: http://<IP-этого-ПК>:8000
+Вход: admin / demo
