@@ -127,13 +127,19 @@ jobs:
         with:
           name: SUP-IP-exe
           path: sup-ip/dist
-      - name: Офлайн-пакет PostgreSQL (опционально)
-        if: github.event_name == 'workflow_dispatch' && inputs.bundle_postgres
+      - name: Офлайн-пакет PostgreSQL (для полного установщика)
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.bundle_postgres)
         run: |
-          curl -L -o sup-ip/installer/postgresql-setup.exe \
+          curl -L --retry 3 --connect-timeout 30 -o sup-ip/installer/postgresql-setup.exe \
             https://get.enterprisedb.com/postgresql/postgresql-16.4-1-windows-x64.exe
           ls -lh sup-ip/installer/postgresql-setup.exe
-      - name: Сборка установщика
+      - name: Сборка полного установщика (PostgreSQL внутри, без интернета)
+        if: hashFiles('sup-ip/installer/postgresql-setup.exe') != ''
+        working-directory: sup-ip
+        run: |
+          makensis -V2 -DVERSION=${{ steps.ver.outputs.version }} installer/setup.nsi
+          rm -f installer/postgresql-setup.exe
+      - name: Сборка компактного установщика
         working-directory: sup-ip
         run: |
           makensis -V2 -DVERSION=${{ steps.ver.outputs.version }} installer/setup.nsi
@@ -147,7 +153,11 @@ jobs:
           EOF
       - name: Стабильные имена файлов для постоянных ссылок
         working-directory: sup-ip
-        run: cp "dist/SUP-IP-Setup-${{ steps.ver.outputs.version }}.exe" dist/SUP-IP-Setup.exe
+        run: |
+          cp "dist/SUP-IP-Setup-${{ steps.ver.outputs.version }}.exe" dist/SUP-IP-Setup.exe
+          if [ -f "dist/SUP-IP-Setup-full-${{ steps.ver.outputs.version }}.exe" ]; then
+            cp "dist/SUP-IP-Setup-full-${{ steps.ver.outputs.version }}.exe" dist/SUP-IP-Setup-full.exe
+          fi
       - name: Артефакты поставки
         uses: actions/upload-artifact@v4
         with:
@@ -162,6 +172,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           v=${{ steps.ver.outputs.version }}
-          gh release create "v$v" --title "СУП-ИП v$v" --notes-file CHANGELOG.md \
-            "sup-ip/dist/SUP-IP.exe" "sup-ip/dist/SUP-IP-Setup-$v.exe" "sup-ip/dist/SUP-IP-Setup.exe" "SUP-IP_server.zip" \
-          || gh release upload "v$v" "sup-ip/dist/SUP-IP.exe" "sup-ip/dist/SUP-IP-Setup-$v.exe" "sup-ip/dist/SUP-IP-Setup.exe" "SUP-IP_server.zip" --clobber
+          files=("sup-ip/dist/SUP-IP.exe" "sup-ip/dist/SUP-IP-Setup-$v.exe" "sup-ip/dist/SUP-IP-Setup.exe" "SUP-IP_server.zip")
+          if [ -f "sup-ip/dist/SUP-IP-Setup-full-$v.exe" ]; then
+            files+=("sup-ip/dist/SUP-IP-Setup-full-$v.exe" "sup-ip/dist/SUP-IP-Setup-full.exe")
+          fi
+          gh release create "v$v" --title "СУП-ИП v$v" --notes-file CHANGELOG.md "${files[@]}" \
+          || gh release upload "v$v" "${files[@]}" --clobber

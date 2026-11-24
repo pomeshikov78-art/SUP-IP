@@ -46,8 +46,10 @@ def main():
     zp = os.path.join(ROOT, "SUP-IP_server.zip")
     with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
         for root, dirs, files in os.walk(os.path.join(ROOT, "sup-ip")):
-            dirs[:] = [d for d in dirs if d not in ("data", "__pycache__")]
+            dirs[:] = [d for d in dirs if d not in ("data", "__pycache__", "dist", "build", "node_modules")]
             for f in files:
+                if f == "postgresql-setup.exe":   # офлайн-пакет СУБД (~350 МБ) — только в Release
+                    continue
                 fp = os.path.join(root, f)
                 z.write(fp, os.path.relpath(fp, ROOT))
 
