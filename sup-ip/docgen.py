@@ -47,6 +47,7 @@ class Document:
         self.blocks = []
         self.created = datetime.datetime.now()
         self.toc = False
+        self.page_numbers = True   # нумерация страниц «Стр. N из M» (блок шаблона MTG-10)
 
     # --- конструкторы блоков (цепочка вызовов) ---
     def h1(self, text): self.blocks.append({"t": "h1", "text": _s(text)}); return self
@@ -271,8 +272,10 @@ def docx(d: Document) -> bytes:
     footer = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
               '<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
               '<w:p><w:pPr><w:jc w:val="center"/></w:pPr>'
-              + _runs("%s · сформировано %s · стр. " % (d.footer or d.org, stamp), size=8, color="77808C")
-              + _field("PAGE", "1") + _runs(" из ", size=8, color="77808C") + _field("NUMPAGES", "1")
+              + _runs("%s · сформировано %s%s" % (d.footer or d.org, stamp, " · стр. " if d.page_numbers else ""),
+                      size=8, color="77808C")
+              + (_field("PAGE", "1") + _runs(" из ", size=8, color="77808C") + _field("NUMPAGES", "1")
+                 if d.page_numbers else "")
               + '</w:p></w:ftr>')
     core = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
@@ -972,10 +975,11 @@ class PDFWriter:
                 "BT /F1 7.5 Tf 0.45 0.48 0.52 rg 1 0 0 1 %.2f %.2f Tm <%s> Tj ET"
                 % (self.M, self.M + 5, self.reg.hexstr(foot)),
             ]
-            pn = "Стр. %d из %d" % (i, total)
-            tw = self.reg.text_width(pn, 7.5)
-            content.append("BT /F1 7.5 Tf 0.45 0.48 0.52 rg 1 0 0 1 %.2f %.2f Tm <%s> Tj ET"
-                           % (self.W - self.M - tw, self.M + 5, self.reg.hexstr(pn)))
+            if self.d.page_numbers:
+                pn = "Стр. %d из %d" % (i, total)
+                tw = self.reg.text_width(pn, 7.5)
+                content.append("BT /F1 7.5 Tf 0.45 0.48 0.52 rg 1 0 0 1 %.2f %.2f Tm <%s> Tj ET"
+                               % (self.W - self.M - tw, self.M + 5, self.reg.hexstr(pn)))
             data = zlib.compress("\n".join(content).encode("latin-1"), 9)
             cid = add(b"<< /Length %d /Filter /FlateDecode >>\nstream\n" % len(data) + data + b"\nendstream")
             pid = add("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %.2f %.2f] /Resources "

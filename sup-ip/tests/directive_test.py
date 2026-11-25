@@ -248,7 +248,7 @@ def main():
     check("сервер работает на PostgreSQL", j.get("db") == "PostgreSQL", j)
     c, backup = adm.req("GET", "/api/backup", raw=True)
     backup = json.loads(backup)
-    check("копия содержит 16 таблиц", len(backup["tables"]) == 16, len(backup["tables"]))
+    check("копия содержит 17 таблиц", len(backup["tables"]) == 17, len(backup["tables"]))
     check("копия содержит связи решений с поручениями", "meeting_tasks" in backup["tables"] and len(backup["tables"]["meeting_tasks"]) >= 3)
     check("копия хранит блок поручения в задачах", any("directive" in r for r in backup["tables"]["tasks"]))
     c, j = adm.req("POST", "/api/restore", backup)

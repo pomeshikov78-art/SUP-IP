@@ -92,6 +92,11 @@ jobs:
       - name: Испытания участников совещания (ТЗ §2.7, MTG-05)
         working-directory: sup-ip
         run: python tests/participants_test.py --base http://127.0.0.1:8000
+      - name: Испытания протокола и библиотеки шаблонов (ТЗ §2.8, MTG-09/MTG-10)
+        working-directory: sup-ip
+        run: python tests/templates_test.py --base http://127.0.0.1:8000
+      - name: Формирование эксплуатационных руководств (DOCX/DOC)
+        run: python tools/make_docs.py
       - name: Испытания установки, запуска и журналов (со сборкой сценария NSIS)
         working-directory: sup-ip
         run: |
@@ -187,6 +192,10 @@ jobs:
           if [ -f "dist/SUP-IP-Setup-full-${{ steps.ver.outputs.version }}.exe" ]; then
             cp "dist/SUP-IP-Setup-full-${{ steps.ver.outputs.version }}.exe" dist/SUP-IP-Setup-full.exe
           fi
+      - name: Эксплуатационные руководства (DOCX/DOC)
+        run: |
+          python3 tools/make_docs.py
+          ls -lh docs
       - name: Артефакты поставки
         uses: actions/upload-artifact@v4
         with:
@@ -194,6 +203,8 @@ jobs:
           path: |
             sup-ip/dist/SUP-IP.exe
             sup-ip/dist/SUP-IP-Setup-*.exe
+            docs/*.docx
+            docs/*.doc
           if-no-files-found: error
       - name: Публикация Release (по тегу версии)
         if: startsWith(github.ref, 'refs/tags/v')
@@ -202,6 +213,7 @@ jobs:
         run: |
           v=${{ steps.ver.outputs.version }}
           files=("sup-ip/dist/SUP-IP.exe" "sup-ip/dist/SUP-IP-Setup-$v.exe" "sup-ip/dist/SUP-IP-Setup.exe" "SUP-IP_server.zip")
+          for f in docs/*.docx docs/*.doc; do [ -f "$f" ] && files+=("$f"); done
           if [ -f "sup-ip/dist/SUP-IP-Setup-full-$v.exe" ]; then
             files+=("sup-ip/dist/SUP-IP-Setup-full-$v.exe" "sup-ip/dist/SUP-IP-Setup-full.exe")
           fi

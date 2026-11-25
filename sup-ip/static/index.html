@@ -2867,6 +2867,7 @@ Views.meetings=function(){
  if(f.tab==='canc')rows=rows.filter(m=>m.status===MEET_CANC);
  if(f.tab==='series')rows=rows.filter(m=>recOf(m).seriesId);
  if(['dir','over','ctl','rep'].includes(f.tab))return meetingsDirectives(f);
+ if(f.tab==='tpl')return meetingsTemplates(f);
  if(f.st)rows=rows.filter(m=>m.status===f.st);
  if(f.pj)rows=rows.filter(m=>mprjOf(m).includes(f.pj));
  rows.sort((a,b)=>f.tab==='past'?(a.date>b.date?-1:1):(a.date<b.date?-1:1));
@@ -2879,7 +2880,7 @@ Views.meetings=function(){
   kpiHTML(dirs.length,'Поручений активно','создано из решений','tasks','info',"nav('control')")+
   kpiHTML(dirs.filter(taskOverdue).length,'Поручений просрочено','требуют эскалации','alert',dirs.filter(taskOverdue).length?'err':'ok',"nav('control')")+
  '</div>'+
- '<div class="tabs"><button class="'+(f.tab==='next'?'on':'')+'" onclick="App.f.mt.tab=\'next\';renderView()">Предстоящие и текущие</button><button class="'+(f.tab==='past'?'on':'')+'" onclick="App.f.mt.tab=\'past\';renderView()">Проведённые</button><button class="'+(f.tab==='prot'?'on':'')+'" onclick="App.f.mt.tab=\'prot\';renderView()">Протоколы</button><button class="'+(f.tab==='dir'?'on':'')+'" onclick="App.f.mt.tab=\'dir\';renderView()">Поручения</button><button class="'+(f.tab==='over'?'on':'')+'" onclick="App.f.mt.tab=\'over\';renderView()">Просроченные поручения</button><button onclick="App.f.mt.tab=\'ctl\';renderView()">Контроль сроков</button><button onclick="App.f.mt.tab=\'rep\';renderView()">Отчётность</button>'+ '<button class="'+(f.tab==='series'?'on':'')+'" id="mt-tab-series" onclick="App.f.mt.tab=\'series\';renderView()">Регулярные</button><button class="'+(f.tab==='canc'?'on':'')+'" id="mt-tab-canc" onclick="App.f.mt.tab=\'canc\';renderView()">Отменённые</button>' +'<button class="'+(f.tab==='all'?'on':'')+'" onclick="App.f.mt.tab=\'all\';renderView()">Все</button></div>'+
+ '<div class="tabs"><button class="'+(f.tab==='next'?'on':'')+'" onclick="App.f.mt.tab=\'next\';renderView()">Предстоящие и текущие</button><button class="'+(f.tab==='past'?'on':'')+'" onclick="App.f.mt.tab=\'past\';renderView()">Проведённые</button><button class="'+(f.tab==='prot'?'on':'')+'" onclick="App.f.mt.tab=\'prot\';renderView()">Протоколы</button><button class="'+(f.tab==='dir'?'on':'')+'" onclick="App.f.mt.tab=\'dir\';renderView()">Поручения</button><button class="'+(f.tab==='over'?'on':'')+'" onclick="App.f.mt.tab=\'over\';renderView()">Просроченные поручения</button><button onclick="App.f.mt.tab=\'ctl\';renderView()">Контроль сроков</button><button onclick="App.f.mt.tab=\'rep\';renderView()">Отчётность</button>'+ '<button class="'+(f.tab==='series'?'on':'')+'" id="mt-tab-series" onclick="App.f.mt.tab=\'series\';renderView()">Регулярные</button><button class="'+(f.tab==='canc'?'on':'')+'" id="mt-tab-canc" onclick="App.f.mt.tab=\'canc\';renderView()">Отменённые</button>' +'<button class="'+(f.tab==='tpl'?'on':'')+'" id="mt-tab-tpl" onclick="App.f.mt.tab=\'tpl\';renderView()">Шаблоны протокола</button><button class="'+(f.tab==='all'?'on':'')+'" onclick="App.f.mt.tab=\'all\';renderView()">Все</button></div>'+
  '<div class="flexw mb8">'+
   sel('mtf-status',[['','Все статусы'],['Запланировано','Запланировано'],['Проведено','Проведено'],['Протокол утверждён','Протокол утверждён'],[MEET_CANC,MEET_CANC]],f.st||'','onchange="App.f.mt.st=this.value;renderView()"')+
   sel('mtf-proj',[['','Все проекты'],...DB.projects.map(p=>[p.id,p.code+' · '+p.name.slice(0,30)])],f.pj||'','onchange="App.f.mt.pj=this.value;renderView()"')+
@@ -3487,6 +3488,358 @@ App.protVersion=function(mid,v){
   '<button class="btn" onclick="App.docDownload(\''+x.docId+'\','+x.docV+')">'+ic('download')+' DOCX</button>'+
   '<button class="btn pri" onclick="App.protFile(\''+x.docId+'\','+x.docV+',\'pdf\')">'+ic('download')+' PDF</button></div>');
 };
+/* ---- M16 §2.8: библиотека шаблонов протокола (MTG-10) и редактор протокола (MTG-09) ---- */
+const TPL_BLOCK_LABEL={title:'Текстовый заголовок',requisites:'Реквизиты совещания',participants:'Таблица участников',
+ agenda:'Список вопросов повестки',discussion:'Блок обсуждения',decisions:'Блок решения',tasks:'Таблица поручений',
+ attachments:'Приложения',signatures:'Подписи',text:'Текстовый блок',header:'Верхний колонтитул',
+ footer:'Нижний колонтитул',numbering:'Нумерация страниц'};
+const TPL_BLOCK_KEYS=Object.keys(TPL_BLOCK_LABEL);
+const TPL_REQUIRED=['requisites','participants','agenda','decisions','signatures'];
+const TPL_SINGLE=['title','header','footer','numbering'];
+const TPL_DATA_KEYS=['requisites','participants','agenda','discussion','decisions','tasks','attachments','signatures'];
+const TPL_KINDS=['Рабочее совещание','Техническое совещание','Оперативное совещание','Совещание по проекту',
+ 'Научно-техническое совещание','Контроль исполнения поручений','Пользовательский'];
+const TPL_VARS=['meeting.number','meeting.date','meeting.title','meeting.location','meeting.chairperson',
+ 'meeting.secretary','meeting.organizer','meeting.participants','meeting.agenda','meeting.decisions',
+ 'meeting.assignments','meeting.attachments','protocol.number','protocol.date','organization'];
+const MEET_TYPES=['Оперативное','Техническое','Приёмочное','Совещание с заказчиком'];
+const PROT_FORMATS=['Очное','Дистанционное','Смешанное'];
+const tplBadge=s=>badge(s,s==='Действует'?'#16a34a':'#475569',s==='Действует'?'#dcfce7':'#e2e8f0');
+function TEMPLS(){ return DB.templates||[]; }
+function TPL(id){ return TEMPLS().find(t=>t.id===id)||null; }
+function tplBaseBlocks(){
+ return [{type:'title',title:'Протокол совещания',text:'Протокол № {{protocol.number}} от {{protocol.date}}'},
+  {type:'requisites',title:'1. Общие сведения',text:''},{type:'participants',title:'2. Присутствовали',text:''},
+  {type:'agenda',title:'3. Повестка дня',text:''},{type:'discussion',title:'4. Рассмотрение вопросов',text:''},
+  {type:'decisions',title:'5. Принятые решения',text:''},{type:'tasks',title:'6. Контроль исполнения',text:''},
+  {type:'signatures',title:'7. Подписи',text:''},{type:'attachments',title:'8. Приложения',text:''},
+  {type:'footer',title:'Нижний колонтитул',text:'{{organization}} · протокол № {{protocol.number}}'},
+  {type:'numbering',title:'Нумерация страниц',text:''}].map(b=>Object.assign({id:'',options:{}},b));
+}
+/* --- MTG-10: каталог шаблонов --- */
+function meetingsTemplates(f){
+ const rows=TEMPLS().filter(t=>(!f.tplSt||t.status===f.tplSt)&&(!f.tplKind||t.kind===f.tplKind));
+ const adm=can('admin','edit');
+ return '<div class="page-head"><div><h2>Шаблоны протокола</h2><div class="desc">Библиотека шаблонов протокола совещания (ТЗ §2.8.1, экран MTG-10): шесть базовых шаблонов и пользовательские. Шаблон задаёт состав, наименования и порядок разделов, колонтитулы и нумерацию страниц; переменные meeting.* подставляют данные совещания. Изменение шаблона не изменяет ранее выпущенные протоколы.</div></div>'+
+ '<div class="acts">'+(adm?'<button class="btn pri" id="tpl-new" onclick="App.tplNew()">'+ic('plus')+' Новый шаблон</button>':'')+'</div></div>'+
+ '<div class="grid g4 mb14">'+
+  kpiHTML(TEMPLS().length,'Шаблонов в библиотеке','включая архивные','file','acc',"App.f.mt.tplSt='';renderView()")+
+  kpiHTML(TEMPLS().filter(t=>t.status==='Действует').length,'Действующих','доступны для выбора','check','ok',"App.f.mt.tplSt='Действует';renderView()")+
+  kpiHTML(TEMPLS().filter(t=>t.status==='Архивный').length,'В архиве','не применяются','folder','info',"App.f.mt.tplSt='Архивный';renderView()")+
+  kpiHTML((TEMPLS().find(t=>t.isDefault)||{}).code||'—','По умолчанию','применяется без выбора','save','info',"App.f.mt.tplSt='';renderView()")+
+ '</div>'+
+ '<div class="flexw mb8">'+
+  sel('tplf-status',[['','Все статусы'],['Действует','Действует'],['Архивный','Архивный']],f.tplSt||'','onchange="App.f.mt.tplSt=this.value;renderView()"')+
+  sel('tplf-kind',[['','Все виды шаблонов'],...TPL_KINDS.map(k=>[k,k])],f.tplKind||'','onchange="App.f.mt.tplKind=this.value;renderView()"')+
+  '<span class="spacer"></span><button class="btn sm" onclick="App.f.mt.tplSt=\'\';App.f.mt.tplKind=\'\';renderView()">'+ic('refresh')+' Сбросить</button>'+
+ '</div>'+
+ '<div class="card" id="tpl-catalog"><div class="ch">'+ic('file')+'Каталог шаблонов<span class="r small mut">версия, автор, дата изменения, признак «по умолчанию»</span></div><div class="cb">'+
+ (rows.length?'<div class="tbl-wrap"><table class="tbl" id="tpl-table"><thead><tr><th>Код</th><th>Наименование</th><th>Вид шаблона</th><th>Виды совещаний</th><th>Версия</th><th>Блоков</th><th>Автор</th><th>Изменён</th><th>Статус</th><th>По умолчанию</th><th>Действия</th></tr></thead><tbody>'+
+  rows.map(t=>'<tr id="tpl-row-'+t.id+'" class="nohover"><td class="b nowrap">'+esc(t.code)+'</td><td><b>'+esc(t.name)+'</b>'+(t.note?'<div class="small mut">'+esc(t.note)+'</div>':'')+'</td>'+
+   '<td class="small">'+esc(t.kind)+'</td><td class="small">'+esc((t.meetTypes||[]).join(', ')||'любой')+'</td>'+
+   '<td class="num">'+t.version+(t.versionsCount?' <span class="chip">история '+t.versionsCount+'</span>':'')+'</td>'+
+   '<td class="num">'+t.blocksCount+'</td><td class="small">'+esc(U(t.author).name)+'</td>'+
+   '<td class="small nowrap">'+fmtDT(t.updatedAt)+'</td><td>'+tplBadge(t.status)+'</td>'+
+   '<td>'+(t.isDefault?badge('по умолчанию','#7c3aed','#ede9fe'):'<span class="small mut">—</span>')+'</td>'+
+   '<td><div class="flexw">'+
+    '<button class="btn sm tpl-view" title="Предпросмотр" onclick="App.tplPreview(\''+t.id+'\')">'+ic('eye')+'</button>'+
+    (adm?'<button class="btn sm tpl-edit" title="Конструктор шаблона" onclick="App.tplEdit(\''+t.id+'\')">'+ic('edit')+'</button>':'')+
+    (adm?'<button class="btn sm tpl-copy" title="Копировать" onclick="App.tplCopy(\''+t.id+'\')">'+ic('plus')+'</button>':'')+
+    (adm&&!t.isDefault&&t.status==='Действует'?'<button class="btn sm tpl-default" title="Сделать шаблоном по умолчанию" onclick="App.tplDefault(\''+t.id+'\')">'+ic('check')+'</button>':'')+
+    (adm&&t.versionsCount?'<button class="btn sm tpl-rollback" title="Восстановить версию" onclick="App.tplRollback(\''+t.id+'\')">'+ic('refresh')+'</button>':'')+
+    (adm&&t.status==='Действует'&&!t.isDefault?'<button class="btn sm danger tpl-archive" title="В архив" onclick="App.tplArchive(\''+t.id+'\')">'+ic('folder')+'</button>':'')+
+    (adm&&t.status==='Архивный'?'<button class="btn sm ok tpl-restore" title="Восстановить из архива" onclick="App.tplRestore(\''+t.id+'\')">'+ic('check')+'</button>':'')+
+   '</div></td></tr>').join('')+
+  '</tbody></table></div>':emptyBlock('Шаблонов не найдено','Измените фильтр или создайте шаблон','file'))+
+ '</div></div>'+
+ '<div class="help-note mt14">'+ic('info')+'<div>Типы блоков (MTG-10 §13.4): текстовый заголовок, реквизиты совещания, таблица участников, список вопросов повестки, блок обсуждения, блок решения, таблица поручений, приложения, подписи, колонтитулы, нумерация страниц. Переменные (§13.5): '+TPL_VARS.map(v=>'{{'+v+'}}').join(', ')+'.</div></div>';
+}
+App.tplNew=function(){
+ if(!guard('admin','edit'))return;
+ App._tc={id:null,name:'',kind:'Пользовательский',org:'Инженерное подразделение',note:'',meetTypes:[],blocks:tplBaseBlocks()};
+ App.tplDraw();
+};
+App.tplEdit=function(id){
+ if(!guard('admin','edit'))return;
+ rpc('template.get',{id:id}).then(t=>{
+  if(!t)return;
+  App._tc={id:t.id,name:t.name,kind:t.kind,org:t.org||'',note:t.note||'',meetTypes:(t.meetTypes||[]).slice(),
+   blocks:JSON.parse(JSON.stringify(t.blocks||[])),version:t.version,code:t.code};
+  App.tplDraw();
+ });
+};
+App.tplSync=function(){
+ const c=App._tc; if(!c)return;
+ c.name=val('tc-name'); c.kind=val('tc-kind'); c.org=val('tc-org'); c.note=val('tc-note');
+ c.meetTypes=[...document.querySelectorAll('.tc-mt:checked')].map(x=>x.value);
+ c.blocks.forEach((b,i)=>{
+  const t=document.getElementById('tc-bt-'+i), n=document.getElementById('tc-bn-'+i), x=document.getElementById('tc-bx-'+i);
+  if(t)b.type=t.value; if(n)b.title=n.value; if(x)b.text=x.value;
+ });
+};
+App.tplDraw=function(){
+ const c=App._tc; if(!c)return;
+ const blocks='<div id="tc-blocks">'+c.blocks.map((b,i)=>
+  '<div class="card mb8 tc-block" id="tc-block-'+i+'"><div class="cb">'+
+   '<div class="row3">'+field('Тип блока',sel('tc-bt-'+i,TPL_BLOCK_KEYS.map(k=>[k,TPL_BLOCK_LABEL[k]]),b.type,'class="tc-b-type"'),true)+
+    field('Наименование раздела',inp('tc-bn-'+i,b.title,'text','class="tc-b-title"'),true)+
+    field('Порядок','<div class="flexw">'+
+     (i>0?'<button class="btn sm tc-b-up" title="Выше" onclick="App.tplBlockMove('+i+',-1)">'+ic('up')+'</button>':'')+
+     (i<c.blocks.length-1?'<button class="btn sm tc-b-down" title="Ниже" onclick="App.tplBlockMove('+i+',1)">'+ic('down')+'</button>':'')+
+     (TPL_REQUIRED.includes(b.type)?'<span class="chip">обязательный</span>':'<button class="btn sm danger tc-b-del" title="Удалить блок" onclick="App.tplBlockDel('+i+')">'+ic('trash')+'</button>')+
+    '</div>')+'</div>'+
+   (TPL_SINGLE.includes(b.type)||b.type==='text'?field('Текст блока (переменные {{meeting.*}})','<div class="tc-b-text">'+ta('tc-bx-'+i,b.text,2)+'</div>'):'<div class="small mut">Раздел заполняется данными совещания автоматически.</div>')+
+  '</div></div>').join('')+
+  '<button class="btn sm" id="tc-add-block" onclick="App.tplBlockAdd()">'+ic('plus')+' Добавить блок</button></div>';
+ const html=mh(c.id?('Конструктор шаблона '+esc(c.code||'')+' · версия '+c.version):'Новый шаблон протокола','file')+'<div class="mb form">'+
+  '<div class="small mut mb8">Состав и порядок блоков задают структуру протокола (ТЗ §2.8.2). Обязательные разделы удалить нельзя. Изменение шаблона увеличивает версию и не затрагивает ранее выпущенные протоколы.</div>'+
+  '<div class="row">'+field('Наименование шаблона',inp('tc-name',c.name),true)+field('Вид шаблона',sel('tc-kind',TPL_KINDS,c.kind),true)+'</div>'+
+  '<div class="row">'+field('Организация',inp('tc-org',c.org))+field('Примечание',inp('tc-note',c.note))+'</div>'+
+  field('Применяется к видам совещаний','<div class="flexw" style="border:1.5px solid var(--line2);border-radius:8px;padding:9px 11px">'+
+   MEET_TYPES.map(t=>'<label class="checkline"><input type="checkbox" class="tc-mt" value="'+t+'" '+(c.meetTypes.includes(t)?'checked':'')+' onchange="App.markDirty()">'+t+'</label>').join('')+'</div>')+
+  '<h4 style="margin:12px 0 8px">Блоки шаблона ('+c.blocks.length+')</h4>'+blocks+
+  '<div class="small mut mt8">Переменные: '+TPL_VARS.map(v=>'{{'+v+'}}').join(', ')+'</div>'+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button>'+
+  '<button class="btn pri" id="tc-save" onclick="App.tplSave()">'+ic('save')+' '+(c.id?'Сохранить (новая версия)':'Создать шаблон')+'</button></div>';
+ const holder=document.getElementById('tc-blocks');
+ if(holder&&document.getElementById('tc-name')){ holder.outerHTML=blocks; return; }  // перерисовка списка блоков
+ openModal(html);
+};
+App.tplBlockAdd=function(){
+ App.tplSync();
+ if(App._tc.blocks.length>=40){toast('warn','Не более 40 блоков','Ограничение конструктора шаблонов');return;}
+ App._tc.blocks.push({id:'',type:'text',title:'Новый раздел',text:'',options:{}});
+ App.tplDraw();
+};
+App.tplBlockDel=function(i){
+ App.tplSync();
+ const b=App._tc.blocks[i];
+ if(TPL_REQUIRED.includes(b.type)){toast('warn','Обязательный раздел удалить нельзя','ТЗ §2.8.2');return;}
+ App._tc.blocks.splice(i,1); App.tplDraw();
+};
+App.tplBlockMove=function(i,d){
+ App.tplSync();
+ const j=i+d; if(j<0||j>=App._tc.blocks.length)return;
+ const x=App._tc.blocks[i]; App._tc.blocks[i]=App._tc.blocks[j]; App._tc.blocks[j]=x; App.tplDraw();
+};
+App.tplSave=function(){
+ App.tplSync();
+ if(!requireFields(['tc-name']))return;
+ const c=App._tc;
+ const blocks=c.blocks.map(b=>({id:b.id||undefined,type:b.type,title:b.title,text:b.text||'',options:b.options||{}}));
+ const data={name:c.name,kind:c.kind,org:c.org,note:c.note,meetTypes:c.meetTypes,blocks:blocks};
+ if(c.id)rpc('template.update',Object.assign({id:c.id},data)).then(r=>{if(r){App.closeModal(true);renderView();}});
+ else rpc('template.create',data).then(r=>{if(r){App.closeModal(true);renderView();}});
+};
+App.tplCopy=function(id){
+ if(!guard('admin','edit'))return;
+ const t=TPL(id); if(!t)return;
+ openModal(mh('Копирование шаблона '+esc(t.code),'plus')+'<div class="mb form">'+
+  '<div class="small mut mb8">Копия создаётся как самостоятельный шаблон версии 1.</div>'+
+  field('Наименование копии',inp('tcp-name',t.name+' (копия)'),true)+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button>'+
+  '<button class="btn pri" id="tcp-save" onclick="App.tplCopySave(\''+id+'\')">'+ic('plus')+' Создать копию</button></div>');
+};
+App.tplCopySave=function(id){
+ if(!requireFields(['tcp-name']))return;
+ rpc('template.copy',{id:id,name:val('tcp-name')}).then(r=>{if(r){App.closeModal(true);renderView();}});
+};
+App.tplDefault=function(id){
+ if(!guard('admin','edit'))return;
+ rpc('template.default',{id:id}).then(r=>{if(r)renderView();});
+};
+App.tplArchive=function(id){
+ if(!guard('admin','edit'))return;
+ const t=TPL(id); if(!t)return;
+ if(!confirm('Перевести шаблон '+t.code+' в архив? Ранее выпущенные протоколы сохраняются.'))return;
+ rpc('template.archive',{id:id}).then(r=>{
+  if(r){renderView();return;}
+  const e=App.lastRpcError||{};
+  if(e.code==='NEED_CONFIRM'&&confirm((e.message||'')+' Архивировать?'))
+   rpc('template.archive',{id:id,confirm:true}).then(x=>{if(x)renderView();});
+ });
+};
+App.tplRestore=function(id){
+ if(!guard('admin','edit'))return;
+ rpc('template.restore',{id:id}).then(r=>{if(r)renderView();});
+};
+App.tplRollback=function(id){
+ if(!guard('admin','edit'))return;
+ rpc('template.get',{id:id}).then(t=>{
+  if(!t)return;
+  const hs=(t.history||[]).slice().reverse();
+  openModal(mh('Версии шаблона '+esc(t.code),'refresh')+'<div class="mb" id="tpl-hist">'+
+   '<div class="small mut mb8">Текущая версия: '+t.version+'. Восстановление создаёт новую версию с составом выбранной редакции.</div>'+
+   (hs.length?'<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Версия</th><th>Дата</th><th>Автор</th><th>Примечание</th><th></th></tr></thead><tbody>'+
+    hs.map(h=>'<tr><td class="num">'+h.v+'</td><td class="small nowrap">'+fmtDT(h.ts)+'</td><td class="small">'+esc(U(h.by).name)+'</td><td class="small">'+esc(h.note||'—')+'</td>'+
+     '<td><button class="btn sm tpl-rb" onclick="App.tplRollbackGo(\''+id+'\','+h.v+')">'+ic('refresh')+' Восстановить</button></td></tr>').join('')+
+    '</tbody></table></div>':'<div class="small mut">Сохранённых предыдущих версий нет.</div>')+
+   '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Закрыть</button></div>');
+ });
+};
+App.tplRollbackGo=function(id,v){
+ rpc('template.rollback',{id:id,v:v}).then(r=>{if(r){App.closeModal(true);renderView();}});
+};
+App.tplPreview=function(id,mid){
+ rpc('template.preview',mid?{id:id,meetingId:mid}:{id:id}).then(r=>{
+  if(!r)return;
+  openModal(mh('Предпросмотр шаблона '+esc(r.template.code),'eye')+'<div class="mb">'+
+   '<div class="small mut mb8">'+esc(r.template.name)+' · версия '+r.template.version+' · данные: '+esc(r.code)+'</div>'+
+   '<pre id="tp-plain" style="white-space:pre-wrap;font:12.5px/1.55 var(--mono,monospace);background:#f8fafc;border:1px solid var(--line2);border-radius:8px;padding:12px;max-height:52vh;overflow:auto">'+esc(r.plain)+'</pre>'+
+   '<div class="small mut mt8">Колонтитул: '+esc(r.footer||'—')+'</div>'+
+   '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Закрыть</button></div>');
+ });
+};
+/* --- MTG-09: реквизиты, черновик и редактор протокола --- */
+App.pdLoad=function(mid){
+ rpc('meeting.protocol.draft.get',{id:mid}).then(r=>{
+  if(!r)return;
+  App._pd={mid:mid,data:r};
+  if((App.f.meetTab||'info')==='prot'&&App._meetOpen===mid)openMeeting(mid);
+ });
+};
+function pdBlock(m){
+ const st=App._pd;
+ if(!st||st.mid!==m.id||!st.data)return '<div class="card mb14" id="pd-card"><div class="cb small mut">Загрузка черновика протокола…</div></div>';
+ const d=st.data, rq=d.requisites, editable=d.editable&&can('meetings','edit',m), mid=m.id;
+ const req='<div class="card mb14" id="pd-req"><div class="ch">'+ic('file')+'Реквизиты протокола (ТЗ §2.8.2)'+
+  '<span class="r small mut">шаблон: '+esc((d.template||{}).code||'—')+' · версия '+((d.template||{}).version||1)+'</span></div><div class="cb form">'+
+  '<div class="row">'+field('Организация',inp('pd-org',rq.org),true)+field('Подразделение',inp('pd-dept',rq.department))+'</div>'+
+  '<div class="row3">'+field('Номер протокола',inp('pd-number',rq.number),true)+field('Дата протокола',inp('pd-date',rq.date,'date'),true)+
+   field('Формат проведения',sel('pd-format',PROT_FORMATS,rq.format))+'</div>'+
+  '<div class="row">'+field('Место проведения',inp('pd-place',rq.place))+field('Организатор',sel('pd-organizer',[['','не назначен'],...DB.users.filter(u=>!u.blocked).map(u=>[u.id,u.name])],rq.organizer))+'</div>'+
+  field('Шаблон протокола',sel('pd-template',[['','по виду совещания'],...TEMPLS().filter(t=>t.status==='Действует').map(t=>[t.id,t.code+' · '+t.name+' (v'+t.version+')'])],rq.templateId))+
+  (editable?'<div class="flexw mt8"><button class="btn sm pri" id="pd-req-save" onclick="App.pdReqSave(\''+mid+'\')">'+ic('save')+' Сохранить реквизиты</button>'+
+   '<button class="btn sm" id="pd-tpl-preview" onclick="App.tplPreview(\''+((d.template||{}).id||'tpl1')+'\',\''+mid+'\')">'+ic('eye')+' Предпросмотр шаблона</button></div>'
+   :'<div class="small mut mt8">Протокол в статусе «'+esc(d.status)+'» не редактируется: создайте новую редакцию.</div>')+
+  '</div></div>';
+ const secs=d.sections.filter(s=>!['header','footer','numbering'].includes(s.type));
+ const secHtml='<div class="card mb14" id="pd-sections"><div class="ch">'+ic('layout')+'Разделы протокола ('+secs.length+')'+
+  '<span class="r small mut">автозаполнение данными совещания и ручная правка (§2.8.3)</span></div><div class="cb">'+
+  secs.map(s=>'<div class="card mb8 pd-sec" id="pd-sec-'+s.key+'"><div class="ch">'+esc(TPL_BLOCK_LABEL[s.type]||s.type)+
+   '<span class="r flexw">'+(s.required?'<span class="chip">обязательный</span>':'')+(s.custom?'<span class="chip">добавлен вручную</span>':'')+
+   (editable&&s.custom?'<button class="btn sm danger pd-del" title="Удалить раздел" onclick="App.pdSecDel(\''+mid+'\',\''+s.key+'\')">'+ic('trash')+'</button>':'')+'</span></div>'+
+   '<div class="cb form">'+field('Наименование раздела',inp('pd-t-'+s.key,s.title,'text','class="pd-title"'),true)+
+   (TPL_DATA_KEYS.includes(s.type)?'<label class="checkline"><input type="checkbox" class="pd-auto" id="pd-a-'+s.key+'" '+(s.auto?'checked':'')+(s.required?' disabled':'')+' onchange="App.markDirty()"> автозаполнение данными совещания</label>':'')+
+   field('Текст раздела (ручная правка)','<div class="pd-body">'+ta('pd-b-'+s.key,s.body,3)+'</div>')+
+   '</div></div>').join('')+
+  (editable?'<button class="btn sm" id="pd-add-section" onclick="App.pdSecAdd(\''+mid+'\')">'+ic('plus')+' Добавить раздел</button>':'')+
+  '</div></div>';
+ const atts=d.attachments||[];
+ const attHtml='<div class="card mb14" id="pd-att"><div class="ch">'+ic('file')+'Приложения к протоколу ('+atts.length+')</div><div class="cb">'+
+  (atts.length?'<div class="list-rows">'+atts.map(x=>'<div class="lr" style="cursor:default">'+ic(x.kind==='doc'?'file':'link')+
+   '<div class="lt"><b>'+esc(x.name)+'</b><small>'+(x.kind==='doc'?('документ M09 '+esc(x.docCode||'')+' · версия '+x.docV):('ссылка: '+esc(x.url||'—')))+(x.note?' · '+esc(x.note):'')+'</small></div>'+
+   (editable?'<button class="btn sm danger pd-att-del" onclick="App.pdAttDel(\''+mid+'\',\''+x.id+'\')">'+ic('trash')+'</button>':'')+'</div>').join('')+'</div>'
+   :'<div class="small mut">Приложения не зарегистрированы.</div>')+
+  (editable?'<button class="btn sm mt8" id="pd-att-add" onclick="App.pdAttAdd(\''+mid+'\')">'+ic('plus')+' Добавить приложение</button>':'')+
+  '</div></div>';
+ const concl='<div class="card mb14" id="pd-concl"><div class="ch">'+ic('edit')+'Заключение</div><div class="cb form">'+
+  ta('pd-conclusion',d.conclusion,3)+
+  '<div class="flexw mt8">'+
+   (editable?'<button class="btn pri" id="pd-save" onclick="App.pdSave(\''+mid+'\')">'+ic('save')+' Сохранить черновик</button>':'')+
+   '<button class="btn" id="pd-preview" onclick="App.pdPreview(\''+mid+'\')">'+ic('eye')+' Предпросмотр протокола</button>'+
+   '<span class="spacer"></span><span class="small mut">'+(d.updatedAt?('черновик изменён '+fmtDT(d.updatedAt)+' · '+esc(U(d.updatedBy).name)):'черновик не изменялся')+'</span>'+
+  '</div></div></div>';
+ return req+secHtml+attHtml+concl;
+}
+App.pdReqSave=function(mid){
+ if(!requireFields(['pd-org','pd-number','pd-date']))return;
+ rpc('meeting.requisites',{id:mid,org:val('pd-org'),department:val('pd-dept'),place:val('pd-place'),
+  format:val('pd-format'),organizer:val('pd-organizer'),number:val('pd-number'),date:val('pd-date'),
+  templateId:val('pd-template')}).then(r=>{if(r){App._pd=null;openMeeting(mid);}});
+};
+App.pdSave=function(mid){
+ const d=(App._pd||{}).data; if(!d)return;
+ const sections=d.sections.filter(s=>!['header','footer','numbering'].includes(s.type)).map(s=>{
+  const a=document.getElementById('pd-a-'+s.key);
+  return {key:s.key,title:val('pd-t-'+s.key),body:val('pd-b-'+s.key),auto:a?a.checked:s.auto};
+ });
+ rpc('meeting.protocol.draft.save',{id:mid,sections:sections,conclusion:val('pd-conclusion')})
+  .then(r=>{if(r){App._pd=null;openMeeting(mid);}});
+};
+App.pdSecAdd=function(mid){
+ if(!guard('meetings','edit',MEET(mid)))return;
+ openModal(mh('Новый раздел протокола','plus')+'<div class="mb form">'+
+  '<div class="small mut mb8">Раздел добавляется в черновик протокола; обязательные разделы шаблона не изменяются (§2.8.3).</div>'+
+  field('Наименование раздела',inp('ps-title',''),true)+field('Текст раздела',ta('ps-body','',4))+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button>'+
+  '<button class="btn pri" id="ps-save" onclick="App.pdSecAddGo(\''+mid+'\')">'+ic('plus')+' Добавить</button></div>');
+};
+App.pdSecAddGo=function(mid){
+ if(!requireFields(['ps-title']))return;
+ rpc('meeting.protocol.section.add',{id:mid,title:val('ps-title'),body:val('ps-body')})
+  .then(r=>{if(r){App.closeModal(true);App._pd=null;openMeeting(mid);}});
+};
+App.pdSecDel=function(mid,key){
+ if(!confirm('Удалить раздел из черновика протокола?'))return;
+ rpc('meeting.protocol.section.remove',{id:mid,key:key}).then(r=>{if(r){App._pd=null;openMeeting(mid);}});
+};
+App.pdAttAdd=function(mid){
+ if(!guard('meetings','edit',MEET(mid)))return;
+ const docs=DB.docs||[];
+ openModal(mh('Приложение к протоколу','file')+'<div class="mb form">'+
+  '<div class="small mut mb8">Приложение — документ M09 с фиксацией версии либо внешняя ссылка (§2.8.2 п.8).</div>'+
+  field('Вид приложения',sel('pat-kind',[['doc','Документ M09'],['link','Ссылка']],'doc','onchange="App.pdAttKind()"'))+
+  '<div id="pat-doc-box">'+field('Документ',sel('pat-doc',docs.map(d=>[d.id,d.code+' · '+d.title]),(docs[0]||{}).id||''))+
+   field('Версия документа',inp('pat-ver','','number','min="1" placeholder="последняя"'))+'</div>'+
+  '<div id="pat-link-box" style="display:none">'+field('Наименование',inp('pat-name',''))+field('Ссылка',inp('pat-url',''))+'</div>'+
+  field('Примечание',inp('pat-note',''))+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button>'+
+  '<button class="btn pri" id="pat-save" onclick="App.pdAttAddGo(\''+mid+'\')">'+ic('plus')+' Приложить</button></div>');
+};
+App.pdAttKind=function(){
+ const k=val('pat-kind');
+ const db_=document.getElementById('pat-doc-box'), lb=document.getElementById('pat-link-box');
+ if(db_)db_.style.display=k==='doc'?'':'none';
+ if(lb)lb.style.display=k==='link'?'':'none';
+};
+App.pdAttAddGo=function(mid){
+ const k=val('pat-kind'), data={id:mid,note:val('pat-note')};
+ if(k==='doc'){ data.docId=val('pat-doc'); const v=parseInt(val('pat-ver')); if(v)data.docV=v; }
+ else { if(!requireFields(['pat-name']))return; data.name=val('pat-name'); data.url=val('pat-url'); }
+ rpc('meeting.protocol.attach',data).then(r=>{if(r){App.closeModal(true);App._pd=null;openMeeting(mid);}});
+};
+App.pdAttDel=function(mid,attId){
+ if(!confirm('Удалить приложение из протокола?'))return;
+ rpc('meeting.protocol.detach',{id:mid,attId:attId}).then(r=>{if(r){App._pd=null;openMeeting(mid);}});
+};
+App.pdPreview=function(mid){
+ rpc('meeting.protocol.preview',{id:mid,html:true}).then(r=>{
+  if(!r)return;
+  openModal(mh('Предпросмотр протокола','eye')+'<div class="mb">'+
+   '<div class="small mut mb8">Шаблон '+esc((r.template||{}).code||'—')+' · разделов: '+r.sections.length+' · контрольная сумма '+esc(r.checksum)+'</div>'+
+   '<div class="tabs mb8"><button class="on" id="pv-tab-text" onclick="App.pdPreviewTab(\'text\')">Текст</button><button id="pv-tab-doc" onclick="App.pdPreviewTab(\'doc\')">Документ</button></div>'+
+   '<pre id="pv-plain" style="white-space:pre-wrap;font:12.5px/1.55 var(--mono,monospace);background:#f8fafc;border:1px solid var(--line2);border-radius:8px;padding:12px;max-height:52vh;overflow:auto">'+esc(r.plain)+'</pre>'+
+   '<iframe id="pv-html" style="display:none;width:100%;height:52vh;border:1px solid var(--line2);border-radius:8px;background:#fff"></iframe>'+
+   '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Закрыть</button></div>');
+  const f=document.getElementById('pv-html'); if(f)f.srcdoc=r.html||'';
+ });
+};
+App.pdPreviewTab=function(k){
+ const t=document.getElementById('pv-plain'), f=document.getElementById('pv-html');
+ const bt=document.getElementById('pv-tab-text'), bd=document.getElementById('pv-tab-doc');
+ if(t)t.style.display=k==='text'?'':'none';
+ if(f)f.style.display=k==='doc'?'':'none';
+ if(bt)bt.className=k==='text'?'on':'';
+ if(bd)bd.className=k==='doc'?'on':'';
+};
+/* --- §2.8.2 п.4: рассмотрение вопроса (обсуждение, замечания, проблемы) --- */
+App.agendaDiscuss=function(mid,itemId){
+ const m=MEET(mid); if(!m||!guard('meetings','edit',m))return;
+ const a=(m.agenda||[]).find(x=>x.id===itemId); if(!a)return;
+ openModal(mh('Рассмотрение вопроса №'+a.n,'meeting')+'<div class="mb form">'+
+  '<div class="small mut mb8">'+esc(a.title)+' · краткое изложение обсуждения, замечания и предложения, выявленные проблемы (ТЗ §2.8.2 п.4). Сведения попадают в раздел «Рассмотрение вопросов» протокола.</div>'+
+  field('Обсуждение',ta('ad-discussion',a.discussion||'',4))+
+  field('Основные замечания и предложения',ta('ad-remarks',a.remarks||'',3))+
+  field('Выявленные проблемы',ta('ad-problems',a.problems||'',3))+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button>'+
+  '<button class="btn pri" id="ad-save" onclick="App.agendaDiscussSave(\''+mid+'\',\''+a.id+'\')">'+ic('save')+' Сохранить</button></div>');
+};
+App.agendaDiscussSave=function(mid,itemId){
+ rpc('meeting.agenda.discussion',{id:mid,itemId:itemId,discussion:val('ad-discussion'),
+  remarks:val('ad-remarks'),problems:val('ad-problems')})
+  .then(r=>{if(r){App.closeModal(true);App._pd=null;openMeeting(mid);}});
+};
 /* ---- M16 §2.5: планирование совещаний (материалы, проекты, перенос, отмена, регулярность) ---- */
 const MEET_CANC='Отменено';
 const REC_FREQ=[['none','Без повторения'],['daily','Ежедневно'],['weekly','Еженедельно'],['monthly','Ежемесячно']];
@@ -3861,6 +4214,7 @@ function meetAgendaBlock(m){
       (editable&&a.n<items.length?'<button class="btn sm ma-down" title="Опустить в повестке" onclick="App.agendaMove(\''+mid+'\',\''+a.id+'\',\'down\')">'+ic('down')+'</button>':'')+
       (editable?'<button class="btn sm ma-pos" title="Переместить на позицию" onclick="App.agendaPos(\''+mid+'\',\''+a.id+'\')">'+ic('layout')+'</button>':'')+
       (editable?'<button class="btn sm ma-st" title="Статус рассмотрения" onclick="App.agendaStatus(\''+mid+'\',\''+a.id+'\')">'+ic('check')+'</button>':'')+
+      (editable?'<button class="btn sm ma-disc" title="Рассмотрение вопроса: обсуждение, замечания, проблемы" onclick="App.agendaDiscuss(\''+mid+'\',\''+a.id+'\')">'+ic('journal')+'</button>':'')+
       (editable?'<button class="btn sm ma-mat" title="Материалы вопроса" onclick="App.agendaMat(\''+mid+'\',\''+a.id+'\')">'+ic('file')+'</button>':'')+
       (editable?'<button class="btn sm ma-dec" title="Зарегистрировать решение" onclick="App.decisionAdd(\''+mid+'\','+a.n+')">'+ic('tasks')+'</button>':'')+
       (editable?'<button class="btn sm danger ma-del" title="Удалить из повестки" onclick="App.agendaDel(\''+mid+'\',\''+a.id+'\')">'+ic('trash')+'</button>':'')+
@@ -3939,6 +4293,9 @@ App.agendaView=function(mid,itemId){
   '<div class="stat-line"><span>Ожидаемый результат</span><b>'+esc(a.expected||'—')+'</b></div>'+
   '<div class="stat-line"><span>Фактический результат</span><b id="agc-fact">'+esc(a.fact||'—')+'</b></div>'+
   '<div class="stat-line"><span>Комментарий</span><b>'+esc(a.comment||'—')+'</b></div>'+
+  '<div class="stat-line"><span>Обсуждение (§2.8.2)</span><b id="agc-discussion">'+esc(a.discussion||'—')+'</b></div>'+
+  '<div class="stat-line"><span>Замечания и предложения</span><b id="agc-remarks">'+esc(a.remarks||'—')+'</b></div>'+
+  '<div class="stat-line"><span>Выявленные проблемы</span><b id="agc-problems">'+esc(a.problems||'—')+'</b></div>'+
   '<div class="stat-line"><span>Статус установлен</span><b>'+(a.statusAt?fmtDT(a.statusAt)+' · '+esc(U(a.statusBy).name):'—')+'</b></div>'+
   (a.carryFrom?'<div class="small mut mt8">Перенесён из '+esc(a.carryFrom.code)+' (вопрос №'+a.carryFrom.n+', '+fmtD(a.carryFrom.date)+') · '+esc(a.carryFrom.reason||'')+'</div>':'')+
   (a.carryTo?'<div class="small mut mt8">Перенесён в <span class="dep-chip" onclick="App.closeModal(true);openMeeting(\''+a.carryTo.meetingId+'\')">'+esc(a.carryTo.code)+'</span> (вопрос №'+a.carryTo.n+') · '+esc(a.carryTo.reason||'')+'</div>':'')+
@@ -3955,6 +4312,7 @@ App.agendaView=function(mid,itemId){
    '</tbody></table></div>':'<div class="small mut">Изменений не было.</div>')+
   '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Закрыть</button>'+
   (editable?'<button class="btn" id="agc-mat" onclick="App.agendaMat(\''+mid+'\',\''+a.id+'\')">'+ic('file')+' Материалы</button>':'')+
+  (editable?'<button class="btn" id="agc-disc" onclick="App.agendaDiscuss(\''+mid+'\',\''+a.id+'\')">'+ic('journal')+' Рассмотрение</button>':'')+
   (editable?'<button class="btn" id="agc-st" onclick="App.agendaStatus(\''+mid+'\',\''+a.id+'\')">'+ic('check')+' Статус</button>':'')+
   (editable?'<button class="btn" id="agc-dec" onclick="App.decisionAdd(\''+mid+'\','+a.n+')">'+ic('tasks')+' Решение</button>':'')+
   (editable&&a.status!=='Перенесён'?'<button class="btn pri" id="agc-edit" onclick="App.agendaModal(\''+mid+'\',\''+a.id+'\')">'+ic('edit')+' Изменить</button>':'')+
@@ -4240,6 +4598,8 @@ function openMeeting(mid){
  const m=MEET(mid); if(!m)return;
  if(!can('meetings','view')){deny('meetings','view',m);return;}
  const tab=App.f.meetTab||'info';
+ App._meetOpen=mid;
+ if(tab==='prot'&&(!App._pd||App._pd.mid!==mid))App.pdLoad(mid);
  const editable=can('meetings','edit',m);
  const dirs=DB.tasks.filter(t=>t.meetingId===mid);
  let body='';
@@ -4285,7 +4645,7 @@ function openMeeting(mid){
  if(tab==='prot'){
   body='<div class="flexw mb8"><button class="btn" onclick="App.meetPrint(\''+mid+'\')">'+ic('print')+' Печать</button><button class="btn" onclick="App.meetDownload(\''+mid+'\')">'+ic('download')+' HTML</button>'+docBtns('meeting',mid)+(can('meetings','export')&&can('docs','create')?'<button class="btn pri" onclick="App.meetProtocol(\''+mid+'\')">'+ic('save')+' Протокол в M09 (DOCX+PDF)</button>':'')+'<span class="spacer"></span>'+
   '</div>'+
-  protBlock(m)+
+  pdBlock(m)+protBlock(m)+
   '<div class="card"><div class="cb report-doc">'+meetMinutes(m)+'</div></div>';
  }
  const tabs=[['info','Информация'],['part','Участники ('+partsOf(m).length+')'],['plan','Планирование'],['agenda','Повестка ('+m.agenda.length+')'],['dec','Решения ('+m.decisions.length+')'],['dir','Поручения ('+dirs.length+')'],['prot','Протокол'+(protOf(m).version?' (ред. '+protOf(m).version+')':'')]];

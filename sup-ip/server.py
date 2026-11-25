@@ -39,7 +39,7 @@ except ImportError:
     docgen = None
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -383,14 +383,19 @@ ENT = {
    ("status","status","t"),("agenda","agenda","j"),("decisions","decisions","j"),("protocol","protocol","j"),
    ("materials","materials","j"),("projects","projects","j"),("recurrence","recurrence","j"),
    ("planLog","plan_log","j"),("seriesId","series_id","t"),
-   ("participants","participants","j"),("actual","actual_composition","j")]),
+   ("participants","participants","j"),("actual","actual_composition","j"),
+   ("requisites","requisites","j"),("draft","protocol_draft","j")]),
+ "template": ("templates", [("id","id","t"),("code","code","t"),("name","name","t"),("kind","kind","t"),
+   ("meetTypes","meet_types","j"),("version","version","i"),("status","status","t"),("isDefault","is_default","b"),
+   ("org","org","t"),("note","note","t"),("blocks","blocks","j"),("history","history","j"),
+   ("author","author","t"),("createdAt","created_at","i"),("updatedAt","updated_at","i"),("updatedBy","updated_by","t")]),
  "calEvent": ("cal_events", [("id","id","t"),("title","title","t"),("date","date","t"),("time","mtime","t"),
    ("type","type","t"),("participants","participants","j"),("note","note","t")]),
  "report": ("reports", [("id","id","t"),("code","code","t"),("type","type","t"),("title","title","t"),("params","params","j"),
    ("ts","ts","i"),("by","by_user","t"),("status","status","t"),("html","html","t")]),
 }
 STATE_KEYS = {"project":"projects","task":"tasks","risk":"risks","doc":"docs","calc":"calcs","time":"time",
-              "meeting":"meetings","calEvent":"calEvents","report":"reports"}
+              "meeting":"meetings","calEvent":"calEvents","report":"reports","template":"templates"}
 
 class DB:
     def __init__(self, dsn):
@@ -418,8 +423,9 @@ class DB:
         for js, col, ty in fields:
             v = o.get(js)
             if ty == "t" and v is None and js in ("seriesId",): v = ""   # записи прежних версий
+            if ty == "b": v = bool(v)
             if ty == "j": v = psycopg2.extras.Json(v if v is not None else ([] if js in ("team","deps","comments","measures","history","events","attendees","agenda","decisions","participants","runs",
-                                                    "materials","projects","planLog") else {}))
+                                                    "materials","projects","planLog","blocks","meetTypes") else {}))
             vals[col.strip('"')] = v
         return vals
     def get_ent(self, cur, kind, id_):
@@ -479,6 +485,8 @@ class DB:
         s["users"] = self.users_public(cur)
         for kind, key in STATE_KEYS.items():
             s[key] = self.all_ent(cur, kind, order="code" if kind not in ("time","report","calEvent") else "id")
+        # шаблоны в состоянии — только каталог (блоки и история запрашиваются через template.get)
+        s["templates"] = [tpl_pub(t) for t in s["templates"]]
         cur.execute("SELECT id,ts,cat,level,user_id,module,action,obj,obj_id,details FROM events ORDER BY ts DESC, id DESC LIMIT 800")
         s["events"] = [{"id":r["id"],"ts":r["ts"],"cat":r["cat"],"level":r["level"],"user":r["user_id"],"module":r["module"],
                         "action":r["action"],"obj":r["obj"],"objId":r["obj_id"],"details":r["details"]} for r in cur.fetchall()]
@@ -3823,12 +3831,13 @@ def h_admin_reset(db, cur, u, p):
     guard(db, cur, u, "admin", "delete")
     cur.execute("SELECT token, user_id, created FROM sessions")
     keep_sessions = cur.fetchall()
-    for tbl in ("notifications","reminders","meeting_tasks","doc_versions","docs","calcs","time_entries","tasks","risks","meetings","projects","cal_events","reports","events","settings","users"):
+    for tbl in ("notifications","reminders","meeting_tasks","doc_versions","docs","calcs","time_entries","tasks","risks","meetings","projects","cal_events","reports","events","settings","templates","users"):
         cur.execute("DELETE FROM " + tbl)
     cur.execute("DELETE FROM sessions WHERE user_id NOT IN (SELECT id FROM users)")
     conn = cur.connection
     conn.commit()
     seed(db)
+    ensure_base_templates(db)
     for s in keep_sessions:
         cur.execute("SELECT 1 FROM users WHERE id=%s AND NOT blocked", (s["user_id"],))
         if cur.fetchone():
@@ -4260,22 +4269,21 @@ def build_export(db, cur, u, kind, id_="", params=None):
     raise RpcError("Вид документа не реализован: %s" % kind, "Экспорт", 500, "NOT_IMPLEMENTED")
 
 
-def meeting_protocol_doc(db, cur, u, m):
-    """Протокол совещания по структуре ТЗ §2.8 (M16): 8 обязательных разделов."""
+def _pr_sec_requisites(d, db, cur, u, m, ctx):
+    """Общие сведения (§2.8.2 п.1)"""
     att = m.get("attendees") or []
     decs = m.get("decisions") or []
-    d = docgen.Document("Протокол совещания %s" % m["code"], subtitle=m["title"],
-                        meta=[("Вид совещания", m["type"]), ("Дата", _fd(m["date"])), ("Время", m.get("time") or ""),
-                              ("Председатель", _uname(db, cur, m["chair"])), ("Секретарь", _uname(db, cur, m["secretary"])),
-                              ("Статус", m["status"]), ("Сформировал", u["name"]),
-                              ("Дата формирования", datetime.datetime.now().strftime("%d.%m.%Y %H:%M"))])
-    d.toc = True
-    d.h1("1. Общие сведения")
+    ag = m.get("agenda") or []
+    rq = req_of(db, cur, m)
     prj_codes = []
     for pid in mprojects_of(m):
         pr = db.get_ent(cur, "project", pid)
         prj_codes.append("%s · %s" % (pr["code"], pr["name"]) if pr else pid)
-    d.kv([("Наименование", m["title"]), ("Вид совещания", m["type"]),
+    d.kv([("Организация", rq["org"]), ("Подразделение", rq["department"] or "—"),
+          ("Наименование", m["title"]), ("Номер протокола", rq["number"]),
+          ("Дата протокола", _fd(rq["date"])), ("Место проведения", rq["place"] or "не указано"),
+          ("Формат проведения", rq["format"]), ("Организатор", _uname(db, cur, rq["organizer"]) or "—"),
+          ("Вид совещания", m["type"]),
           ("Дата и время", "%s %s" % (_fd(m["date"]), m.get("time") or "")),
           ("Председатель", _uname(db, cur, m["chair"])), ("Секретарь", _uname(db, cur, m["secretary"])),
           ("Связанные проекты", "; ".join(prj_codes) or "не зарегистрированы"),
@@ -4297,7 +4305,13 @@ def meeting_protocol_doc(db, cur, u, m):
                                          _fd(x["to"]["date"]), x["to"].get("time", ""))
                    if x.get("from") and x.get("to") else "")] for x in pl],
                 widths=[1.3, 1.5, 1.4, 2.6])
-    d.h1("2. Присутствовали")
+
+def _pr_sec_participants(d, db, cur, u, m, ctx):
+    """Присутствовали (§2.8.2 п.2, §2.7)"""
+    att = m.get("attendees") or []
+    decs = m.get("decisions") or []
+    ag = m.get("agenda") or []
+    rq = req_of(db, cur, m)
     parts = part_norm(m)
     if parts:
         usr = {x["id"]: x for x in db.users_public(cur)}
@@ -4328,7 +4342,13 @@ def meeting_protocol_doc(db, cur, u, m):
                                " (" + a["responseNote"] + ")" if a.get("responseNote") else "") for a in unclear))
     elif att: d.list(["%s — %s" % (_uname(db, cur, a), _role_of(db, cur, a)) for a in att], numbered=True)
     else: d.p("Состав участников не зарегистрирован.")
-    d.h1("3. Повестка дня")
+
+def _pr_sec_agenda(d, db, cur, u, m, ctx):
+    """Повестка дня (§2.8.2 п.3)"""
+    att = m.get("attendees") or []
+    decs = m.get("decisions") or []
+    ag = m.get("agenda") or []
+    rq = req_of(db, cur, m)
     ag = m.get("agenda") or []
     if ag:
         d.table(["№", "Вопрос", "Докладчик", "Ответственный за подготовку", "План, мин", "Статус"],
@@ -4339,7 +4359,13 @@ def meeting_protocol_doc(db, cur, u, m):
                 widths=[0.4, 2.6, 1.3, 1.5, 0.7, 1.2])
         d.p("Планируемая продолжительность рассмотрения: %d мин." % agenda_total_min(m))
     else: d.p("Вопросы повестки не зарегистрированы.")
-    d.h1("4. Рассмотрение вопросов")
+
+def _pr_sec_discussion(d, db, cur, u, m, ctx):
+    """Рассмотрение вопросов (§2.8.2 п.4)"""
+    att = m.get("attendees") or []
+    decs = m.get("decisions") or []
+    ag = m.get("agenda") or []
+    rq = req_of(db, cur, m)
     if ag:
         for a in ag:
             d.h2("Вопрос %s. %s" % (a.get("n", ""), a.get("title", "")))
@@ -4373,18 +4399,46 @@ def meeting_protocol_doc(db, cur, u, m):
                     % (a["carryFrom"].get("code", ""), _fd(a["carryFrom"].get("date")),
                        a["carryFrom"].get("n", ""), a["carryFrom"].get("reason", "")))
             if a.get("comment"): d.p("Комментарий: %s" % a["comment"])
-            d.p(a.get("discussion") or "Обсуждение зафиксировано в решениях по вопросу.")
+            d.p("Обсуждение: %s" % (a.get("discussion") or "зафиксировано в решениях по вопросу."))
+            if a.get("remarks"): d.p("Основные замечания и предложения: %s" % a["remarks"])
+            if a.get("problems"): d.p("Выявленные проблемы: %s" % a["problems"])
+            qdecs = [x for x in decs if x.get("agendaN") == a.get("n") or x.get("itemId") == a.get("id")]
+            if qdecs:
+                d.p("Решения по вопросу: " + "; ".join(x.get("text", "") for x in qdecs))
     else:
         d.p("Материалы обсуждения не зарегистрированы.")
-    d.h1("5. Принятые решения")
+
+def _pr_sec_decisions(d, db, cur, u, m, ctx):
+    """Принятые решения (§2.8.2 п.5)"""
+    att = m.get("attendees") or []
+    decs = m.get("decisions") or []
+    ag = m.get("agenda") or []
+    rq = req_of(db, cur, m)
     if decs:
-        d.table(["№", "Решение", "Ответственный", "Срок", "Поручения"],
-                [[i + 1, x.get("text", ""), _uname(db, cur, x.get("resp")), _fd(x.get("due")),
-                  ", ".join((db.get_ent(cur, "task", tid) or {}).get("code", "") for tid in dec_task_ids(x)) or "—"]
-                 for i, x in enumerate(decs)],
-                widths=[0.5, 3.6, 1.6, 1, 0.9], title="Реестр решений")
+        rows = []
+        for i, x in enumerate(decs):
+            tids = dec_task_ids(x)
+            ts = [db.get_ent(cur, "task", tid) for tid in tids]
+            ts = [t for t in ts if t]
+            co = sorted({c for t in ts for c in ((t.get("directive") or {}).get("coassignees") or [])})
+            crit = "; ".join((t.get("directive") or {}).get("criteria", "") for t in ts
+                             if (t.get("directive") or {}).get("criteria")) or "—"
+            ctrl = "; ".join("%s (%d%%)" % (t["status"], t["progress"]) for t in ts) or "поручение не создано"
+            prj = ", ".join((db.get_ent(cur, "project", t.get("projectId")) or {}).get("code", "") for t in ts) or "—"
+            rows.append([i + 1, x.get("text", ""), _uname(db, cur, x.get("resp")),
+                         ", ".join(_uname(db, cur, c) for c in co) or "—", _fd(x.get("due")),
+                         prj, ", ".join(t["code"] for t in ts) or "—", crit, ctrl])
+        d.table(["№", "Формулировка решения", "Ответственный", "Соисполнители", "Срок", "Проект",
+                 "Задача/поручение", "Критерий завершения", "Статус контроля"], rows,
+                widths=[0.4, 2.4, 1.1, 1.1, 0.8, 0.8, 0.9, 1.6, 1.2], title="Реестр решений")
     else: d.p("Решения не зарегистрированы.")
-    d.h1("6. Контроль исполнения")
+
+def _pr_sec_tasks(d, db, cur, u, m, ctx):
+    """Контроль исполнения (§2.8.2 п.6)"""
+    att = m.get("attendees") or []
+    decs = m.get("decisions") or []
+    ag = m.get("agenda") or []
+    rq = req_of(db, cur, m)
     rows = []
     for x in decs:
         ts = [db.get_ent(cur, "task", tid) for tid in dec_task_ids(x)]
@@ -4406,16 +4460,87 @@ def meeting_protocol_doc(db, cur, u, m):
     if crit:
         d.h2("Критерии завершения поручений")
         d.table(["Поручение", "Критерии завершения"], crit, widths=[1, 5.5])
-    d.h1("7. Подписи")
+
+def _pr_sec_signatures(d, db, cur, u, m, ctx):
+    """Подписи (§2.8.2 п.7)"""
+    att = m.get("attendees") or []
+    decs = m.get("decisions") or []
+    ag = m.get("agenda") or []
+    rq = req_of(db, cur, m)
     d.signatures([("Председатель совещания", _uname(db, cur, m["chair"])),
                   ("Секретарь совещания", _uname(db, cur, m["secretary"]))])
-    d.h1("8. Приложения")
+
+def _pr_sec_attachments(d, db, cur, u, m, ctx):
+    """Приложения (§2.8.2 п.8)"""
+    att = m.get("attendees") or []
+    decs = m.get("decisions") or []
+    ag = m.get("agenda") or []
+    rq = req_of(db, cur, m)
+    atts = draft_of(m)["attachments"]
+    if atts:
+        d.table(["№", "Приложение", "Вид", "Примечание"],
+                [[i + 1, x.get("name", ""),
+                  ("документ M09 %s, версия %s" % (x.get("docCode", ""), x.get("docV"))) if x.get("kind") == "doc"
+                  else ("ссылка: %s" % (x.get("url") or "—")), x.get("note") or "—"] for i, x in enumerate(atts)],
+                widths=[0.4, 3.0, 2.2, 1.6], title="Приложения к протоколу")
     docs_ = [x for x in db.all_ent(cur, "doc") if x.get("taskId") in [x2.get("taskId") for x2 in decs if x2.get("taskId")]]
     if docs_:
+        d.h2("Документы поручений")
         d.table(["Код", "Документ", "Тип", "Статус"],
                 [[x["code"], x["title"], x["type"], x["status"]] for x in docs_], widths=[1, 3.4, 1.4, 1.4])
-    else:
+    if not atts and not docs_:
         d.p("Приложения не зарегистрированы.")
+
+PROTOCOL_SECTION_BUILDERS = {
+    "requisites": _pr_sec_requisites,
+    "participants": _pr_sec_participants,
+    "agenda": _pr_sec_agenda,
+    "discussion": _pr_sec_discussion,
+    "decisions": _pr_sec_decisions,
+    "tasks": _pr_sec_tasks,
+    "signatures": _pr_sec_signatures,
+    "attachments": _pr_sec_attachments,
+}
+
+def meeting_protocol_doc(db, cur, u, m):
+    """Протокол совещания: состав, наименования и порядок разделов задаёт шаблон (§2.8, MTG-09/MTG-10).
+    Данные совещания подставляются автоматически; ручные правки черновика добавляются к разделам."""
+    tpl = tpl_for_meeting(db, cur, m)
+    rq = req_of(db, cur, m)
+    ctx = tpl_context(db, cur, m, rq)
+    secs = protocol_sections(db, cur, m, tpl)
+    blocks = (tpl or {}).get("blocks") or []
+    hdr = tpl_render(next((b["text"] for b in blocks if b["type"] == "header"), ""), ctx)
+    ftr = tpl_render(next((b["text"] for b in blocks if b["type"] == "footer"), ""), ctx)
+    d = docgen.Document("Протокол совещания %s" % m["code"], subtitle=m["title"],
+                        meta=[("Организация", rq["org"]), ("Номер протокола", rq["number"]),
+                              ("Дата протокола", _fd(rq["date"])), ("Вид совещания", m["type"]),
+                              ("Дата совещания", "%s %s" % (_fd(m["date"]), m.get("time") or "")),
+                              ("Место / формат", "%s · %s" % (rq["place"] or "не указано", rq["format"])),
+                              ("Председатель", _uname(db, cur, m["chair"])), ("Секретарь", _uname(db, cur, m["secretary"])),
+                              ("Организатор", _uname(db, cur, rq["organizer"]) or "—"),
+                              ("Шаблон", "%s · %s (версия %s)" % ((tpl or {}).get("code", "—"),
+                                                                  (tpl or {}).get("name", "стандартная структура"),
+                                                                  (tpl or {}).get("version", 1))),
+                              ("Статус", m["status"]), ("Сформировал", u["name"]),
+                              ("Дата формирования", datetime.datetime.now().strftime("%d.%m.%Y %H:%M"))],
+                        org=hdr or rq["org"], footer=ftr or None)
+    d.toc = True
+    d.page_numbers = any(b["type"] == "numbering" for b in blocks) if blocks else True
+    for s in secs:
+        t = s["type"]
+        if t in ("header", "footer", "numbering"): continue
+        if t == "title":
+            d.h2(tpl_render(s["text"] or s["title"], ctx)); continue
+        d.h1(s["title"])
+        if s["auto"] and t in PROTOCOL_SECTION_BUILDERS:
+            PROTOCOL_SECTION_BUILDERS[t](d, db, cur, u, m, ctx)
+        if s["body"]: d.p(tpl_render(s["body"], ctx))
+        if t == "text" and s["text"]: d.p(tpl_render(s["text"], ctx))
+    dr = draft_of(m)
+    if dr["conclusion"]:
+        d.h1("Заключение")
+        d.p(dr["conclusion"])
     return d
 
 def _role_of(db, cur, user_id):
@@ -4435,7 +4560,8 @@ def h_meeting_protocol(db, cur, u, p):
                              "Протокол совещания · представления: %s" % ", ".join(f.upper() for f in fmts))
     db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Сформирован протокол совещания", "Совещание", m["id"],
              {"code": m["code"], "doc": reg["docCode"], "v": reg["docV"], "formats": fmts})
-    return {"docId": reg["docId"], "version": reg["docV"], "files": reg["files"]}, msg(
+    return {"docId": reg["docId"], "version": reg["docV"], "files": reg["files"],
+            "template": tpl_snapshot(tpl_for_meeting(db, cur, m)), "requisites": req_of(db, cur, m)}, msg(
         "Протокол сформирован (версия %d)" % reg["docV"], "DOCX и PDF зарегистрированы в M09 · событие в M15")
 
 # ---------------- Маршрут согласования и версии протокола (ТЗ M16 §2.9) ----------------
@@ -4624,10 +4750,21 @@ def _protocol_approve(db, cur, u, m, note=""):
     reg = _protocol_register(db, cur, u, m, ["docx", "pdf"],
                              "Утверждённый протокол %s · редакция %d" % (m["code"], pr["version"] + 1))
     pr["version"] += 1
+    # снимок редакции (MTG-09): шаблон и его версия, реквизиты, разделы, контрольная сумма.
+    # Изменение шаблона в дальнейшем не меняет ранее выпущенные протоколы.
+    tpl = tpl_for_meeting(db, cur, m)
+    rq = req_of(db, cur, m)
+    secs = protocol_sections(db, cur, m, tpl)
+    plain = protocol_plain(db, cur, m, secs)
     pr["versions"].append({"v": pr["version"], "ts": now_ms(), "by": u["id"], "note": (note or "")[:500],
                            "docId": reg["docId"], "docCode": reg["docCode"], "docV": reg["docV"], "files": reg["files"],
                            "agenda": json.loads(json.dumps(m.get("agenda") or [])),
-                           "decisions": json.loads(json.dumps(m.get("decisions") or []))})
+                           "decisions": json.loads(json.dumps(m.get("decisions") or [])),
+                           "template": tpl_snapshot(tpl), "requisites": rq,
+                           "sections": [{k: s[k] for k in ("key", "type", "title", "body", "auto", "required")} for s in secs],
+                           "attachments": json.loads(json.dumps(draft_of(m)["attachments"])),
+                           "conclusion": draft_of(m)["conclusion"],
+                           "checksum": hashlib.sha256(plain.encode("utf-8")).hexdigest()})
     pr["status"] = "Утверждён"
     pr["approvedAt"] = now_ms(); pr["approvedBy"] = u["id"]
     m["protocol"] = pr
@@ -4698,6 +4835,821 @@ def h_protocol_archive(db, cur, u, p):
     db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Протокол переведён в архив", "Совещание", m["id"],
              {"code": m["code"], "version": pr["version"], "event": "MEETING_PROTOCOL_ARCHIVED"})
     return m, msg("Протокол в архиве", "История редакций сохранена")
+
+# ================= ТЗ §2.8: формирование протокола, библиотека шаблонов, редактор =================
+# §2.8.1 — библиотека шаблонов (6 базовых + пользовательские, версии, признак «по умолчанию»).
+# §2.8.2 — структура протокола: общие сведения, присутствовали, повестка, рассмотрение вопросов,
+#          решения, контроль исполнения, подписи, приложения.
+# §2.8.3 — редактор: автозаполнение, ручная правка, добавление/удаление разделов, приложения,
+#          предпросмотр, черновик и итоговый документ (DOCX/PDF в M09).
+# MTG-10 — конструктор шаблонов: блоки, переменные meeting.*, копирование, архив, восстановление версии.
+
+TPL_KINDS = ["Рабочее совещание", "Техническое совещание", "Оперативное совещание", "Совещание по проекту",
+             "Научно-техническое совещание", "Контроль исполнения поручений", "Пользовательский"]
+TPL_STATUSES = ["Действует", "Архивный"]
+PROTOCOL_FORMATS = ["Очное", "Дистанционное", "Смешанное"]
+DEFAULT_ORG = "Инженерное подразделение"
+TPL_MAX_BLOCKS = 40
+TPL_MAX_SECTIONS = 60
+# тип блока -> (наименование по MTG-10 §13.4, обязательный раздел §2.8.2)
+TPL_BLOCK_TYPES = {
+    "title":        ("Текстовый заголовок", False),
+    "requisites":   ("Реквизиты совещания", True),
+    "participants": ("Таблица участников", True),
+    "agenda":       ("Список вопросов повестки", True),
+    "discussion":   ("Блок обсуждения", False),
+    "decisions":    ("Блок решения", True),
+    "tasks":        ("Таблица поручений", False),
+    "attachments":  ("Приложения", False),
+    "signatures":   ("Подписи", True),
+    "text":         ("Текстовый блок", False),
+    "header":       ("Верхний колонтитул", False),
+    "footer":       ("Нижний колонтитул", False),
+    "numbering":    ("Нумерация страниц", False),
+}
+TPL_REQUIRED_BLOCKS = [k for k, v in TPL_BLOCK_TYPES.items() if v[1]]
+TPL_SINGLE_BLOCKS = ["header", "footer", "numbering", "title"]
+# переменные шаблона (MTG-10 §13.5) — логические поля, не код
+TPL_VARS = ["meeting.number", "meeting.date", "meeting.title", "meeting.location", "meeting.chairperson",
+            "meeting.secretary", "meeting.organizer", "meeting.participants", "meeting.agenda",
+            "meeting.decisions", "meeting.assignments", "meeting.attachments",
+            "protocol.number", "protocol.date", "organization"]
+TPL_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}")
+
+def tpl_block(type_, title="", text="", options=None, key=None):
+    label, required = TPL_BLOCK_TYPES[type_]
+    return {"id": key or uid("tb"), "type": type_, "title": title or label, "text": text or "",
+            "options": dict(options or {}), "required": required}
+
+def _base_blocks(n, extra=(), footer="", dec_opts=None, task_opts=None, disc_opts=None):
+    """Базовый состав блоков: 8 разделов §2.8.2 + заголовок, колонтитул и нумерация страниц."""
+    k = lambda t: "t%d-%s" % (n, t)
+    b = [tpl_block("title", "Протокол совещания", "Протокол № {{protocol.number}} от {{protocol.date}}", key=k("title")),
+         tpl_block("requisites", "1. Общие сведения", key=k("requisites")),
+         tpl_block("participants", "2. Присутствовали", key=k("participants")),
+         tpl_block("agenda", "3. Повестка дня", key=k("agenda")),
+         tpl_block("discussion", "4. Рассмотрение вопросов", options=disc_opts, key=k("discussion")),
+         tpl_block("decisions", "5. Принятые решения", options=dec_opts, key=k("decisions")),
+         tpl_block("tasks", "6. Контроль исполнения", options=task_opts, key=k("tasks")),
+         tpl_block("signatures", "7. Подписи", key=k("signatures")),
+         tpl_block("attachments", "8. Приложения", key=k("attachments"))]
+    for i, (title, text) in enumerate(extra):
+        b.append(tpl_block("text", title, text, key="t%d-x%d" % (n, i + 1)))
+    b.append(tpl_block("footer", "Нижний колонтитул",
+                       footer or "{{organization}} · протокол № {{protocol.number}} от {{protocol.date}}", key=k("footer")))
+    b.append(tpl_block("numbering", "Нумерация страниц", key=k("numbering")))
+    return b
+
+def base_templates():
+    """Шесть базовых шаблонов протокола (ТЗ §2.8.1)."""
+    return [
+        dict(id="tpl1", code="ШАБ-001", name="Протокол рабочего совещания", kind="Рабочее совещание",
+             meetTypes=["Оперативное", "Приёмочное"], isDefault=True, org=DEFAULT_ORG,
+             note="Базовый шаблон рабочего совещания подразделения.",
+             blocks=_base_blocks(1, extra=[("9. Заключение",
+                  "По итогам совещания {{meeting.number}} сформировано поручений: {{meeting.assignments}}.")])),
+        dict(id="tpl2", code="ШАБ-002", name="Протокол технического совещания", kind="Техническое совещание",
+             meetTypes=["Техническое"], isDefault=False, org=DEFAULT_ORG,
+             note="Технические решения, замечания к документации и результаты рассмотрения.",
+             blocks=_base_blocks(2, extra=[("9. Технические замечания", "")],
+                                 dec_opts={"criteria": True, "coassignees": True})),
+        dict(id="tpl3", code="ШАБ-003", name="Протокол оперативного совещания", kind="Оперативное совещание",
+             meetTypes=["Оперативное"], isDefault=False, org=DEFAULT_ORG,
+             note="Краткая форма: сжатое изложение обсуждения и акцент на поручениях.",
+             blocks=_base_blocks(3, disc_opts={"short": True}, task_opts={"overdue": True})),
+        dict(id="tpl4", code="ШАБ-004", name="Протокол совещания по проекту", kind="Совещание по проекту",
+             meetTypes=["Совещание с заказчиком"], isDefault=False, org=DEFAULT_ORG,
+             note="Проектные совещания: состояние проекта, сроки, риски, поручения.",
+             blocks=_base_blocks(4, extra=[("9. Состояние проекта", ""), ("10. Риски и ограничения", "")])),
+        dict(id="tpl5", code="ШАБ-005", name="Протокол научно-технического совещания", kind="Научно-техническое совещание",
+             meetTypes=[], isDefault=False, org=DEFAULT_ORG,
+             note="НТС: рассмотрение научно-технических вопросов и обоснование выводов.",
+             blocks=_base_blocks(5, extra=[("9. Научно-технические выводы", "")],
+                                 dec_opts={"criteria": True})),
+        dict(id="tpl6", code="ШАБ-006", name="Протокол совещания по контролю исполнения поручений",
+             kind="Контроль исполнения поручений", meetTypes=[], isDefault=False, org=DEFAULT_ORG,
+             note="Контроль исполнения: состояние поручений, просрочки, корректирующие решения.",
+             blocks=_base_blocks(6, extra=[("9. Сводка по просроченным поручениям", "")],
+                                 task_opts={"overdue": True, "criteria": True})),
+    ]
+
+def tpl_check_vars(text, where="текст блока"):
+    for v in TPL_VAR_RE.findall(str(text or "")):
+        if v not in TPL_VARS:
+            raise RpcError("Неизвестная переменная «%s» (%s). Допустимые: %s" % (v, where, ", ".join(TPL_VARS)),
+                           "Шаблон протокола")
+
+def tpl_norm(blocks):
+    """Проверка и нормализация состава блоков шаблона (MTG-10 §13.4)."""
+    if not isinstance(blocks, list) or not blocks:
+        raise RpcError("Шаблон должен содержать хотя бы один блок", "Шаблон протокола")
+    if len(blocks) > TPL_MAX_BLOCKS:
+        raise RpcError("В шаблоне не более %d блоков" % TPL_MAX_BLOCKS, "Шаблон протокола")
+    out, seen, ids = [], {}, set()
+    for b in blocks:
+        if not isinstance(b, dict): raise RpcError("Некорректное описание блока шаблона", "Шаблон протокола")
+        t = b.get("type")
+        if t not in TPL_BLOCK_TYPES:
+            raise RpcError("Неизвестный тип блока: %s. Допустимые: %s" % (t, ", ".join(TPL_BLOCK_TYPES)),
+                           "Шаблон протокола")
+        if t in TPL_SINGLE_BLOCKS and seen.get(t):
+            raise RpcError("Блок «%s» может быть в шаблоне только один" % TPL_BLOCK_TYPES[t][0], "Шаблон протокола")
+        seen[t] = seen.get(t, 0) + 1
+        title = str(b.get("title") or TPL_BLOCK_TYPES[t][0]).strip()[:200]
+        text = str(b.get("text") or "")[:4000]
+        opts = b.get("options") or {}
+        if not isinstance(opts, dict) or len(opts) > 10:
+            raise RpcError("Некорректные параметры блока «%s»" % title, "Шаблон протокола")
+        tpl_check_vars(title, "заголовок блока"); tpl_check_vars(text)
+        id_ = str(b.get("id") or uid("tb"))
+        if id_ in ids: raise RpcError("Повторяющийся идентификатор блока: %s" % id_, "Шаблон протокола")
+        ids.add(id_)
+        out.append({"id": id_, "type": t, "title": title, "text": text,
+                    "options": {str(k)[:40]: opts[k] for k in opts}, "required": TPL_BLOCK_TYPES[t][1]})
+    missing = [TPL_BLOCK_TYPES[t][0] for t in TPL_REQUIRED_BLOCKS if not seen.get(t)]
+    if missing:
+        raise RpcError("В шаблоне отсутствуют обязательные разделы (§2.8.2): %s" % "; ".join(missing),
+                       "Шаблон протокола")
+    return out
+
+def tpl_pub(t, full=False):
+    """Публичное представление шаблона (каталог MTG-10)."""
+    r = {k: t.get(k) for k in ("id", "code", "name", "kind", "meetTypes", "version", "status", "isDefault",
+                               "org", "note", "author", "createdAt", "updatedAt", "updatedBy")}
+    r["blocksCount"] = len(t.get("blocks") or [])
+    r["versionsCount"] = len(t.get("history") or [])
+    if full:
+        r["blocks"] = t.get("blocks") or []
+        r["history"] = [{k: h.get(k) for k in ("v", "ts", "by", "note")} for h in (t.get("history") or [])]
+    return r
+
+def tpl_snapshot(t):
+    return {"id": t["id"], "code": t["code"], "name": t["name"], "version": t.get("version", 1),
+            "kind": t.get("kind", "")} if t else {}
+
+def _tpl_seed_cur(db, cur):
+    """Создание отсутствующих базовых шаблонов на переданном курсоре (идемпотентно)."""
+    added = 0
+    for t in base_templates():
+        cur.execute("SELECT 1 FROM templates WHERE id=%s OR code=%s", (t["id"], t["code"]))
+        if cur.fetchone(): continue
+        now = now_ms()
+        cur.execute("INSERT INTO templates(id,code,name,kind,meet_types,version,status,is_default,org,note,"
+                    "blocks,history,author,created_at,updated_at,updated_by) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (t["id"], t["code"], t["name"], t["kind"], psycopg2.extras.Json(t["meetTypes"]), 1,
+                     "Действует", t["isDefault"], t["org"], t["note"],
+                     psycopg2.extras.Json(tpl_norm(t["blocks"])), psycopg2.extras.Json([]),
+                     "u1", now, now, "u1"))
+        added += 1
+    if added:
+        db.bump(cur)
+        LOG.info("Библиотека шаблонов протокола: создано базовых шаблонов — %d", added)
+    return added
+
+def ensure_base_templates(db):
+    """Базовые шаблоны §2.8.1 создаются однократно (идемпотентно)."""
+    conn = db.get()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            added = _tpl_seed_cur(db, cur)
+        conn.commit()
+        return added
+    finally: db.put(conn)
+
+def tpl_for_meeting(db, cur, m):
+    """Выбор шаблона: реквизиты совещания → шаблон по виду совещания → «по умолчанию» → первый действующий."""
+    rq = m.get("requisites") or {}
+    if rq.get("templateId"):
+        t = db.get_ent(cur, "template", rq["templateId"])
+        if t and t["status"] == "Действует": return t
+    acts = [t for t in db.all_ent(cur, "template") if t["status"] == "Действует"]
+    acts.sort(key=lambda t: t["code"])
+    for t in acts:
+        if m.get("type") in (t.get("meetTypes") or []): return t
+    for t in acts:
+        if t.get("isDefault"): return t
+    return acts[0] if acts else None
+
+def req_of(db, cur, m):
+    """Реквизиты протокола с автозаполнением (§2.8.2 п.1, §2.8.3 автозаполнение)."""
+    rq = dict(m.get("requisites") or {})
+    s = db.settings(cur)
+    num = rq.get("number") or ("П-%s" % str(m.get("code", "")).replace("СОВ-", ""))
+    return {"org": rq.get("org") or s.get("orgName") or DEFAULT_ORG,
+            "department": rq.get("department") or "",
+            "place": rq.get("place") or "",
+            "format": rq.get("format") if rq.get("format") in PROTOCOL_FORMATS else "Очное",
+            "organizer": rq.get("organizer") or m.get("secretary") or "",
+            "number": num, "date": rq.get("date") or m.get("date") or dISO(today()),
+            "templateId": rq.get("templateId") or ""}
+
+def tpl_context(db, cur, m, rq=None):
+    """Значения переменных meeting.* / protocol.* для подстановки в шаблон (MTG-10 §13.5)."""
+    rq = rq or req_of(db, cur, m)
+    parts = part_norm(m)
+    ag = m.get("agenda") or []
+    decs = m.get("decisions") or []
+    tasks = [t for x in decs for t in dec_task_ids(x)]
+    atts = (m.get("draft") or {}).get("attachments") or []
+    return {
+        "meeting.number": m.get("code", ""), "meeting.date": _fd(m.get("date")),
+        "meeting.title": m.get("title", ""), "meeting.location": rq.get("place") or "не указано",
+        "meeting.chairperson": _uname(db, cur, m.get("chair")), "meeting.secretary": _uname(db, cur, m.get("secretary")),
+        "meeting.organizer": _uname(db, cur, rq.get("organizer")) or "не назначен",
+        "meeting.participants": "; ".join(_uname(db, cur, a["userId"]) for a in parts) or "состав не зарегистрирован",
+        "meeting.agenda": "; ".join("%s. %s" % (a.get("n", i + 1), a.get("title", "")) for i, a in enumerate(ag)) or "повестка не сформирована",
+        "meeting.decisions": "; ".join(x.get("text", "") for x in decs) or "решения не зарегистрированы",
+        "meeting.assignments": str(len(tasks)),
+        "meeting.attachments": "; ".join(x.get("name", "") for x in atts) or "приложения не зарегистрированы",
+        "protocol.number": rq.get("number", ""), "protocol.date": _fd(rq.get("date")),
+        "organization": rq.get("org") or DEFAULT_ORG,
+    }
+
+def tpl_render(text, ctx):
+    return TPL_VAR_RE.sub(lambda mo: str(ctx.get(mo.group(1), mo.group(0))), str(text or ""))
+
+def draft_of(m):
+    d = dict(m.get("draft") or {})
+    for k in ("sections", "attachments"):
+        if not isinstance(d.get(k), list): d[k] = []
+    d.setdefault("conclusion", ""); d.setdefault("note", "")
+    return d
+
+def protocol_sections(db, cur, m, tpl=None):
+    """Разделы протокола: состав из шаблона + правки черновика (§2.8.3)."""
+    tpl = tpl if tpl is not None else tpl_for_meeting(db, cur, m)
+    blocks = (tpl or {}).get("blocks") or _base_blocks(0)
+    dr = draft_of(m)
+    saved = {s.get("key"): s for s in dr["sections"] if isinstance(s, dict)}
+    out, keys = [], set()
+    for b in blocks:
+        auto = b["type"] not in ("text", "title", "header", "footer", "numbering")
+        s = {"key": b["id"], "type": b["type"], "title": b["title"], "text": b.get("text", ""),
+             "required": b["required"], "options": b.get("options") or {}, "auto": auto,
+             "body": "", "custom": False}
+        sv = saved.get(b["id"])
+        if sv:
+            s["title"] = str(sv.get("title") or s["title"])[:200]
+            s["body"] = str(sv.get("body") or "")[:20000]
+            if not s["required"] and auto: s["auto"] = bool(sv.get("auto", True))
+        out.append(s); keys.add(b["id"])
+    for sv in dr["sections"]:
+        if not isinstance(sv, dict) or sv.get("key") in keys: continue
+        out.append({"key": sv.get("key"), "type": "text", "title": str(sv.get("title") or "Раздел")[:200],
+                    "text": "", "required": False, "options": {}, "auto": False,
+                    "body": str(sv.get("body") or "")[:20000], "custom": True})
+    return out[:TPL_MAX_SECTIONS]
+
+def protocol_plain(db, cur, m, secs=None, ctx=None):
+    """Текстовое представление протокола (предпросмотр MTG-09 и контрольная сумма версии)."""
+    rq = req_of(db, cur, m)
+    ctx = ctx or tpl_context(db, cur, m, rq)
+    secs = secs if secs is not None else protocol_sections(db, cur, m)
+    lines = ["%s. Протокол № %s от %s" % (rq["org"], rq["number"], _fd(rq["date"])), m.get("title", "")]
+    for s in secs:
+        if s["type"] in ("header", "footer", "numbering"): continue
+        if s["type"] == "title":
+            lines.append(tpl_render(s["text"] or s["title"], ctx)); continue
+        lines.append(s["title"])
+        if s["auto"]: lines.append(_section_plain(db, cur, m, s, rq))
+        if s["body"]: lines.append(s["body"])
+        if s["type"] == "text" and s["text"]: lines.append(tpl_render(s["text"], ctx))
+    dr = draft_of(m)
+    if dr["conclusion"]: lines += ["Заключение", dr["conclusion"]]
+    return "\n".join(x for x in lines if x)
+
+def _section_plain(db, cur, m, s, rq):
+    """Краткое автозаполнение раздела для текстового предпросмотра."""
+    t = s["type"]
+    if t == "requisites":
+        return "; ".join("%s: %s" % (k, v) for k, v in [
+            ("Организация", rq["org"]), ("Подразделение", rq["department"] or "—"),
+            ("Наименование", m.get("title", "")), ("Номер протокола", rq["number"]),
+            ("Дата протокола", _fd(rq["date"])), ("Дата совещания", _fd(m.get("date"))),
+            ("Место", rq["place"] or "—"), ("Формат", rq["format"]),
+            ("Председатель", _uname(db, cur, m.get("chair"))), ("Секретарь", _uname(db, cur, m.get("secretary"))),
+            ("Организатор", _uname(db, cur, rq["organizer"]) or "—")])
+    if t == "participants":
+        parts = part_norm(m)
+        return "; ".join("%s (%s, %s)" % (_uname(db, cur, a["userId"]), a["role"], a["participation"])
+                         for a in parts) or "Состав участников не зарегистрирован."
+    if t == "agenda":
+        ag = m.get("agenda") or []
+        return "; ".join("%s. %s — %s" % (a.get("n", i + 1), a.get("title", ""), _uname(db, cur, a.get("reporter")))
+                         for i, a in enumerate(ag)) or "Вопросы повестки не зарегистрированы."
+    if t == "discussion":
+        ag = m.get("agenda") or []
+        out = []
+        for a in ag:
+            out.append("Вопрос %s. %s: %s" % (a.get("n", ""), a.get("title", ""),
+                       a.get("discussion") or a.get("fact") or "обсуждение не зафиксировано"))
+            if a.get("remarks"): out.append("Замечания и предложения: %s" % a["remarks"])
+            if a.get("problems"): out.append("Выявленные проблемы: %s" % a["problems"])
+        return "\n".join(out) or "Материалы обсуждения не зарегистрированы."
+    if t == "decisions":
+        decs = m.get("decisions") or []
+        return "; ".join("%s (ответственный %s, срок %s)" % (x.get("text", ""), _uname(db, cur, x.get("resp")),
+                         _fd(x.get("due"))) for x in decs) or "Решения не зарегистрированы."
+    if t == "tasks":
+        rows = []
+        for x in m.get("decisions") or []:
+            for tid in dec_task_ids(x):
+                t2 = db.get_ent(cur, "task", tid)
+                if t2: rows.append("%s %s — %s, %s, %d%%" % (t2["code"], t2["title"],
+                                   _uname(db, cur, t2["assignee"]), _fd(t2["end"]), t2["progress"]))
+        return "; ".join(rows) or "Поручения не созданы."
+    if t == "signatures":
+        return "Председатель: %s; секретарь: %s" % (_uname(db, cur, m.get("chair")), _uname(db, cur, m.get("secretary")))
+    if t == "attachments":
+        atts = draft_of(m)["attachments"]
+        return "; ".join("%s%s" % (x.get("name", ""), " (версия %s)" % x["docV"] if x.get("docV") else "")
+                         for x in atts) or "Приложения не зарегистрированы."
+    return ""
+
+def _prot_editable(m):
+    pr = prot_of(m)
+    if pr["status"] not in PROTOCOL_EDITABLE:
+        raise RpcError("Протокол в статусе «%s» не редактируется: создайте новую редакцию (MTG-09)" % pr["status"],
+                       "Протокол", 409, "PROTOCOL_LOCKED")
+    return pr
+
+def _draft_touch(m, u, pr=None):
+    dr = draft_of(m)
+    dr["updatedAt"] = now_ms(); dr["updatedBy"] = u["id"]
+    tpl = m.get("_tpl_cache")
+    if tpl: dr["templateId"] = tpl["id"]; dr["templateV"] = tpl.get("version", 1)
+    m["draft"] = dr
+    if pr is not None and pr["status"] == "Подготовка":
+        pr["status"] = "Черновик"; m["protocol"] = pr
+    return dr
+
+# ---------------- Каталог и конструктор шаблонов (MTG-10) ----------------
+
+@reg("template.list")
+def h_template_list(db, cur, u, p):
+    guard(db, cur, u, "meetings", "view")
+    items = db.all_ent(cur, "template")
+    if p.get("status"):
+        if p["status"] not in TPL_STATUSES: raise RpcError("Неизвестный статус шаблона: %s" % p["status"])
+        items = [t for t in items if t["status"] == p["status"]]
+    if p.get("kind"): items = [t for t in items if t["kind"] == p["kind"]]
+    if p.get("meetType"): items = [t for t in items if p["meetType"] in (t.get("meetTypes") or [])]
+    items.sort(key=lambda t: t["code"])
+    return {"items": [tpl_pub(t) for t in items], "kinds": TPL_KINDS, "blockTypes": TPL_BLOCK_TYPES,
+            "variables": TPL_VARS, "default": next((t["id"] for t in items if t.get("isDefault")), "")}, msg(
+        "Шаблонов: %d" % len(items), "Библиотека шаблонов протокола · ТЗ §2.8.1")
+
+@reg("template.get")
+def h_template_get(db, cur, u, p):
+    guard(db, cur, u, "meetings", "view")
+    t = get_req(db, cur, "template", p["id"])
+    return tpl_pub(t, full=True), msg("Шаблон %s" % t["code"], "%s · версия %d" % (t["name"], t["version"]))
+
+def _tpl_code(db, cur):
+    """Следующий свободный код шаблона (базовые шаблоны занимают ШАБ-001…ШАБ-006)."""
+    used = {x["code"] for x in db.all_ent(cur, "template")}
+    n = next_seq(db, cur, "template")
+    while ("ШАБ-%03d" % n) in used: n += 1
+    s = db.settings(cur); s["seq"]["template"] = n; db.save_settings(cur, s)
+    return "ШАБ-%03d" % n
+
+def _tpl_save_new(db, cur, u, t):
+    t = dict(t)
+    t.update(id=t.get("id") or uid("tpl"), code=_tpl_code(db, cur), version=1, status="Действует",
+             isDefault=bool(t.get("isDefault")), author=u["id"], createdAt=now_ms(),
+             updatedAt=now_ms(), updatedBy=u["id"], history=[], blocks=tpl_norm(t.get("blocks") or []))
+    if t["isDefault"]:
+        for o in db.all_ent(cur, "template"):
+            if o.get("isDefault"):
+                o["isDefault"] = False; db.save_ent(cur, "template", o)
+    db.save_ent(cur, "template", t)
+    return t
+
+@reg("template.create")
+def h_template_create(db, cur, u, p):
+    """Создание шаблона администратором (§2.8.1)."""
+    guard(db, cur, u, "admin", "edit")
+    req(p, "name")
+    name = str(p["name"]).strip()[:200]
+    kind = p.get("kind") or "Пользовательский"
+    if kind not in TPL_KINDS: raise RpcError("Неизвестный вид шаблона: %s" % kind, "Шаблон протокола")
+    mts = p.get("meetTypes") or []
+    if not isinstance(mts, list) or len(mts) > 10: raise RpcError("Некорректный список видов совещаний", "Шаблон протокола")
+    for x in db.all_ent(cur, "template"):
+        if x["name"].lower() == name.lower(): raise RpcError("Шаблон с таким названием уже существует", "Шаблон протокола")
+    blocks = p.get("blocks")
+    if blocks is None:
+        blocks = _base_blocks(0)
+    t = _tpl_save_new(db, cur, u, dict(name=name, kind=kind, meetTypes=mts, org=str(p.get("org") or DEFAULT_ORG)[:200],
+                                      note=str(p.get("note") or "")[:1000], blocks=blocks, isDefault=p.get("isDefault")))
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Создан шаблон протокола", "Шаблон", t["id"],
+             {"code": t["code"], "name": t["name"], "blocks": len(t["blocks"]), "event": "PROTOCOL_TEMPLATE_CREATED"})
+    return tpl_pub(t, full=True), msg("Шаблон создан: %s" % t["code"], "%s · блоков: %d" % (t["name"], len(t["blocks"])))
+
+@reg("template.copy")
+def h_template_copy(db, cur, u, p):
+    """Копирование шаблона (MTG-10): новая запись версии 1."""
+    guard(db, cur, u, "admin", "edit")
+    src = get_req(db, cur, "template", p["id"])
+    name = str(p.get("name") or ("%s (копия)" % src["name"])).strip()[:200]
+    for x in db.all_ent(cur, "template"):
+        if x["name"].lower() == name.lower(): raise RpcError("Шаблон с таким названием уже существует", "Шаблон протокола")
+    blocks = json.loads(json.dumps(src["blocks"]))
+    t = _tpl_save_new(db, cur, u, dict(name=name, kind=src["kind"], meetTypes=list(src.get("meetTypes") or []),
+                                      org=src.get("org") or DEFAULT_ORG,
+                                      note=str(p.get("note") or ("Копия шаблона %s" % src["code"]))[:1000],
+                                      blocks=blocks, isDefault=False))
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Скопирован шаблон протокола", "Шаблон", t["id"],
+             {"code": t["code"], "source": src["code"], "event": "PROTOCOL_TEMPLATE_COPIED"})
+    return tpl_pub(t, full=True), msg("Шаблон скопирован: %s" % t["code"], "Источник: %s" % src["code"])
+
+@reg("template.update")
+def h_template_update(db, cur, u, p):
+    """Изменение шаблона: версия +1, предыдущая сохраняется в истории.
+    Ранее сформированные протоколы не изменяются (в версии хранится снимок шаблона)."""
+    guard(db, cur, u, "admin", "edit")
+    t = get_req(db, cur, "template", p["id"])
+    if t["status"] != "Действует": raise RpcError("Архивный шаблон не редактируется: восстановите его", "Шаблон протокола")
+    before = tpl_pub(t)
+    prev_blocks = json.loads(json.dumps(t.get("blocks") or []))
+    if p.get("name") is not None:
+        name = str(p["name"]).strip()[:200]
+        if not name: raise RpcError("Не заполнено название шаблона", "Шаблон протокола")
+        for x in db.all_ent(cur, "template"):
+            if x["id"] != t["id"] and x["name"].lower() == name.lower():
+                raise RpcError("Шаблон с таким названием уже существует", "Шаблон протокола")
+        t["name"] = name
+    if p.get("kind") is not None:
+        if p["kind"] not in TPL_KINDS: raise RpcError("Неизвестный вид шаблона: %s" % p["kind"], "Шаблон протокола")
+        t["kind"] = p["kind"]
+    if p.get("meetTypes") is not None:
+        if not isinstance(p["meetTypes"], list) or len(p["meetTypes"]) > 10:
+            raise RpcError("Некорректный список видов совещаний", "Шаблон протокола")
+        t["meetTypes"] = p["meetTypes"]
+    if p.get("org") is not None: t["org"] = str(p["org"])[:200]
+    if p.get("note") is not None: t["note"] = str(p["note"])[:1000]
+    if p.get("blocks") is not None: t["blocks"] = tpl_norm(p["blocks"])
+    t["history"] = (t.get("history") or []) + [{"v": t["version"], "ts": now_ms(), "by": u["id"],
+                                               "note": str(p.get("note") or "Изменение шаблона")[:500],
+                                               "blocks": prev_blocks,
+                                               "name": before["name"], "kind": before["kind"],
+                                               "meetTypes": before["meetTypes"], "org": before["org"]}]
+    t["history"] = t["history"][-50:]
+    t["version"] += 1
+    t["updatedAt"] = now_ms(); t["updatedBy"] = u["id"]
+    db.save_ent(cur, "template", t)
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Изменён шаблон протокола", "Шаблон", t["id"],
+             {"code": t["code"], "version": t["version"], "event": "PROTOCOL_TEMPLATE_UPDATED"})
+    return tpl_pub(t, full=True), msg("Шаблон обновлён (версия %d)" % t["version"],
+                                      "Ранее выпущенные протоколы не изменяются")
+
+@reg("template.default")
+def h_template_default(db, cur, u, p):
+    """Признак «шаблон по умолчанию» — единственный в библиотеке."""
+    guard(db, cur, u, "admin", "edit")
+    t = get_req(db, cur, "template", p["id"])
+    if t["status"] != "Действует": raise RpcError("Архивный шаблон не может быть шаблоном по умолчанию", "Шаблон протокола")
+    for o in db.all_ent(cur, "template"):
+        if o.get("isDefault") != (o["id"] == t["id"]):
+            o["isDefault"] = (o["id"] == t["id"]); o["updatedAt"] = now_ms(); o["updatedBy"] = u["id"]
+            db.save_ent(cur, "template", o)
+    t = get_req(db, cur, "template", t["id"])
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Изменён шаблон протокола по умолчанию", "Шаблон", t["id"],
+             {"code": t["code"], "event": "PROTOCOL_TEMPLATE_DEFAULT"})
+    return tpl_pub(t), msg("Шаблон по умолчанию: %s" % t["code"], t["name"])
+
+@reg("template.archive")
+def h_template_archive(db, cur, u, p):
+    guard(db, cur, u, "admin", "edit")
+    t = get_req(db, cur, "template", p["id"])
+    if t["status"] == "Архивный": raise RpcError("Шаблон уже в архиве", "Шаблон протокола")
+    if t.get("isDefault"):
+        raise RpcError("Шаблон по умолчанию нельзя архивировать: назначьте другой шаблон", "Шаблон протокола")
+    used = [m["code"] for m in db.all_ent(cur, "meeting")
+            if (m.get("requisites") or {}).get("templateId") == t["id"]]
+    if used and not p.get("confirm"):
+        raise RpcError("Шаблон выбран в совещаниях: %s. Подтвердите архивирование." % ", ".join(used[:5]),
+                       "Требуется подтверждение", 409, "NEED_CONFIRM")
+    t["status"] = "Архивный"; t["updatedAt"] = now_ms(); t["updatedBy"] = u["id"]
+    db.save_ent(cur, "template", t)
+    db.audit(cur, "AUDIT", "warning", u["id"], "meetings", "Шаблон протокола переведён в архив", "Шаблон", t["id"],
+             {"code": t["code"], "event": "PROTOCOL_TEMPLATE_ARCHIVED"})
+    return tpl_pub(t), msg("Шаблон в архиве", "Ранее выпущенные протоколы сохранены")
+
+@reg("template.restore")
+def h_template_restore(db, cur, u, p):
+    guard(db, cur, u, "admin", "edit")
+    t = get_req(db, cur, "template", p["id"])
+    if t["status"] != "Архивный": raise RpcError("Шаблон не в архиве", "Шаблон протокола")
+    t["status"] = "Действует"; t["updatedAt"] = now_ms(); t["updatedBy"] = u["id"]
+    db.save_ent(cur, "template", t)
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Шаблон протокола восстановлен из архива", "Шаблон", t["id"],
+             {"code": t["code"], "event": "PROTOCOL_TEMPLATE_RESTORED"})
+    return tpl_pub(t), msg("Шаблон восстановлен", t["name"])
+
+@reg("template.rollback")
+def h_template_rollback(db, cur, u, p):
+    """Восстановление предыдущей версии шаблона (MTG-10)."""
+    guard(db, cur, u, "admin", "edit")
+    t = get_req(db, cur, "template", p["id"])
+    hist = t.get("history") or []
+    if not hist: raise RpcError("У шаблона нет сохранённых предыдущих версий", "Шаблон протокола")
+    v = p.get("v")
+    h = next((x for x in hist if x["v"] == v), None) if v else hist[-1]
+    if not h: raise RpcError("Версия шаблона не найдена: %s" % v, "Шаблон протокола", 404, "NOT_FOUND")
+    t["history"] = hist + [{"v": t["version"], "ts": now_ms(), "by": u["id"],
+                            "note": "Откат к версии %d" % h["v"],
+                            "blocks": json.loads(json.dumps(t["blocks"])), "name": t["name"],
+                            "kind": t["kind"], "meetTypes": t["meetTypes"], "org": t["org"]}]
+    t["blocks"] = tpl_norm(h.get("blocks") or t["blocks"])
+    t["name"] = h.get("name") or t["name"]; t["kind"] = h.get("kind") or t["kind"]
+    t["meetTypes"] = h.get("meetTypes") or t["meetTypes"]; t["org"] = h.get("org") or t["org"]
+    t["version"] += 1; t["updatedAt"] = now_ms(); t["updatedBy"] = u["id"]
+    db.save_ent(cur, "template", t)
+    db.audit(cur, "AUDIT", "warning", u["id"], "meetings", "Восстановлена версия шаблона протокола", "Шаблон", t["id"],
+             {"code": t["code"], "from": h["v"], "version": t["version"], "event": "PROTOCOL_TEMPLATE_ROLLBACK"})
+    return tpl_pub(t, full=True), msg("Восстановлена версия %d" % h["v"], "Текущая версия шаблона: %d" % t["version"])
+
+@reg("template.preview")
+def h_template_preview(db, cur, u, p):
+    """Предпросмотр шаблона: на данных совещания либо на демонстрационном наборе."""
+    guard(db, cur, u, "meetings", "view")
+    t = get_req(db, cur, "template", p["id"])
+    if p.get("meetingId"):
+        m = get_req(db, cur, "meeting", p["meetingId"])
+        rq = req_of(db, cur, m)
+        secs = protocol_sections(db, cur, m, t)
+        ctx = tpl_context(db, cur, m, rq)
+        plain = protocol_plain(db, cur, m, secs, ctx)
+        code = m["code"]
+    else:
+        rq = {"org": t.get("org") or DEFAULT_ORG, "department": "", "place": "Каб. 214", "format": "Очное",
+              "organizer": "", "number": "П-ДЕМО-001", "date": dISO(today())}
+        ctx = {"meeting.number": "СОВ-ДЕМО-001", "meeting.date": _fd(dISO(today())),
+               "meeting.title": "Демонстрационное совещание", "meeting.location": rq["place"],
+               "meeting.chairperson": "Морозов Дмитрий", "meeting.secretary": "Волкова Елена",
+               "meeting.organizer": "Волкова Елена", "meeting.participants": "Морозов Дмитрий; Волкова Елена",
+               "meeting.agenda": "1. Демонстрационный вопрос", "meeting.decisions": "1. Демонстрационное решение",
+               "meeting.assignments": "1", "meeting.attachments": "Приложение 1 (демо)",
+               "protocol.number": rq["number"], "protocol.date": _fd(rq["date"]), "organization": rq["org"]}
+        secs = [{"key": b["id"], "type": b["type"], "title": b["title"], "text": b["text"],
+                 "required": b["required"], "options": b["options"], "body": "", "custom": False,
+                 "auto": b["type"] not in ("text", "title", "header", "footer", "numbering")} for b in t["blocks"]]
+        lines = ["%s. Протокол № %s от %s" % (rq["org"], rq["number"], _fd(rq["date"])), ctx["meeting.title"]]
+        for s in secs:
+            if s["type"] in ("header", "footer", "numbering"): continue
+            if s["type"] == "title": lines.append(tpl_render(s["text"] or s["title"], ctx)); continue
+            lines.append(s["title"])
+            if s["type"] == "text": lines.append(tpl_render(s["text"], ctx) or "—")
+            else: lines.append("[%s]" % TPL_BLOCK_TYPES[s["type"]][0])
+        plain = "\n".join(lines); code = "демо"
+    return {"template": tpl_pub(t), "plain": plain, "code": code,
+            "blocks": [{"title": s["title"], "type": s["type"], "text": tpl_render(s["text"], ctx),
+                        "required": s["required"]} for s in secs],
+            "header": tpl_render(next((b["text"] for b in t["blocks"] if b["type"] == "header"), ""), ctx),
+            "footer": tpl_render(next((b["text"] for b in t["blocks"] if b["type"] == "footer"), ""), ctx)}, msg(
+        "Предпросмотр шаблона %s" % t["code"], "Данные: %s" % code)
+
+# ---------------- Реквизиты протокола и редактор черновика (MTG-09) ----------------
+
+@reg("meeting.requisites")
+def h_meeting_requisites(db, cur, u, p):
+    """Реквизиты протокола: организация/подразделение, место, формат, организатор, номер, дата, шаблон."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    _prot_editable(m)
+    rq = req_of(db, cur, m)
+    for k in ("org", "department", "place", "number"):
+        if p.get(k) is not None:
+            lim = 200 if k != "number" else 50
+            rq[k] = str(p[k]).strip()[:lim]
+    if not rq["org"]: raise RpcError("Не заполнено наименование организации", "Реквизиты протокола")
+    if not rq["number"]: raise RpcError("Не заполнен номер протокола", "Реквизиты протокола")
+    if p.get("format") is not None:
+        if p["format"] not in PROTOCOL_FORMATS:
+            raise RpcError("Неизвестный формат проведения: %s. Допустимые: %s" % (p["format"], ", ".join(PROTOCOL_FORMATS)),
+                           "Реквизиты протокола")
+        rq["format"] = p["format"]
+    if p.get("date") is not None:
+        check_date(p["date"], "дата протокола"); rq["date"] = p["date"]
+    if p.get("organizer") is not None:
+        if p["organizer"]:
+            cur.execute("SELECT 1 FROM users WHERE id=%s AND NOT blocked", (p["organizer"],))
+            if not cur.fetchone(): raise RpcError("Организатор не найден в справочнике сотрудников", "Реквизиты протокола")
+        rq["organizer"] = p["organizer"]
+    if p.get("templateId") is not None:
+        if p["templateId"]:
+            t = get_req(db, cur, "template", p["templateId"])
+            if t["status"] != "Действует": raise RpcError("Выбран архивный шаблон", "Реквизиты протокола")
+        rq["templateId"] = p["templateId"]
+    for x in db.all_ent(cur, "meeting"):
+        if x["id"] != m["id"] and req_of(db, cur, x)["number"] == rq["number"]:
+            raise RpcError("Номер протокола %s уже занят совещанием %s" % (rq["number"], x["code"]), "Реквизиты протокола")
+    m["requisites"] = rq
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Изменены реквизиты протокола", "Совещание", m["id"],
+             {"code": m["code"], "number": rq["number"], "template": rq["templateId"], "event": "MEETING_REQUISITES_CHANGED"})
+    return {"meeting": m, "requisites": rq, "template": tpl_snapshot(tpl_for_meeting(db, cur, m))}, msg(
+        "Реквизиты протокола сохранены", "Протокол № %s от %s" % (rq["number"], _fd(rq["date"])))
+
+@reg("meeting.protocol.draft.get")
+def h_protocol_draft_get(db, cur, u, p):
+    """Черновик протокола: автозаполнение по шаблону + сохранённые правки (§2.8.3)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "view", m)
+    tpl = tpl_for_meeting(db, cur, m)
+    rq = req_of(db, cur, m)
+    secs = protocol_sections(db, cur, m, tpl)
+    ctx = tpl_context(db, cur, m, rq)
+    dr = draft_of(m)
+    return {"sections": secs, "conclusion": dr["conclusion"], "attachments": dr["attachments"],
+            "requisites": rq, "template": tpl_snapshot(tpl), "context": ctx,
+            "updatedAt": dr.get("updatedAt"), "updatedBy": dr.get("updatedBy"),
+            "status": prot_of(m)["status"], "editable": prot_of(m)["status"] in PROTOCOL_EDITABLE,
+            "blockTypes": TPL_BLOCK_TYPES, "variables": TPL_VARS}, msg(
+        "Черновик протокола", "Шаблон %s · разделов: %d" % ((tpl or {}).get("code", "—"), len(secs)))
+
+@reg("meeting.protocol.draft.save")
+def h_protocol_draft_save(db, cur, u, p):
+    """Сохранение черновика: ручная правка заголовков и текста разделов, автозаполнение вкл/выкл."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    pr = _prot_editable(m)
+    tpl = tpl_for_meeting(db, cur, m)
+    cur_secs = {s["key"]: s for s in protocol_sections(db, cur, m, tpl)}
+    dr = draft_of(m)
+    if p.get("sections") is not None:
+        if not isinstance(p["sections"], list) or len(p["sections"]) > TPL_MAX_SECTIONS:
+            raise RpcError("Некорректный состав разделов черновика", "Протокол")
+        saved = {s.get("key"): s for s in dr["sections"] if isinstance(s, dict)}
+        for s in p["sections"]:
+            if not isinstance(s, dict) or not s.get("key"):
+                raise RpcError("Не указан ключ раздела", "Протокол")
+            key = s["key"]
+            if key not in cur_secs: raise RpcError("Раздел не найден: %s" % key, "Протокол", 404, "NOT_FOUND")
+            base = cur_secs[key]
+            title = str(s.get("title") if s.get("title") is not None else base["title"]).strip()[:200]
+            if not title: raise RpcError("Не заполнено наименование раздела", "Протокол")
+            body = str(s.get("body") or "")[:20000]
+            auto = bool(s.get("auto", base["auto"]))
+            if base["required"] and not auto and base["auto"]:
+                raise RpcError("Обязательный раздел «%s» нельзя отключить от данных совещания (§2.8.2)" % base["title"],
+                               "Протокол")
+            if not auto and not body and base["auto"]:
+                raise RpcError("Раздел «%s» без автозаполнения требует текста" % title, "Протокол")
+            tpl_check_vars(body, "текст раздела")
+            rec = dict(saved.get(key) or {}); rec.update(key=key, title=title, body=body, auto=auto)
+            saved[key] = rec
+        dr["sections"] = list(saved.values())
+    if p.get("conclusion") is not None:
+        dr["conclusion"] = str(p["conclusion"])[:5000]
+    if p.get("note") is not None: dr["note"] = str(p["note"])[:1000]
+    m["draft"] = dr
+    m["_tpl_cache"] = tpl
+    _draft_touch(m, u, pr)
+    m.pop("_tpl_cache", None)
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Сохранён черновик протокола", "Совещание", m["id"],
+             {"code": m["code"], "sections": len(dr["sections"]), "event": "MEETING_PROTOCOL_DRAFT_SAVED"})
+    return {"meeting": m, "sections": protocol_sections(db, cur, m, tpl), "status": prot_of(m)["status"]}, msg(
+        "Черновик протокола сохранён", "Разделов с правками: %d" % len(dr["sections"]))
+
+@reg("meeting.protocol.section.add")
+def h_protocol_section_add(db, cur, u, p):
+    """Добавление раздела протокола вручную (§2.8.3)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    pr = _prot_editable(m)
+    req(p, "title")
+    title = str(p["title"]).strip()[:200]
+    body = str(p.get("body") or "")[:20000]
+    tpl_check_vars(body, "текст раздела")
+    dr = draft_of(m)
+    if len(protocol_sections(db, cur, m)) >= TPL_MAX_SECTIONS:
+        raise RpcError("В протоколе не более %d разделов" % TPL_MAX_SECTIONS, "Протокол")
+    for s in dr["sections"]:
+        if s.get("title", "").lower() == title.lower():
+            raise RpcError("Раздел с таким наименованием уже есть", "Протокол")
+    key = uid("ps")
+    dr["sections"].append({"key": key, "title": title, "body": body, "auto": False, "custom": True,
+                           "addedAt": now_ms(), "addedBy": u["id"]})
+    m["draft"] = dr
+    _draft_touch(m, u, pr)
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Добавлен раздел протокола", "Совещание", m["id"],
+             {"code": m["code"], "title": title, "event": "MEETING_PROTOCOL_SECTION_ADDED"})
+    return {"meeting": m, "key": key, "sections": protocol_sections(db, cur, m)}, msg(
+        "Раздел добавлен", title)
+
+@reg("meeting.protocol.section.remove")
+def h_protocol_section_remove(db, cur, u, p):
+    """Удаление раздела протокола: обязательные разделы §2.8.2 удалить нельзя."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    pr = _prot_editable(m)
+    req(p, "key")
+    secs = {s["key"]: s for s in protocol_sections(db, cur, m)}
+    s = secs.get(p["key"])
+    if not s: raise RpcError("Раздел не найден: %s" % p["key"], "Протокол", 404, "NOT_FOUND")
+    if s["required"]:
+        raise RpcError("Раздел «%s» обязателен по §2.8.2 и не удаляется" % s["title"], "Протокол")
+    if not s["custom"]:
+        raise RpcError("Раздел «%s» задан шаблоном %s: измените шаблон (MTG-10)" % (s["title"], (tpl_for_meeting(db, cur, m) or {}).get("code", "")),
+                       "Протокол")
+    dr = draft_of(m)
+    dr["sections"] = [x for x in dr["sections"] if x.get("key") != p["key"]]
+    m["draft"] = dr
+    _draft_touch(m, u, pr)
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "warning", u["id"], "meetings", "Удалён раздел протокола", "Совещание", m["id"],
+             {"code": m["code"], "title": s["title"], "event": "MEETING_PROTOCOL_SECTION_REMOVED"})
+    return {"meeting": m, "sections": protocol_sections(db, cur, m)}, msg("Раздел удалён", s["title"])
+
+@reg("meeting.protocol.attach")
+def h_protocol_attach(db, cur, u, p):
+    """Приложение к протоколу (§2.8.2 п.8): документ M09 с фиксацией версии либо ссылка."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    pr = _prot_editable(m)
+    dr = draft_of(m)
+    if len(dr["attachments"]) >= 20: raise RpcError("Не более 20 приложений к протоколу", "Протокол")
+    att = {"id": uid("pa"), "addedAt": now_ms(), "addedBy": u["id"], "note": str(p.get("note") or "")[:500]}
+    if p.get("docId"):
+        doc = get_req(db, cur, "doc", p["docId"])
+        vs = doc.get("versions") or []
+        v = p.get("docV") or (max(x["v"] for x in vs) if vs else 1)
+        if vs and not any(x["v"] == v for x in vs):
+            raise RpcError("Версия документа не найдена: %s" % v, "Приложение", 404, "NOT_FOUND")
+        if any(x.get("docId") == doc["id"] and x.get("docV") == v for x in dr["attachments"]):
+            raise RpcError("Документ %s версии %s уже приложен" % (doc["code"], v), "Приложение")
+        att.update(kind="doc", docId=doc["id"], docCode=doc["code"], docV=v,
+                   name=str(p.get("name") or doc["title"])[:200])
+    else:
+        req(p, "name")
+        att.update(kind="link", name=str(p["name"]).strip()[:200], url=str(p.get("url") or "")[:500])
+        if not att["name"]: raise RpcError("Не заполнено наименование приложения", "Приложение")
+        if any(x.get("name", "").lower() == att["name"].lower() for x in dr["attachments"]):
+            raise RpcError("Приложение с таким наименованием уже есть", "Приложение")
+    dr["attachments"].append(att)
+    m["draft"] = dr
+    _draft_touch(m, u, pr)
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Добавлено приложение к протоколу", "Совещание", m["id"],
+             {"code": m["code"], "name": att["name"], "event": "MEETING_PROTOCOL_ATTACHMENT_ADDED"})
+    return {"meeting": m, "attachment": att, "attachments": dr["attachments"]}, msg("Приложение добавлено", att["name"])
+
+@reg("meeting.protocol.detach")
+def h_protocol_detach(db, cur, u, p):
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    pr = _prot_editable(m)
+    req(p, "attId")
+    dr = draft_of(m)
+    att = next((x for x in dr["attachments"] if x["id"] == p["attId"]), None)
+    if not att: raise RpcError("Приложение не найдено: %s" % p["attId"], "Приложение", 404, "NOT_FOUND")
+    dr["attachments"] = [x for x in dr["attachments"] if x["id"] != p["attId"]]
+    m["draft"] = dr
+    _draft_touch(m, u, pr)
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "warning", u["id"], "meetings", "Удалено приложение протокола", "Совещание", m["id"],
+             {"code": m["code"], "name": att["name"], "event": "MEETING_PROTOCOL_ATTACHMENT_REMOVED"})
+    return {"meeting": m, "attachments": dr["attachments"]}, msg("Приложение удалено", att["name"])
+
+@reg("meeting.protocol.preview")
+def h_protocol_preview(db, cur, u, p):
+    """Предпросмотр протокола без регистрации файла (§2.8.3, MTG-09)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "view", m)
+    tpl = tpl_for_meeting(db, cur, m)
+    rq = req_of(db, cur, m)
+    secs = protocol_sections(db, cur, m, tpl)
+    ctx = tpl_context(db, cur, m, rq)
+    plain = protocol_plain(db, cur, m, secs, ctx)
+    out = {"plain": plain, "sections": secs, "requisites": rq, "template": tpl_snapshot(tpl),
+           "checksum": hashlib.sha256(plain.encode("utf-8")).hexdigest()[:16],
+           "status": prot_of(m)["status"]}
+    if p.get("html"):
+        if docgen is None: raise RpcError("Генератор документов недоступен", "Экспорт", 500, "NO_DOCGEN")
+        out["html"] = docgen.html_bytes(meeting_protocol_doc(db, cur, u, m)).decode("utf-8")
+    return out, msg("Предпросмотр протокола", "Шаблон %s · разделов: %d" % ((tpl or {}).get("code", "—"), len(secs)))
+
+@reg("meeting.agenda.discussion")
+def h_agenda_discussion(db, cur, u, p):
+    """Рассмотрение вопроса (§2.8.2 п.4): обсуждение, замечания и предложения, выявленные проблемы."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    ag = m.get("agenda") or []
+    a = None
+    if p.get("itemId"): a = next((x for x in ag if x["id"] == p["itemId"]), None)
+    elif p.get("n") is not None: a = next((x for x in ag if x.get("n") == p["n"]), None)
+    else: raise RpcError("Не указан вопрос повестки (n или itemId)", "Проверка входных данных")
+    if not a: raise RpcError("Вопрос повестки не найден", "Повестка", 404, "NOT_FOUND")
+    for k, lim, label in (("discussion", 4000, "обсуждение"), ("remarks", 2000, "замечания и предложения"),
+                          ("problems", 2000, "выявленные проблемы")):
+        if p.get(k) is not None:
+            a[k] = str(p[k])[:lim]
+    if not (a.get("discussion") or a.get("remarks") or a.get("problems")):
+        raise RpcError("Заполните хотя бы одно поле: обсуждение, замечания или проблемы", "Рассмотрение вопроса")
+    a["history"] = (a.get("history") or []) + [{"ts": now_ms(), "by": u["id"], "action": "discussion",
+                                                "note": "Зафиксировано рассмотрение вопроса"}]
+    a["history"] = a["history"][-50:]
+    m["agenda"] = ag
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Зафиксировано обсуждение вопроса", "Совещание", m["id"],
+             {"code": m["code"], "n": a.get("n"), "event": "MEETING_AGENDA_DISCUSSION"})
+    return {"meeting": m, "item": a}, msg("Рассмотрение вопроса зафиксировано", "Вопрос %s. %s" % (a.get("n"), a.get("title")))
 
 # ---------------- Центр уведомлений и напоминаний (ТЗ M12 §8, M16 §2.11.1) ----------------
 # Единый контур доставки: уведомления хранятся на сервере (кому, тип, дата, канал, статус,
@@ -5286,7 +6238,7 @@ def read_file_bytes(db, cur, user, doc_id, v, fmt=None):
 
 # ---------------- Резервное копирование (M14) ----------------
 BACKUP_TABLES = ["users","projects","meetings","risks","tasks","docs","doc_versions","calcs","time_entries","cal_events","reports","events","settings",
-                 "notifications","reminders","meeting_tasks"]
+                 "notifications","reminders","meeting_tasks","templates"]
 # копии прежних версий (13 таблиц) восстанавливаются: новые таблицы считаются пустыми
 BACKUP_REQUIRED = ["users","projects","meetings","risks","tasks","docs","doc_versions","calcs","time_entries","cal_events","reports","events","settings"]
 
@@ -5339,13 +6291,14 @@ def restore_backup(db, user, data, token=None):
                         else: rest.append(row)
                     if len(rest) == len(pending): raise RpcError("Циклическая иерархия задач в копии", "Восстановление")
                     pending = rest; guard_n += 1
-                for t in ["meeting_tasks","docs","doc_versions","calcs","time_entries","cal_events","reports","events","settings","reminders","notifications"]:
+                for t in ["meeting_tasks","docs","doc_versions","calcs","time_entries","cal_events","reports","events","settings","reminders","notifications","templates"]:
                     for row in tables[t]: ins(t, row)
                 cur.execute("UPDATE meta SET v=(v::bigint+1)::text WHERE k='rev'")
                 LOG.warning("БД ВОССТАНОВЛЕНА из копии пользователем %s (копия от %s)", user.get("login"), data.get("ts"))
                 db.audit(cur, "SECURITY", "warning", user["id"], "admin", "БД восстановлена из резервной копии", "БД", "",
                          {"backupTs": data.get("ts"), "rows": {t: len(tables[t]) for t in BACKUP_TABLES}})
                 conn.commit()
+                if _tpl_seed_cur(db, cur): conn.commit()   # копия прежней версии — базовые шаблоны §2.8.1
                 cur.execute("SELECT 1 FROM users WHERE id=%s AND NOT blocked", (user["id"],))
                 alive = cur.fetchone() is not None
                 if alive and token:
@@ -5752,6 +6705,7 @@ def main():
     if args.migrate:
         print("Миграции применены; схема актуальна."); sys.exit(0)
     if not args.no_seed and cfg.get("seed", "1") == "1": seed(db)
+    ensure_base_templates(db)
     App.db = db
     srv = Server((host, port), App)
     scheme = "http"
@@ -5785,7 +6739,7 @@ def main():
 
 # ================= Установка и настройка через EXE (ТЗ §7) =================
 CONFIG_PATH = os.path.join(BASE_DIR, "supip.ini")
-SCHEMA_VERSION = 6   # 2 — уведомления (v1.4.0), 3 — маршрут протокола (v1.5.0), 4 — поручения (v1.6.0), 5 — планирование совещаний (v1.10.0), 6 — участники совещания и подразделение (v1.13.0)
+SCHEMA_VERSION = 7   # 2 — уведомления (v1.4.0), 3 — маршрут протокола (v1.5.0), 4 — поручения (v1.6.0), 5 — планирование совещаний (v1.10.0), 6 — участники совещания (v1.13.0), 7 — шаблоны протокола (v1.14.0)
 MIGRATIONS = {   # {версия: [SQL, ...]} — применяется по порядку при старте/обновлении
     2: [  # v1.4.0: центр уведомлений и напоминаний
         """CREATE TABLE IF NOT EXISTS notifications(
@@ -5827,6 +6781,18 @@ MIGRATIONS = {   # {версия: [SQL, ...]} — применяется по п
         "UPDATE users SET department='Инженерное подразделение' WHERE department=''",
         "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS participants JSONB NOT NULL DEFAULT '[]'",
         "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS actual_composition JSONB NOT NULL DEFAULT '{}'",
+    ],
+    7: [  # v1.14.0: библиотека шаблонов протокола, реквизиты и черновик (ТЗ M16 §2.8, MTG-09/MTG-10)
+        """CREATE TABLE IF NOT EXISTS templates(
+             id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'Пользовательский',
+             meet_types JSONB NOT NULL DEFAULT '[]', version INT NOT NULL DEFAULT 1,
+             status TEXT NOT NULL DEFAULT 'Действует', is_default BOOLEAN NOT NULL DEFAULT FALSE,
+             org TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
+             blocks JSONB NOT NULL DEFAULT '[]', history JSONB NOT NULL DEFAULT '[]',
+             author TEXT, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, updated_by TEXT)""",
+        "CREATE INDEX IF NOT EXISTS ix_templates_status ON templates(status)",
+        "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS requisites JSONB NOT NULL DEFAULT '{}'",
+        "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS protocol_draft JSONB NOT NULL DEFAULT '{}'",
     ],
 }
 
@@ -6001,6 +6967,8 @@ def run_install(auto_path=None):
     report.append("Схема БД создана/проверена (версия %d)%s" % (SCHEMA_VERSION, "; миграции: %s" % applied if applied else ""))
     seeded = seed(db)
     report.append("Демо-данные: %s" % ("создан эталонный набор" if seeded else "уже присутствуют"))
+    tpl_added = ensure_base_templates(db)
+    report.append("Библиотека шаблонов протокола: %s" % ("создано базовых шаблонов — %d" % tpl_added if tpl_added else "базовые шаблоны присутствуют"))
     # 5. Пароль администратора
     if admin_pass and admin_pass != "demo":
         conn = db.get()
@@ -6390,6 +7358,7 @@ def service_command(action, cfg=None):
                     db = DB(cfg["dsn"])
                     migrate(db)
                     if cfg.get("seed", "1") == "1": seed(db)
+                    ensure_base_templates(db)
                     App.db = db
                     srv = Server((cfg["host"], int(cfg["port"])), App)
                     if cfg.get("cert") and cfg.get("key"):
