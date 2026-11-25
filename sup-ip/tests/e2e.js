@@ -216,6 +216,185 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
  await page.evaluate(()=>nav('meetings'));
  await sleep(250);
 
+ console.log('== M16 §2.5: планирование совещаний ==');
+ const planBase = Date.now();
+ const planDate = new Date(planBase+14*864e5).toISOString().slice(0,10);
+ const moveDate = new Date(planBase+17*864e5).toISOString().slice(0,10);
+ const planWd = new Date(planDate+'T00:00:00').getDay()||7;
+ const drawerTxt = ()=>page.evaluate(()=>document.getElementById('drawer-root').textContent);
+ const modalTxt = ()=>page.evaluate(()=>document.getElementById('modal-root').textContent);
+ const txtOf = sel => page.$eval(sel,e=>e.textContent);
+ const serCount = mid => page.evaluate(m=>{
+  const r=(DB.meetings.find(x=>x.id===m)||{}).recurrence||{};
+  return DB.meetings.filter(x=>(x.recurrence||{}).seriesId&&x.recurrence.seriesId===r.seriesId).length;
+ },mid);
+ await page.evaluate(()=>{App.closeDrawer();App.f.mt={tab:'all'};nav('meetings');});
+ await sleep(400);
+ ok('реестр: сводка планирования §2.5', await page.$('#mt-plan-stat')!==null);
+ ok('реестр: фильтр по связанному проекту', await page.$('#mtf-proj')!==null);
+ ok('реестр: режимы «Регулярные» и «Отменённые»', (await page.$('#mt-tab-series'))!==null && (await page.$('#mt-tab-canc'))!==null);
+
+ // создание совещания: связанный проект и еженедельное повторение
+ await page.evaluate(()=>document.getElementById('mt-new').click());
+ await sleep(350);
+ ok('форма создания: проекты и правило повторения', (await page.$('.mt-prj'))!==null && (await page.$('#mt-freq'))!==null);
+ await page.evaluate((d,w)=>{
+  document.getElementById('mt-title').value='E2E плановое совещание';
+  document.getElementById('mt-date').value=d;
+  document.getElementById('mt-time').value='11:30';
+  document.querySelector('.mt-prj[value="p1"]').checked=true;
+  document.getElementById('mt-freq').value='weekly';
+  document.getElementById('mt-int').value='1';
+  document.querySelector('.mt-wd[value="'+w+'"]').checked=true;
+ },planDate,planWd);
+ await page.evaluate(()=>App.meetSave(null));
+ await sleep(900);
+ const planM = await page.evaluate(()=>{
+  const m=DB.meetings.find(x=>x.title==='E2E плановое совещание');
+  if(!m)return null;
+  const r=m.recurrence||{};
+  return {id:m.id,code:m.code,prj:m.projects||[],master:!!r.master,sid:r.seriesId||'',freq:r.freq};
+ });
+ const planMid = planM?planM.id:'';
+ ok('совещание §2.5 создано с кодом СОВ', !!(planM&&/^СОВ-\d{4}-\d+$/.test(planM.code)), planM&&planM.code);
+ ok('связанный проект зарегистрирован при создании', planM&&planM.prj.join(',')==='p1');
+ ok('головная карточка регулярной серии', !!(planM&&planM.master&&planM.sid&&planM.freq==='weekly'));
+ ok('ближайшие совещания серии созданы автоматически', (await serCount(planMid))>=3, String(await serCount(planMid)));
+
+ // вкладка «Планирование» карточки совещания
+ await page.evaluate(m=>{App.f.meetTab='plan';openMeeting(m);},planMid);
+ await sleep(450);
+ ok('карточка: вкладка «Планирование»', (await page.$('#mt-tab-plan'))!==null && (await page.$('#meet-plan'))!==null);
+ ok('планирование: дата, время и правило повторения', (await txtOf('#mp-when')).includes('11:30') && (await txtOf('#mp-rec')).includes('Еженедельно'));
+ ok('планирование: счётчики проектов и материалов', (await txtOf('#mp-prj-n'))==='1' && (await txtOf('#mp-mat-n'))==='0');
+ ok('кнопки переноса, отмены и расписания', (await page.$('#mp-move'))!==null && (await page.$('#mp-cancel'))!==null && (await page.$('#mp-rec-edit'))!==null);
+ ok('управление серией: создать, пропустить, состав', (await page.$('#mp-series-gen'))!==null && (await page.$('#mp-series-skip'))!==null && (await page.$('#mp-series-view'))!==null);
+
+ // предварительные материалы: документ M09 и ссылка на файл ЛВС
+ await page.evaluate(()=>document.getElementById('mp-mat-add').click());
+ await sleep(300);
+ ok('окно материала: документ M09 или ссылка', (await page.$('#mat-kind'))!==null && (await page.$('#mat-doc'))!==null);
+ await page.evaluate(()=>{document.getElementById('mat-doc').value='d1';document.getElementById('mat-note').value='Материал к рассмотрению';});
+ await page.evaluate(()=>document.getElementById('mat-save').click());
+ await sleep(700);
+ ok('документ M09 прикреплён как материал', (await txtOf('#mp-mat-n'))==='1' && (await drawerTxt()).includes('Д-001'));
+ await page.evaluate(m=>App.meetMatModal(m),planMid);
+ await sleep(300);
+ await page.evaluate(()=>{
+  document.getElementById('mat-kind').value='link';App.meetMatKind();
+  document.getElementById('mat-name').value='Смета на сетевом ресурсе';
+  document.getElementById('mat-url').value='\\\\lvs-srv\\share\\smeta.pdf';
+ });
+ ok('переключение вида материала на ссылку ЛВС', await page.$eval('#mat-link-box',e=>e.style.display!=='none'));
+ await page.evaluate(()=>document.getElementById('mat-save').click());
+ await sleep(700);
+ ok('ссылка ЛВС прикреплена как материал', (await txtOf('#mp-mat-n'))==='2' && (await drawerTxt()).includes('Смета на сетевом ресурсе'));
+ const dlgPlan = d=>d.accept();
+ page.on('dialog',dlgPlan);
+ await page.evaluate(()=>document.querySelectorAll('.mp-mat-del')[1].click());
+ await sleep(700);
+ page.off('dialog',dlgPlan);
+ ok('материал открепляется от совещания', (await txtOf('#mp-mat-n'))==='1');
+
+ // связанные проекты: изменение списка
+ await page.evaluate(()=>document.getElementById('mp-prj-edit').click());
+ await sleep(300);
+ await page.evaluate(()=>{document.querySelector('.mpp-chk[value="p2"]').checked=true;});
+ await page.evaluate(()=>document.getElementById('mpp-save').click());
+ await sleep(700);
+ ok('список связанных проектов изменён', (await txtOf('#mp-prj-n'))==='2' && (await txtOf('#mp-log-n'))==='1');
+
+ // перенос с основанием и пересчётом напоминаний
+ const remBefore = await page.evaluate(m=>DB.reminders.filter(r=>r.owner_id===m).map(r=>r.fire_at).sort((a,b)=>a-b),planMid);
+ await page.evaluate(()=>document.getElementById('mp-move').click());
+ await sleep(300);
+ ok('окно переноса требует основание', (await modalTxt()).includes('Основание переноса'));
+ await page.evaluate(d=>{
+  document.getElementById('mv-date').value=d;
+  document.getElementById('mv-time').value='12:15';
+  document.getElementById('mv-reason').value='Перенос по просьбе заказчика';
+ },moveDate);
+ await page.evaluate(()=>document.getElementById('mv-go').click());
+ await sleep(800);
+ const remAfter = await page.evaluate(m=>DB.reminders.filter(r=>r.owner_id===m).map(r=>r.fire_at).sort((a,b)=>a-b),planMid);
+ ok('перенос применён к дате и времени', (await txtOf('#mp-when')).includes('12:15'));
+ ok('перенос записан в историю планирования', (await txtOf('#mp-log-n'))==='2' && (await drawerTxt()).includes('Перенос по просьбе заказчика'));
+ ok('напоминания пересчитаны от новой даты', remBefore.length>0 && remAfter.length===remBefore.length &&
+    remAfter.every((v,i)=>v-remBefore[i]===3*864e5+45*6e4), remBefore.length+'/'+remAfter.length);
+
+ // отмена и возобновление
+ await page.evaluate(()=>document.getElementById('mp-cancel').click());
+ await sleep(300);
+ await page.evaluate(()=>{document.getElementById('mc-reason').value='Отменено из-за отпуска председателя';});
+ await page.evaluate(()=>document.getElementById('mc-go').click());
+ await sleep(800);
+ const cancState = await page.evaluate(m=>({st:DB.meetings.find(x=>x.id===m).status,rem:DB.reminders.filter(r=>r.owner_id===m).length}),planMid);
+ ok('совещание отменено, напоминания сняты', cancState.st==='Отменено'&&cancState.rem===0, JSON.stringify(cancState));
+ ok('отменённое: возобновление вместо переноса', (await page.$('#mp-restore'))!==null && (await page.$('#mp-move'))===null);
+ await page.evaluate(()=>document.getElementById('mp-restore').click());
+ await sleep(300);
+ await page.evaluate(d=>{
+  document.getElementById('mr-date').value=d;
+  document.getElementById('mr-time').value='11:30';
+  document.getElementById('mr-reason').value='Возобновлено по решению председателя';
+ },moveDate);
+ await page.evaluate(()=>document.getElementById('mr-go').click());
+ await sleep(800);
+ ok('совещание возобновлено в расписании', (await page.evaluate(m=>DB.meetings.find(x=>x.id===m).status,planMid))==='Запланировано');
+ ok('история: проекты, перенос, отмена, возобновление', (await txtOf('#mp-log-n'))==='4');
+
+ // расписание серии, генерация дат, состав и пропуск
+ await page.evaluate(()=>document.getElementById('mp-rec-edit').click());
+ await sleep(300);
+ ok('окно расписания: периодичность и интервал', (await page.$eval('#rec-freq',e=>e.value))==='weekly' && (await page.$('#rec-save'))!==null);
+ await page.evaluate(()=>{document.getElementById('rec-int').value='2';});
+ await page.evaluate(()=>document.getElementById('rec-save').click());
+ await sleep(800);
+ ok('расписание серии изменено', (await txtOf('#mp-rec')).includes('Каждые 2 нед'));
+ const serBefore = await serCount(planMid);
+ await page.evaluate(()=>document.getElementById('mp-series-gen').click());
+ await sleep(900);
+ const serAfter = await serCount(planMid);
+ ok('генерация ближайших дат не создаёт дублей', serAfter>=serBefore && serAfter<=serBefore+8, serBefore+'→'+serAfter);
+ await page.evaluate(()=>document.getElementById('mp-series-view').click());
+ await sleep(400);
+ ok('состав серии: отдельная карточка на каждую дату', (await page.$$eval('#mp-series-table tbody tr',rs=>rs.length))===serAfter);
+ await page.evaluate(()=>App.closeModal(true));
+ await sleep(300);
+ const skipDate = await page.evaluate(m=>{
+  const r=(DB.meetings.find(x=>x.id===m)||{}).recurrence||{};
+  const s=DB.meetings.filter(x=>(x.recurrence||{}).seriesId===r.seriesId&&x.id!==m&&x.status==='Запланировано')
+   .sort((a,b)=>a.date<b.date?-1:1);
+  return s.length?s[0].date:'';
+ },planMid);
+ await page.evaluate(()=>document.getElementById('mp-series-skip').click());
+ await sleep(300);
+ await page.evaluate(d=>{document.getElementById('sk-date').value=d;document.getElementById('sk-reason').value='Праздничный день';},skipDate);
+ await page.evaluate(()=>document.getElementById('sk-go').click());
+ await sleep(900);
+ const skipState = await page.evaluate((m,d)=>{
+  const r=(DB.meetings.find(x=>x.id===m)||{}).recurrence||{};
+  const c=DB.meetings.find(x=>(x.recurrence||{}).seriesId===r.seriesId&&x.date===d);
+  return {sk:(r.skipped||[]).length,st:c?c.status:'нет'};
+ },planMid,skipDate);
+ ok('дата серии пропущена с основанием', skipState.sk===1&&skipState.st==='Отменено', JSON.stringify(skipState));
+
+ // реестр: режимы и фильтр по проекту
+ await page.evaluate(()=>{App.closeDrawer();App.f.mt={tab:'canc'};renderView();});
+ await sleep(400);
+ const cancExpect = await page.evaluate(()=>DB.meetings.filter(m=>m.status==='Отменено').length);
+ ok('реестр: режим «Отменённые»', (await page.$$eval('#view table.tbl tbody tr',rs=>rs.length))===cancExpect, String(cancExpect));
+ await page.evaluate(()=>{App.f.mt={tab:'series'};renderView();});
+ await sleep(400);
+ const serExpect = await page.evaluate(()=>DB.meetings.filter(m=>(m.recurrence||{}).seriesId).length);
+ ok('реестр: режим «Регулярные»', (await page.$$eval('#view table.tbl tbody tr',rs=>rs.length))===serExpect, String(serExpect));
+ await page.evaluate(()=>{App.f.mt={tab:'all',pj:'p1'};renderView();});
+ await sleep(400);
+ const pjExpect = await page.evaluate(()=>DB.meetings.filter(m=>(m.projects||[]).includes('p1')).length);
+ ok('реестр: фильтр по связанному проекту', (await page.$$eval('#view table.tbl tbody tr',rs=>rs.length))===pjExpect, String(pjExpect));
+ await page.evaluate(()=>{App.f.mt={tab:'next'};renderView();});
+ await sleep(300);
+
  console.log('== M16 §2.9: маршрут согласования и версии протокола ==');
  // совещание готовит администратор, секретарь — текущий пользователь браузера (volkova, u3)
  const sessOf = async login => {

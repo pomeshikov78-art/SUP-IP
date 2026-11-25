@@ -1304,7 +1304,7 @@ const WIDGETS = {
  list_deviations:{t:'Критические отклонения',d:'Просрочки, блокировки, сдвиги базового плана',size:'m',render(){const ds=deviations().slice(0,6);if(!ds.length)return emptyBlock('Отклонений не выявлено','Все работы идут по плану','check');return '<div class="list-rows">'+ds.map((d,i)=>'<div class="lr" onclick="devGo(deviations()['+i+'])"><span style="color:'+(d.sev==='err'?'var(--err)':'var(--warn)')+'">'+ic(d.icon)+'</span><div class="lt"><b>'+esc(d.title)+'</b><small>'+esc(d.sub)+'</small></div><span class="chip">'+d.kind+'</span></div>').join('')+'</div>';}},
  list_milestones:{t:'Контрольные точки',d:'Ближайшие и сорванные вехи проектов',size:'m',render(){const ms=DB.tasks.filter(t=>t.type==='milestone'&&t.status!=='Отменена').sort((a,b)=>a.end<b.end?-1:1).slice(0,6);if(!ms.length)return emptyBlock('Контрольных точек нет','','milestone');return '<div class="list-rows">'+ms.map(t=>'<div class="lr" onclick="openTask(\''+t.id+'\')"><span style="color:'+(DONE_ST.includes(t.status)?'var(--ok)':(taskOverdue(t)?'var(--err)':'var(--acc)'))+'">'+ic('milestone')+'</span><div class="lt"><b>'+esc(t.title)+'</b><small>'+esc((P(t.projectId)||{}).code||'')+' · '+fmtD(t.end)+'</small></div>'+(DONE_ST.includes(t.status)?badge('Пройдена','#16a34a','#dcfce7'):overdueMark(t))+'</div>').join('')+'</div>';}},
  list_directives:{t:'Поручения совещаний',d:'Контроль исполнения решений (M16 → M02)',size:'m',render(){const ds=DB.tasks.filter(t=>t.type==='directive'&&t.status!=='Отменена');if(!ds.length)return emptyBlock('Поручений нет','Решения совещаний не создавались','meeting');return '<div class="list-rows">'+ds.map(t=>'<div class="lr" onclick="openTask(\''+t.id+'\')">'+avatar(U(t.assignee),'sm')+'<div class="lt"><b>'+esc(t.title)+'</b><small>'+esc((MEET(t.meetingId)||{}).code||'')+' · срок '+fmtD(t.end)+'</small></div>'+stBadge(t.status)+overdueMark(t)+'</div>').join('')+'</div>';}},
- list_meetings:{t:'Ближайшие совещания',d:'Расписание и статус подготовки',size:'m',render(){const ms=DB.meetings.filter(m=>m.date>=dISO(TODAY)).sort((a,b)=>a.date<b.date?-1:1).slice(0,5);if(!ms.length)return emptyBlock('Совещаний не запланировано','','meeting');return '<div class="list-rows">'+ms.map(m=>'<div class="lr" onclick="openMeeting(\''+m.id+'\')"><span style="color:var(--acc)">'+ic('meeting')+'</span><div class="lt"><b>'+esc(m.title)+'</b><small>'+m.code+' · '+fmtD(m.date)+' '+m.time+' · '+esc(m.type)+'</small></div><span class="chip">'+m.attendees.length+' уч.</span></div>').join('')+'</div>';}},
+ list_meetings:{t:'Ближайшие совещания',d:'Расписание и статус подготовки',size:'m',render(){const ms=DB.meetings.filter(m=>m.date>=dISO(TODAY)&&m.status!==MEET_CANC).sort((a,b)=>a.date<b.date?-1:1).slice(0,5);if(!ms.length)return emptyBlock('Совещаний не запланировано','','meeting');return '<div class="list-rows">'+ms.map(m=>'<div class="lr" onclick="openMeeting(\''+m.id+'\')"><span style="color:var(--acc)">'+ic('meeting')+'</span><div class="lt"><b>'+esc(m.title)+'</b><small>'+m.code+' · '+fmtD(m.date)+' '+m.time+' · '+esc(m.type)+'</small></div><span class="chip">'+m.attendees.length+' уч.</span></div>').join('')+'</div>';}},
  matrix_risks:{t:'Матрица рисков',d:'Распределение открытых рисков P×I',size:'m',render(){return riskMatrixHTML(true);}},
  cal_week:{t:'События недели',d:'Календарь на ближайшие 7 дней',size:'m',render(){const evs=collectCalEvents().filter(e=>e.date>=dISO(TODAY)&&e.date<=D(7)).sort((a,b)=>a.date<b.date?-1:1).slice(0,7);if(!evs.length)return emptyBlock('Событий на неделе нет','','calendar');return '<div class="list-rows">'+evs.map(e=>'<div class="lr" onclick="'+e.go+'"><span style="color:'+e.color+'">'+ic(e.icon)+'</span><div class="lt"><b>'+esc(e.title)+'</b><small>'+fmtD(e.date)+(e.time?' · '+e.time:'')+' · '+e.kind+'</small></div></div>').join('')+'</div>';}}
 };
@@ -2628,7 +2628,7 @@ function collectCalEvents(){
   if(t.type==='milestone')evs.push({date:t.end,title:'◆ '+t.title,kind:'Контрольная точка',color:'#7c3aed',icon:'milestone',go:'openTask(\''+t.id+'\')'});
   else if(!DONE_ST.includes(t.status))evs.push({date:t.end,title:t.title,kind:'Срок задачи',color:taskOverdue(t)?'#dc2626':'#0891b2',icon:'tasks',go:'openTask(\''+t.id+'\')'});
  });
- DB.meetings.forEach(m=>evs.push({date:m.date,time:m.time,title:m.title,kind:'Совещание',color:'#2563eb',icon:'meeting',go:'openMeeting(\''+m.id+'\')'}));
+ DB.meetings.forEach(m=>{const cn=m.status===MEET_CANC;evs.push({date:m.date,time:m.time,title:(cn?'Отменено: ':'')+m.title,kind:cn?'Совещание отменено':'Совещание',color:cn?'#94a3b8':'#2563eb',icon:'meeting',go:'openMeeting(\''+m.id+'\')'});});
  DB.risks.forEach(r=>{if(r.status!=='Закрыт')evs.push({date:r.review,title:'Пересмотр: '+r.title,kind:'Риск',color:'#d97706',icon:'alert',go:'openRisk(\''+r.id+'\')'});});
  DB.calEvents.forEach(e=>evs.push({date:e.date,time:e.time,title:e.title,kind:'Событие',color:'#16a34a',icon:'calendar',go:'App.calEventOpen(\''+e.id+'\')'}));
  return evs;
@@ -2840,23 +2840,33 @@ function meetingsDirectives(f){
 Views.meetings=function(){
  const f=App.f.mt=App.f.mt||{tab:'next'};
  let rows=DB.meetings.slice();
- if(f.tab==='next')rows=rows.filter(m=>m.date>=dISO(TODAY));
+ if(f.tab==='next')rows=rows.filter(m=>m.date>=dISO(TODAY)&&m.status!==MEET_CANC);
  if(f.tab==='past')rows=rows.filter(m=>m.date<dISO(TODAY));
  if(f.tab==='prot')rows=rows.filter(m=>protOf(m).status!=='Подготовка');
+ if(f.tab==='canc')rows=rows.filter(m=>m.status===MEET_CANC);
+ if(f.tab==='series')rows=rows.filter(m=>recOf(m).seriesId);
  if(['dir','over','ctl','rep'].includes(f.tab))return meetingsDirectives(f);
+ if(f.st)rows=rows.filter(m=>m.status===f.st);
+ if(f.pj)rows=rows.filter(m=>mprjOf(m).includes(f.pj));
  rows.sort((a,b)=>f.tab==='past'?(a.date>b.date?-1:1):(a.date<b.date?-1:1));
  const dirs=DB.tasks.filter(t=>t.type==='directive'&&t.status!=='Отменена');
  return '<div class="page-head"><div><h2>Совещания</h2><div class="desc">Повестка, участники, решения и контроль исполнения. Протокол проходит маршрут согласования и утверждается отдельной редакцией (§2.9). Решение совещания одним нажатием превращается в поручение — задачу M02 с ответственным и сроком; исполнение видно в M07 и на дашборде.</div></div>'+
- '<div class="acts">'+(can('meetings','create')?'<button class="btn pri" onclick="App.meetModal()">'+ic('plus')+' Новое совещание</button>':'')+'</div></div>'+
+ '<div class="acts">'+(can('meetings','create')?'<button class="btn pri" id="mt-new" onclick="App.meetModal()">'+ic('plus')+' Новое совещание</button>':'')+'</div></div>'+
  '<div class="grid g4 mb14">'+
   kpiHTML(DB.meetings.filter(m=>m.date>=dISO(TODAY)&&m.status==='Запланировано').length,'Предстоящие','запланированные совещания','meeting','acc',"App.f.mt.tab='next';renderView()")+
   kpiHTML(DB.meetings.filter(m=>m.status==='Протокол утверждён').length,'Протоколы утверждены','решения зафиксированы','check','ok',"App.f.mt.tab='past';renderView()")+
   kpiHTML(dirs.length,'Поручений активно','создано из решений','tasks','info',"nav('control')")+
   kpiHTML(dirs.filter(taskOverdue).length,'Поручений просрочено','требуют эскалации','alert',dirs.filter(taskOverdue).length?'err':'ok',"nav('control')")+
  '</div>'+
- '<div class="tabs"><button class="'+(f.tab==='next'?'on':'')+'" onclick="App.f.mt.tab=\'next\';renderView()">Предстоящие и текущие</button><button class="'+(f.tab==='past'?'on':'')+'" onclick="App.f.mt.tab=\'past\';renderView()">Проведённые</button><button class="'+(f.tab==='prot'?'on':'')+'" onclick="App.f.mt.tab=\'prot\';renderView()">Протоколы</button><button class="'+(f.tab==='dir'?'on':'')+'" onclick="App.f.mt.tab=\'dir\';renderView()">Поручения</button><button class="'+(f.tab==='over'?'on':'')+'" onclick="App.f.mt.tab=\'over\';renderView()">Просроченные поручения</button><button onclick="App.f.mt.tab=\'ctl\';renderView()">Контроль сроков</button><button onclick="App.f.mt.tab=\'rep\';renderView()">Отчётность</button><button class="'+(f.tab==='all'?'on':'')+'" onclick="App.f.mt.tab=\'all\';renderView()">Все</button></div>'+
- '<div class="card"><div class="tbl-wrap"><table class="tbl"><thead><tr><th>Код</th><th>Совещание</th><th>Тип</th><th>Дата</th><th>Председатель</th><th>Участники</th><th>Решения</th><th>Протокол</th><th>Статус</th></tr></thead><tbody>'+
- (rows.length?rows.map(m=>'<tr onclick="openMeeting(\''+m.id+'\')"><td class="b nowrap">'+m.code+'</td><td><b>'+esc(m.title)+'</b></td><td class="small">'+esc(m.type)+'</td><td class="nowrap">'+fmtD(m.date)+' '+esc(m.time)+'</td><td><div class="flex">'+avatar(U(m.chair),'sm')+'<span class="small">'+esc(U(m.chair).name)+'</span></div></td><td class="small">'+m.attendees.length+' чел.</td><td class="num">'+m.decisions.length+'</td><td class="nowrap">'+prBadge(protOf(m).status)+(protOf(m).version?' <span class="chip">ред. '+protOf(m).version+'</span>':'')+'</td><td>'+badge(m.status,m.status==='Запланировано'?'#2563eb':m.status==='Проведено'?'#d97706':'#16a34a',m.status==='Запланировано'?'#dbeafe':m.status==='Проведено'?'#fef3c7':'#dcfce7')+'</td></tr>').join(''):'<tr class="nohover"><td colspan="9">'+emptyBlock('Совещаний нет','Создайте совещание или измените вкладку','meeting')+'</td></tr>')+
+ '<div class="tabs"><button class="'+(f.tab==='next'?'on':'')+'" onclick="App.f.mt.tab=\'next\';renderView()">Предстоящие и текущие</button><button class="'+(f.tab==='past'?'on':'')+'" onclick="App.f.mt.tab=\'past\';renderView()">Проведённые</button><button class="'+(f.tab==='prot'?'on':'')+'" onclick="App.f.mt.tab=\'prot\';renderView()">Протоколы</button><button class="'+(f.tab==='dir'?'on':'')+'" onclick="App.f.mt.tab=\'dir\';renderView()">Поручения</button><button class="'+(f.tab==='over'?'on':'')+'" onclick="App.f.mt.tab=\'over\';renderView()">Просроченные поручения</button><button onclick="App.f.mt.tab=\'ctl\';renderView()">Контроль сроков</button><button onclick="App.f.mt.tab=\'rep\';renderView()">Отчётность</button>'+ '<button class="'+(f.tab==='series'?'on':'')+'" id="mt-tab-series" onclick="App.f.mt.tab=\'series\';renderView()">Регулярные</button><button class="'+(f.tab==='canc'?'on':'')+'" id="mt-tab-canc" onclick="App.f.mt.tab=\'canc\';renderView()">Отменённые</button>' +'<button class="'+(f.tab==='all'?'on':'')+'" onclick="App.f.mt.tab=\'all\';renderView()">Все</button></div>'+
+ '<div class="flexw mb8">'+
+  sel('mtf-status',[['','Все статусы'],['Запланировано','Запланировано'],['Проведено','Проведено'],['Протокол утверждён','Протокол утверждён'],[MEET_CANC,MEET_CANC]],f.st||'','onchange="App.f.mt.st=this.value;renderView()"')+
+  sel('mtf-proj',[['','Все проекты'],...DB.projects.map(p=>[p.id,p.code+' · '+p.name.slice(0,30)])],f.pj||'','onchange="App.f.mt.pj=this.value;renderView()"')+
+  '<span class="small mut" id="mt-plan-stat">Регулярных серий: '+DB.meetings.filter(m=>recOf(m).master).length+' · отменено: '+DB.meetings.filter(m=>m.status===MEET_CANC).length+'</span>'+
+  '<span class="spacer"></span><button class="btn sm" onclick="App.f.mt.st=\'\';App.f.mt.pj=\'\';renderView()">'+ic('refresh')+' Сбросить</button>'+
+ '</div>'+
+ '<div class="card"><div class="tbl-wrap"><table class="tbl"><thead><tr><th>Код</th><th>Совещание</th><th>Тип</th><th>Дата</th><th>Председатель</th><th>Участники</th><th>Планирование</th><th>Решения</th><th>Протокол</th><th>Статус</th></tr></thead><tbody>'+
+ (rows.length?rows.map(m=>'<tr onclick="openMeeting(\''+m.id+'\')"><td class="b nowrap">'+m.code+'</td><td><b>'+esc(m.title)+'</b></td><td class="small">'+esc(m.type)+'</td><td class="nowrap">'+fmtD(m.date)+' '+esc(m.time)+'</td><td><div class="flex">'+avatar(U(m.chair),'sm')+'<span class="small">'+esc(U(m.chair).name)+'</span></div></td><td class="small">'+m.attendees.length+' чел.</td><td class="num">'+m.decisions.length+'</td><td class="nowrap">'+prBadge(protOf(m).status)+(protOf(m).version?' <span class="chip">ред. '+protOf(m).version+'</span>':'')+'</td><td>'+badge(m.status,m.status==='Запланировано'?'#2563eb':m.status==='Проведено'?'#d97706':'#16a34a',m.status==='Запланировано'?'#dbeafe':m.status==='Проведено'?'#fef3c7':'#dcfce7')+'</td></tr>').join(''):'<tr class="nohover"><td colspan="10">'+emptyBlock('Совещаний нет','Создайте совещание или измените вкладку','meeting')+'</td></tr>')+
  '</tbody></table></div></div>';
 };
 App.meetModal=function(mid){
@@ -2868,12 +2878,23 @@ App.meetModal=function(mid){
   '<div class="row3">'+field('Тип',sel('mt-type',['Оперативное','Техническое','Приёмочное','Совещание с заказчиком'],m.type),true)+field('Дата',inp('mt-date',m.date,'date'),true)+field('Время',inp('mt-time',m.time,'time'),true)+'</div>'+
   '<div class="row">'+field('Председатель',sel('mt-chair',DB.users.map(u=>[u.id,u.name]),m.chair),true)+field('Секретарь',sel('mt-sec',DB.users.map(u=>[u.id,u.name]),m.secretary),true)+'</div>'+
   field('Участники','<div class="flexw" style="border:1.5px solid var(--line2);border-radius:8px;padding:9px 11px">'+DB.users.map(u=>'<label class="checkline"><input type="checkbox" class="mt-att" value="'+u.id+'" '+(m.attendees.includes(u.id)?'checked':'')+' onchange="App.markDirty()">'+esc(u.name)+'</label>').join('')+'</div>',true)+
+  (mid?'':field('Связанные проекты (§2.5)','<div class="flexw" style="border:1.5px solid var(--line2);border-radius:8px;padding:9px 11px">'+DB.projects.map(x=>'<label class="checkline"><input type="checkbox" class="mt-prj" value="'+x.id+'" onchange="App.markDirty()">'+x.code+' · '+esc(x.name.slice(0,40))+'</label>').join('')+'</div>')+
+  '<div class="row3">'+field('Повторение (§2.5)',sel('mt-freq',REC_FREQ,'none'))+field('Интервал',inp('mt-int',1,'number','min="1" max="30"'))+field('Окончание серии',inp('mt-until','','date'))+'</div>'+
+  field('Дни недели (для еженедельного)','<div class="flexw">'+WD_NAMES.map((n,i)=>'<label class="checkline"><input type="checkbox" class="mt-wd" value="'+(i+1)+'"> '+n+'</label>').join('')+'</div>')+
+  '<div class="row">'+field('День месяца (для ежемесячного)',inp('mt-md','','number','min="1" max="31"'))+field('Всего совещаний серии',inp('mt-count','','number','min="0" max="104"'))+'</div>')+
  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" onclick="App.meetSave('+(mid?'\''+mid+'\'':'null')+')">'+ic('save')+' '+(mid?'Сохранить':'Создать')+'</button></div>');
 };
 App.meetSave=function(mid){
  if(!requireFields(['mt-title','mt-date','mt-time']))return;
  const att=[...document.querySelectorAll('.mt-att:checked')].map(x=>x.value);
  const data={title:val('mt-title'),type:val('mt-type'),date:val('mt-date'),time:val('mt-time'),chair:val('mt-chair'),secretary:val('mt-sec'),attendees:att};
+ if(!mid){
+  data.projects=[...document.querySelectorAll('.mt-prj:checked')].map(x=>x.value);
+  const fq=val('mt-freq');
+  if(fq&&fq!=='none')data.recurrence={freq:fq,interval:parseInt(val('mt-int'))||1,
+   weekdays:[...document.querySelectorAll('.mt-wd:checked')].map(x=>parseInt(x.value)),
+   monthDay:parseInt(val('mt-md'))||0,until:val('mt-until'),count:parseInt(val('mt-count'))||0};
+ }
  if(mid){
   rpc('meeting.update',{id:mid,...data}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
  }else{
@@ -2884,6 +2905,11 @@ function meetMinutes(m){
  const dirs=DB.tasks.filter(t=>t.meetingId===m.id);
  return '<h1>ПРОТОКОЛ № '+esc(m.code.replace('СОВ-',''))+'</h1><div class="rmeta">'+esc(m.title)+' · '+esc(m.type)+' · '+fmtD(m.date)+' '+esc(m.time)+' · СУП-ИП</div>'+
  '<h2>Присутствовали</h2><p>Председатель: '+esc(U(m.chair).name)+'. Секретарь: '+esc(U(m.secretary).name)+'.<br>Участники: '+m.attendees.map(u=>esc(U(u).name)).join(', ')+'.</p>'+
+ '<h2>Связанные проекты и предварительные материалы</h2>'+
+ (mprjOf(m).length?rptTable(['Проект','Наименование','Статус'],mprjOf(m).map(id=>{const x=P(id);return x?[x.code,x.name,x.status]:[id,'—','—'];})):'<p>Связанные проекты не зарегистрированы.</p>')+
+ (matsOf(m).length?rptTable(['Материал','Вид','Примечание'],matsOf(m).map(x=>[x.name,x.kind==='doc'?'Документ M09':'Ссылка: '+x.url,x.note||'—'])):'<p>Предварительные материалы не прикреплены.</p>')+
+ (recOf(m).freq!=='none'?'<p>Регулярное совещание: '+esc(recText(recOf(m)))+(recOf(m).seriesId?' · карточка серии №'+recOf(m).seriesN:'')+'</p>':'')+
+ (plogOf(m).length?'<h2>Планирование: переносы, отмены, изменения</h2>'+rptTable(['Дата и время','Кто','Действие','Основание'],plogOf(m).map(x=>[fmtDT(x.ts),U(x.by).name,PLAN_ACT[x.action]||x.action,(x.reason||x.note||'—')+(x.from&&x.to?(' ('+fmtD(x.from.date)+' '+x.from.time+' → '+fmtD(x.to.date)+' '+x.to.time+')'):'')])):'')+
  '<h2>Повестка дня</h2>'+(m.agenda.length?rptTable(['№','Вопрос','Докладчик'],m.agenda.map(a=>[a.n,a.title,U(a.reporter).name])):'<p>Повестка не сформирована.</p>')+
  '<h2>Принятые решения</h2>'+(m.decisions.length?rptTable(['№','Решение','Ответственный','Срок','Пункт повестки','Поручения'],m.decisions.map((d,i)=>[i+1,d.text,U(d.resp).name,fmtD(d.due),d.agendaN?'№'+d.agendaN:'—',decTasks(d).map(t=>t.code).join(', ')||'не создано'])):'<p>Решения не зарегистрированы.</p>')+
  '<h2>Контроль исполнения</h2>'+(dirs.length?rptTable(['Поручение','Исполнитель','Соисполнители','Срок','Статус','Выполнение, %','Просрочка','Критерии завершения'],dirs.map(t=>{const dr=dirOf(t);return [t.code+' · '+t.title,U(t.assignee).name,dr.coassignees.map(u=>U(u).name).join(', ')||'—',fmtD(t.end),t.status,DONE_ST.includes(t.status)?100:t.progress,taskOverdue(t)?overDays(t)+' дн':'—',dr.criteria||'—'];})):'<p>Поручения не создавались.</p>')+
@@ -3426,6 +3452,202 @@ App.protVersion=function(mid,v){
   '<button class="btn" onclick="App.docDownload(\''+x.docId+'\','+x.docV+')">'+ic('download')+' DOCX</button>'+
   '<button class="btn pri" onclick="App.protFile(\''+x.docId+'\','+x.docV+',\'pdf\')">'+ic('download')+' PDF</button></div>');
 };
+/* ---- M16 §2.5: планирование совещаний (материалы, проекты, перенос, отмена, регулярность) ---- */
+const MEET_CANC='Отменено';
+const REC_FREQ=[['none','Без повторения'],['daily','Ежедневно'],['weekly','Еженедельно'],['monthly','Ежемесячно']];
+const WD_NAMES=['Пн','Вт','Ср','Чт','Пт','Сб','Вс'];
+const PLAN_ACT={move:'Перенос',cancel:'Отмена',restore:'Возобновление',params:'Изменение параметров',series:'Регулярность',skip:'Пропуск даты',projects:'Связанные проекты'};
+function recOf(m){
+ const r=Object.assign({freq:'none',interval:1,weekdays:[],monthDay:0,until:'',count:0,seriesId:'',seriesN:1,master:false,skipped:[]},(m&&m.recurrence)||{});
+ if(!Array.isArray(r.weekdays))r.weekdays=[];
+ if(!Array.isArray(r.skipped))r.skipped=[];
+ if(!REC_FREQ.some(x=>x[0]===r.freq))r.freq='none';
+ r.interval=Math.max(1,parseInt(r.interval)||1); r.monthDay=parseInt(r.monthDay)||0; r.count=parseInt(r.count)||0;
+ return r;
+}
+function matsOf(m){ return Array.isArray(m&&m.materials)?m.materials:[]; }
+function mprjOf(m){ return Array.isArray(m&&m.projects)?m.projects:[]; }
+function plogOf(m){ return Array.isArray(m&&m.planLog)?m.planLog:[]; }
+function recText(r){
+ if(r.freq==='none')return 'Без повторения';
+ const iv=r.interval; let s;
+ if(r.freq==='daily')s=iv>1?('Каждые '+iv+' дн'):'Ежедневно';
+ else if(r.freq==='weekly'){ s=iv>1?('Каждые '+iv+' нед'):'Еженедельно'; if(r.weekdays.length)s+=': '+r.weekdays.slice().sort().map(w=>WD_NAMES[w-1]).join(', '); }
+ else { s=iv>1?('Каждые '+iv+' мес'):'Ежемесячно'; if(r.monthDay)s+=', '+r.monthDay+' числа'; }
+ if(r.until)s+=' · до '+fmtD(r.until);
+ if(r.count)s+=' · всего '+r.count;
+ return s;
+}
+function meetSeriesOf(m){
+ const r=recOf(m); if(!r.seriesId)return [];
+ return DB.meetings.filter(x=>recOf(x).seriesId===r.seriesId).sort((a,b)=>a.date<b.date?-1:1);
+}
+function meetStatusBadge(s){
+ return badge(s, s==='Запланировано'?'#2563eb':s==='Проведено'?'#d97706':s===MEET_CANC?'#dc2626':'#16a34a',
+  s==='Запланировано'?'#dbeafe':s==='Проведено'?'#fef3c7':s===MEET_CANC?'#fee2e2':'#dcfce7');
+}
+function meetPlanBlock(m){
+ const mid=m.id, editable=can('meetings','edit',m), r=recOf(m), mats=matsOf(m), prj=mprjOf(m), log=plogOf(m), ser=meetSeriesOf(m);
+ const planned=m.status==='Запланировано', cancelled=m.status===MEET_CANC;
+ let h='<div class="card" id="meet-plan"><div class="ch">'+ic('calendar')+'Планирование (ТЗ §2.5)'+(cancelled?'<span class="r">'+meetStatusBadge(MEET_CANC)+'</span>':'')+'</div><div class="cb">'+
+  '<div class="stat-line"><span>Дата и время</span><b id="mp-when">'+fmtD(m.date)+' '+esc(m.time)+'</b></div>'+
+  '<div class="stat-line"><span>Повторение</span><b id="mp-rec">'+esc(recText(r))+'</b></div>'+
+  '<div class="stat-line"><span>Связанных проектов</span><b id="mp-prj-n">'+prj.length+'</b></div>'+
+  '<div class="stat-line"><span>Предварительных материалов</span><b id="mp-mat-n">'+mats.length+'</b></div>'+
+  '<div class="stat-line"><span>Записей в истории планирования</span><b id="mp-log-n">'+log.length+'</b></div>'+
+  (editable?'<div class="flexw mt8">'+
+   (planned?'<button class="btn sm" id="mp-move" onclick="App.meetMove(\''+mid+'\')">'+ic('clock')+' Перенести</button>':'')+
+   (planned?'<button class="btn sm danger" id="mp-cancel" onclick="App.meetCancel(\''+mid+'\')">'+ic('x')+' Отменить совещание</button>':'')+
+   (cancelled?'<button class="btn sm pri" id="mp-restore" onclick="App.meetRestore(\''+mid+'\')">'+ic('check')+' Возобновить</button>':'')+
+   '<button class="btn sm" id="mp-rec-edit" onclick="App.meetRec(\''+mid+'\')">'+ic('refresh')+' Расписание</button>'+
+  '</div>':'')+
+ '</div></div>';
+ h+='<div class="card mt8" id="meet-projects"><div class="ch">'+ic('folder')+'Связанные проекты<span class="r small mut">§2.5: регистрация связанных проектов</span></div><div class="cb">'+
+  (prj.length?'<div class="flexw">'+prj.map(id=>{const p=P(id);return p?'<span class="dep-chip" onclick="openProject(\''+id+'\')">'+p.code+' · '+esc(p.name.slice(0,44))+'</span>':'<span class="chip">'+esc(id)+'</span>';}).join('')+'</div>':'<div class="small mut">Проекты не зарегистрированы.</div>')+
+  (editable?'<div class="mt8"><button class="btn sm" id="mp-prj-edit" onclick="App.meetProjects(\''+mid+'\')">'+ic('edit')+' Изменить список</button></div>':'')+
+ '</div></div>';
+ h+='<div class="card mt8" id="meet-materials"><div class="ch">'+ic('file')+'Предварительные материалы<span class="r small mut">документы M09 и ссылки ЛВС</span></div><div class="cb">'+
+  (editable?'<div class="flexw mb8"><span class="spacer"></span><button class="btn sm pri" id="mp-mat-add" onclick="App.meetMatModal(\''+mid+'\')">'+ic('plus')+' Материал</button></div>':'')+
+  (mats.length?'<div class="list-rows">'+mats.map(x=>'<div class="lr" style="cursor:default">'+ic(x.kind==='doc'?'file':'link')+
+    '<div class="lt"><b>'+esc(x.name)+'</b><small>'+(x.kind==='doc'?'документ M09':'ссылка: '+esc(x.url))+(x.note?' · '+esc(x.note):'')+' · добавил '+esc(U(x.addedBy).name)+' '+fmtDT(x.addedAt)+'</small></div>'+
+    (x.kind==='doc'&&DOC(x.docId)?'<button class="btn sm" onclick="openDoc(\''+x.docId+'\')">'+ic('eye')+'</button>':'')+
+    (editable?'<button class="btn sm danger mp-mat-del" data-id="'+x.id+'" onclick="App.meetMatDel(\''+mid+'\',\''+x.id+'\')">'+ic('trash')+'</button>':'')+
+   '</div>').join('')+'</div>':emptyBlock('Материалы не прикреплены','Прикрепите документы M09 или ссылки на файлы ЛВС','file'))+
+ '</div></div>';
+ if(r.seriesId){
+  h+='<div class="card mt8" id="meet-series"><div class="ch">'+ic('refresh')+'Регулярное совещание<span class="r small mut">'+(r.master?'головная карточка серии':'карточка серии №'+r.seriesN)+'</span></div><div class="cb">'+
+   '<div class="small mut mb8">'+esc(recText(r))+' · всего карточек серии: '+ser.length+' · проведено: '+ser.filter(x=>x.status!=='Запланировано'&&x.status!==MEET_CANC).length+' · отменено: '+ser.filter(x=>x.status===MEET_CANC).length+'</div>'+
+   (editable&&r.master?'<div class="flexw mb8"><button class="btn sm" id="mp-series-gen" onclick="App.meetSeriesGen(\''+mid+'\')">'+ic('plus')+' Создать ближайшие</button>'+
+    '<button class="btn sm" id="mp-series-skip" onclick="App.meetSkipModal(\''+mid+'\')">'+ic('x')+' Пропустить дату</button>'+
+    '<button class="btn sm" id="mp-series-view" onclick="App.meetSeriesView(\''+mid+'\')">'+ic('eye')+' Состав серии</button></div>':
+    '<div class="flexw mb8"><button class="btn sm" id="mp-series-view" onclick="App.meetSeriesView(\''+mid+'\')">'+ic('eye')+' Состав серии</button></div>')+
+   '<div class="small mut">Каждое проведённое совещание серии — самостоятельная карточка со своей повесткой и отдельным протоколом (§2.5).</div>'+
+   (r.skipped.length?'<div class="mt8 small mut">Пропущенные даты: '+r.skipped.map(s=>fmtD(s.date)+' ('+esc(s.reason)+')').join('; ')+'</div>':'')+
+  '</div></div>';
+ }
+ h+='<div class="card mt8" id="meet-planlog"><div class="ch">'+ic('journal')+'История планирования</div><div class="cb">'+
+  (log.length?'<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Когда</th><th>Кто</th><th>Действие</th><th>Основание / подробности</th></tr></thead><tbody>'+
+   log.slice().reverse().map(x=>'<tr><td class="nowrap small">'+fmtDT(x.ts)+'</td><td class="small">'+esc(U(x.by).name)+'</td><td class="small">'+esc(PLAN_ACT[x.action]||x.action)+'</td><td class="small">'+
+    esc(x.reason||x.note||'')+(x.from&&x.to?(' · '+fmtD(x.from.date)+' '+x.from.time+' → '+fmtD(x.to.date)+' '+x.to.time):'')+(x.action==='skip'&&x.date?(' · '+fmtD(x.date)):'')+'</td></tr>').join('')+
+   '</tbody></table></div>':emptyBlock('Изменений планирования не было','Переносы, отмены и изменения расписания фиксируются здесь','journal'))+
+ '</div></div>';
+ return h;
+}
+App.meetMove=function(mid){
+ const m=MEET(mid); if(!guard('meetings','edit',m))return;
+ openModal(mh('Перенос совещания '+m.code,'clock')+'<div class="mb form">'+
+  '<div class="small mut mb8">Перенос регистрируется с основанием: участники оповещаются, напоминания пересчитываются от новой даты (ТЗ §2.5, M12 §8.2).</div>'+
+  '<div class="row">'+field('Новая дата',inp('mv-date',m.date,'date'),true)+field('Новое время',inp('mv-time',m.time,'time'),true)+'</div>'+
+  field('Основание переноса',ta('mv-reason','',3),true)+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="mv-go" onclick="App.meetMoveSave(\''+mid+'\')">'+ic('save')+' Перенести</button></div>');
+};
+App.meetMoveSave=function(mid){
+ if(!requireFields(['mv-date','mv-time','mv-reason']))return;
+ rpc('meeting.reschedule',{id:mid,date:val('mv-date'),time:val('mv-time'),reason:val('mv-reason')}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.meetCancel=function(mid){
+ const m=MEET(mid); if(!guard('meetings','edit',m))return;
+ openModal(mh('Отмена совещания '+m.code,'x')+'<div class="mb form">'+
+  '<div class="small mut mb8">Совещание переводится в статус «Отменено», напоминания снимаются, участники получают уведомление. Основание сохраняется в истории планирования.</div>'+
+  field('Основание отмены',ta('mc-reason','',3),true)+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Не отменять</button><button class="btn danger" id="mc-go" onclick="App.meetCancelSave(\''+mid+'\')">Отменить совещание</button></div>');
+};
+App.meetCancelSave=function(mid){
+ if(!requireFields(['mc-reason']))return;
+ rpc('meeting.cancel',{id:mid,reason:val('mc-reason')}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.meetRestore=function(mid){
+ const m=MEET(mid); if(!guard('meetings','edit',m))return;
+ openModal(mh('Возобновление совещания '+m.code,'check')+'<div class="mb form">'+
+  '<div class="row">'+field('Дата',inp('mr-date',m.date,'date'))+field('Время',inp('mr-time',m.time,'time'))+'</div>'+
+  field('Основание',ta('mr-reason','Возобновлено по решению председателя',2))+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="mr-go" onclick="App.meetRestoreSave(\''+mid+'\')">Возобновить</button></div>');
+};
+App.meetRestoreSave=function(mid){
+ rpc('meeting.restore',{id:mid,date:val('mr-date'),time:val('mr-time'),reason:val('mr-reason')}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.meetProjects=function(mid){
+ const m=MEET(mid); if(!guard('meetings','edit',m))return;
+ const cur=mprjOf(m);
+ openModal(mh('Связанные проекты совещания','folder')+'<div class="mb form">'+
+  '<div class="small mut mb8">Отметьте проекты, вопросы которых рассматриваются на совещании (ТЗ §2.5).</div>'+
+  '<div class="flexw" style="border:1.5px solid var(--line2);border-radius:8px;padding:9px 11px">'+
+   DB.projects.map(p=>'<label class="checkline"><input type="checkbox" class="mpp-chk" value="'+p.id+'" '+(cur.includes(p.id)?'checked':'')+' onchange="App.markDirty()">'+p.code+' · '+esc(p.name)+'</label>').join('')+
+  '</div></div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="mpp-save" onclick="App.meetProjectsSave(\''+mid+'\')">'+ic('save')+' Сохранить</button></div>');
+};
+App.meetProjectsSave=function(mid){
+ const ids=[...document.querySelectorAll('.mpp-chk:checked')].map(x=>x.value);
+ rpc('meeting.projects.set',{id:mid,projects:ids}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.meetMatModal=function(mid){
+ const m=MEET(mid); if(!guard('meetings','edit',m))return;
+ openModal(mh('Предварительный материал','file')+'<div class="mb form">'+
+  field('Вид материала',sel('mat-kind',[['doc','Документ M09'],['link','Ссылка (файл ЛВС, ресурс)']],'doc','onchange="App.meetMatKind()"'))+
+  '<div id="mat-doc-box">'+field('Документ',sel('mat-doc',DB.docs.map(d=>[d.id,d.code+' · '+d.title]),DB.docs.length?DB.docs[0].id:''),true)+'</div>'+
+  '<div id="mat-link-box" style="display:none">'+field('Наименование',inp('mat-name',''))+field('Ссылка или путь',inp('mat-url','','text','placeholder="\\\\server\\share\\file.pdf или https://…"'))+'</div>'+
+  field('Примечание',inp('mat-note',''))+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="mat-save" onclick="App.meetMatSave(\''+mid+'\')">'+ic('save')+' Прикрепить</button></div>');
+};
+App.meetMatKind=function(){
+ const k=val('mat-kind');
+ const a=document.getElementById('mat-doc-box'), b=document.getElementById('mat-link-box');
+ if(a)a.style.display=k==='doc'?'':'none';
+ if(b)b.style.display=k==='link'?'':'none';
+ App.markDirty();
+};
+App.meetMatSave=function(mid){
+ const k=val('mat-kind');
+ const data={id:mid,note:val('mat-note')};
+ if(k==='doc'){ if(!requireFields(['mat-doc']))return; data.docId=val('mat-doc'); }
+ else { if(!requireFields(['mat-name','mat-url']))return; data.name=val('mat-name'); data.url=val('mat-url'); }
+ rpc('meeting.materials.add',data).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.meetMatDel=function(mid,matId){
+ if(!confirm('Открепить материал от совещания?'))return;
+ rpc('meeting.materials.remove',{id:mid,materialId:matId}).then(r=>{if(r)openMeeting(mid);});
+};
+App.meetRec=function(mid){
+ const m=MEET(mid); if(!guard('meetings','edit',m))return;
+ const r=recOf(m);
+ openModal(mh('Расписание совещания '+m.code,'refresh')+'<div class="mb form">'+
+  '<div class="small mut mb8">Регулярные совещания создаются отдельными карточками: у каждой своя повестка и отдельный протокол (ТЗ §2.5). Ближайшие даты создаются автоматически планировщиком на 30 дней вперёд.</div>'+
+  '<div class="row">'+field('Периодичность',sel('rec-freq',REC_FREQ,r.freq))+field('Интервал',inp('rec-int',r.interval,'number','min="1" max="30"'),true)+'</div>'+
+  field('Дни недели (для еженедельного)','<div class="flexw">'+WD_NAMES.map((n,i)=>'<label class="checkline"><input type="checkbox" class="rec-wd" value="'+(i+1)+' '+(r.weekdays.includes(i+1)?'checked':'')+'> '+n+'</label>').join('')+'</div>')+
+  '<div class="row3">'+field('День месяца',inp('rec-md',r.monthDay||'','number','min="1" max="31"'))+field('Окончание серии',inp('rec-until',r.until,'date'))+field('Всего совещаний',inp('rec-count',r.count||'','number','min="0" max="104"'))+'</div>'+
+  (r.master?'<label class="checkline"><input type="checkbox" id="rec-apply"> Применить время и состав к будущим совещаниям серии</label>':'')+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="rec-save" onclick="App.meetRecSave(\''+mid+'\')">'+ic('save')+' Сохранить расписание</button></div>');
+};
+App.meetRecSave=function(mid){
+ const rule={freq:val('rec-freq'),interval:parseInt(val('rec-int'))||1,
+  weekdays:[...document.querySelectorAll('.rec-wd:checked')].map(x=>parseInt(x.value)),
+  monthDay:parseInt(val('rec-md'))||0,until:val('rec-until'),count:parseInt(val('rec-count'))||0};
+ const ap=document.getElementById('rec-apply');
+ rpc('meeting.series.update',{id:mid,rule:rule,applyToFuture:!!(ap&&ap.checked)}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.meetSeriesGen=function(mid){
+ rpc('meeting.series.generate',{id:mid}).then(r=>{if(r)openMeeting(mid);});
+};
+App.meetSkipModal=function(mid){
+ const m=MEET(mid), ser=meetSeriesOf(m);
+ const next=ser.find(x=>x.date>m.date&&x.status==='Запланировано');
+ openModal(mh('Пропуск даты серии','x')+'<div class="mb form">'+
+  '<div class="small mut mb8">Совещание на указанную дату отменяется (если карточка уже создана) и больше не создаётся по расписанию.</div>'+
+  field('Дата',inp('sk-date',next?next.date:D(7),'date'),true)+
+  field('Основание пропуска',ta('sk-reason','',2),true)+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn danger" id="sk-go" onclick="App.meetSkipSave(\''+mid+'\')">Пропустить</button></div>');
+};
+App.meetSkipSave=function(mid){
+ if(!requireFields(['sk-date','sk-reason']))return;
+ rpc('meeting.series.skip',{id:mid,date:val('sk-date'),reason:val('sk-reason')}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.meetSeriesView=function(mid){
+ const m=MEET(mid), ser=meetSeriesOf(m), r=recOf(m);
+ openModal(mh('Состав серии '+m.code,'refresh')+'<div class="mb">'+
+  '<div class="small mut mb8">'+esc(recText(r))+' · карточек: '+ser.length+'</div>'+
+  '<div class="tbl-wrap" id="mp-series-table"><table class="tbl"><thead><tr><th>№</th><th>Код</th><th>Дата</th><th>Статус</th><th>Повестка</th><th>Решения</th><th>Протокол</th></tr></thead><tbody>'+
+  ser.map(x=>{const xr=recOf(x);return '<tr onclick="App.closeModal(true);openMeeting(\''+x.id+'\')"><td class="num">'+xr.seriesN+(xr.master?' <span class="chip">головное</span>':'')+'</td><td class="b nowrap">'+x.code+'</td><td class="nowrap">'+fmtD(x.date)+' '+esc(x.time)+'</td><td>'+meetStatusBadge(x.status)+'</td><td class="num">'+x.agenda.length+'</td><td class="num">'+x.decisions.length+'</td><td>'+prBadge(protOf(x).status)+'</td></tr>';}).join('')+
+  '</tbody></table></div></div><div class="mf"><button class="btn" onclick="App.closeModal()">Закрыть</button></div>');
+};
 function openMeeting(mid){
  const m=MEET(mid); if(!m)return;
  if(!can('meetings','view')){deny('meetings','view',m);return;}
@@ -3439,12 +3661,16 @@ function openMeeting(mid){
    '<div class="stat-line"><span>Дата и время</span><b>'+fmtD(m.date)+' '+esc(m.time)+'</b></div>'+
    '<div class="stat-line"><span>Председатель</span><b>'+esc(U(m.chair).name)+'</b></div>'+
    '<div class="stat-line"><span>Секретарь</span><b>'+esc(U(m.secretary).name)+'</b></div>'+
-   '<div class="stat-line"><span>Статус</span>'+badge(m.status,m.status==='Запланировано'?'#2563eb':m.status==='Проведено'?'#d97706':'#16a34a',m.status==='Запланировано'?'#dbeafe':m.status==='Проведено'?'#fef3c7':'#dcfce7')+'</div>'+
+   '<div class="stat-line"><span>Статус</span>'+meetStatusBadge(m.status)+'</div>'+
+   '<div class="stat-line"><span>Повторение</span><b>'+esc(recText(recOf(m)))+'</b></div>'+
+   '<div class="stat-line"><span>Связанные проекты</span><b>'+(mprjOf(m).map(id=>{const x=P(id);return x?x.code:id;}).join(', ')||'—')+'</b></div>'+
+   '<div class="stat-line"><span>Предварительные материалы</span><b>'+matsOf(m).length+'</b></div>'+
   '</div></div>'+
   reminderBlock('meeting',mid,editable)+
   '<h4 style="margin:14px 0 8px">Участники ('+m.attendees.length+')</h4>'+
   '<div class="list-rows">'+m.attendees.map(u=>'<div class="lr" style="cursor:default">'+avatar(U(u))+'<div class="lt"><b>'+esc(U(u).name)+'</b><small>'+esc(U(u).position)+'</small></div>'+(u===m.chair?'<span class="chip">председатель</span>':u===m.secretary?'<span class="chip">секретарь</span>':'')+'</div>').join('')+'</div>';
  }
+ if(tab==='plan'){ body=meetPlanBlock(m); }
  if(tab==='agenda'){
   body=(editable?'<div class="flexw mb8"><span class="spacer"></span><button class="btn sm pri" onclick="App.agendaAdd(\''+mid+'\')">'+ic('plus')+' Вопрос</button></div>':'')+
   (m.agenda.length?'<div class="list-rows">'+m.agenda.map(a=>'<div class="lr" style="cursor:default"><span class="sn" style="width:24px;height:24px;border-radius:7px;background:var(--acc-bg);color:var(--acc);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:11px;flex:none">'+a.n+'</span><div class="lt"><b>'+esc(a.title)+'</b><small>докладчик: '+esc(U(a.reporter).name)+'</small></div></div>').join('')+'</div>':emptyBlock('Повестка не сформирована','Добавьте вопросы к рассмотрению','meeting'));
@@ -3476,12 +3702,14 @@ function openMeeting(mid){
   protBlock(m)+
   '<div class="card"><div class="cb report-doc">'+meetMinutes(m)+'</div></div>';
  }
- const tabs=[['info','Информация'],['agenda','Повестка ('+m.agenda.length+')'],['dec','Решения ('+m.decisions.length+')'],['dir','Поручения ('+dirs.length+')'],['prot','Протокол'+(protOf(m).version?' (ред. '+protOf(m).version+')':'')]];
- openDrawer(dh(m.code+' · '+m.type,m.title,badge(m.status,m.status==='Запланировано'?'#2563eb':m.status==='Проведено'?'#d97706':'#16a34a',m.status==='Запланировано'?'#dbeafe':m.status==='Проведено'?'#fef3c7':'#dcfce7')+' <span class="chip">'+fmtD(m.date)+' '+esc(m.time)+'</span>'+prBadge(protOf(m).status))+
- '<div class="db"><div class="tabs">'+tabs.map(([k,n])=>'<button class="'+(tab===k?'on':'')+'" onclick="App.f.meetTab=\''+k+'\';openMeeting(\''+mid+'\')">'+n+'</button>').join('')+'</div>'+body+'</div>'+
+ const tabs=[['info','Информация'],['plan','Планирование'],['agenda','Повестка ('+m.agenda.length+')'],['dec','Решения ('+m.decisions.length+')'],['dir','Поручения ('+dirs.length+')'],['prot','Протокол'+(protOf(m).version?' (ред. '+protOf(m).version+')':'')]];
+ openDrawer(dh(m.code+' · '+m.type,m.title,meetStatusBadge(m.status)+' <span class="chip">'+fmtD(m.date)+' '+esc(m.time)+'</span>'+prBadge(protOf(m).status))+
+ '<div class="db"><div class="tabs">'+tabs.map(([k,n])=>'<button id="mt-tab-'+k+'" class="'+(tab===k?'on':'')+'" onclick="App.f.meetTab=\''+k+'\';openMeeting(\''+mid+'\')">'+n+'</button>').join('')+'</div>'+body+'</div>'+
  '<div class="df">'+
   (editable?'<button class="btn" onclick="App.meetModal(\''+mid+'\')">'+ic('edit')+' Редактировать</button>':'')+
   (editable&&m.status==='Запланировано'&&m.date<=dISO(TODAY)?'<button class="btn pri" onclick="App.meetConduct(\''+mid+'\')">'+ic('check')+' Проведено</button>':'')+
+  (editable&&m.status==='Запланировано'?'<button class="btn" id="mf-move" onclick="App.meetMove(\''+mid+'\')">'+ic('clock')+' Перенести</button>':'')+
+  (editable&&m.status===MEET_CANC?'<button class="btn pri" id="mf-restore" onclick="App.meetRestore(\''+mid+'\')">'+ic('check')+' Возобновить</button>':'')+
   '<span class="spacer"></span>'+
   (can('meetings','delete',m)?'<button class="btn danger" onclick="App.meetDelete(\''+mid+'\')">'+ic('trash')+'</button>':'')+
  '</div>',true);

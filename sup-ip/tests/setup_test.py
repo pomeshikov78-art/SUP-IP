@@ -254,7 +254,7 @@ def main():
     check("в журнале реальные сведения об ОС", 'CurrentVersion" "ProductName"' in nsi and 'CurrentVersion" "CurrentBuild"' in nsi)
     check("дата сборки не выдаётся за сведения об ОС", 'LOG "ОС: ${__DATE__}' not in nsi)
     check("версия установщика совпадает с версией сервера", ('!define VERSION "%s"' % srv.VERSION) in nsi, srv.VERSION)
-    check("версия сервера 1.9.0", srv.VERSION == "1.9.0", srv.VERSION)
+    check("версия сервера в формате X.Y.Z", re.match(r"^\d+\.\d+\.\d+$", srv.VERSION) is not None, srv.VERSION)
     c, j = Client().req("GET", "/api/health")
     check("сервер сообщает ту же версию", c == 200 and j.get("version") == srv.VERSION, j)
     c, j = adm.rpc("admin.logs", {"name": "supip.log", "lines": 5})

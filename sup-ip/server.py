@@ -9,7 +9,7 @@
 Запуск:  python server.py --host 0.0.0.0 --port 80
 БД:      параметры подключения — аргументы --pg-* или переменные SUPIP_PG* / стандартные PG*.
 """
-import argparse, base64, configparser, datetime, hashlib, hmac, json, logging, logging.handlers, math, os, platform, re, secrets, shutil, ssl, subprocess, sys, threading, time, traceback, urllib.parse, urllib.request
+import argparse, base64, calendar, configparser, datetime, hashlib, hmac, json, logging, logging.handlers, math, os, platform, re, secrets, shutil, ssl, subprocess, sys, threading, time, traceback, urllib.parse, urllib.request
 import http.server, socketserver
 from http.cookies import SimpleCookie
 
@@ -39,7 +39,7 @@ except ImportError:
     docgen = None
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -284,7 +284,9 @@ CREATE TABLE IF NOT EXISTS meetings(
   date TEXT NOT NULL, mtime TEXT NOT NULL DEFAULT '', chair TEXT REFERENCES users(id) ON DELETE SET NULL,
   secretary TEXT REFERENCES users(id) ON DELETE SET NULL, attendees JSONB NOT NULL DEFAULT '[]',
   status TEXT NOT NULL, agenda JSONB NOT NULL DEFAULT '[]', decisions JSONB NOT NULL DEFAULT '[]',
-  protocol JSONB NOT NULL DEFAULT '{}');
+  protocol JSONB NOT NULL DEFAULT '{}', materials JSONB NOT NULL DEFAULT '[]',
+  projects JSONB NOT NULL DEFAULT '[]', recurrence JSONB NOT NULL DEFAULT '{}',
+  plan_log JSONB NOT NULL DEFAULT '[]', series_id TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS risks(
   id TEXT PRIMARY KEY, code TEXT UNIQUE NOT NULL, title TEXT NOT NULL, cat TEXT NOT NULL,
   project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, p INT NOT NULL, i INT NOT NULL,
@@ -376,7 +378,9 @@ ENT = {
    ("date","date","t"),("hours","hours","f"),("act","act","t"),("comment","comment","t"),("status","status","t"),("approvedBy","approved_by","t")]),
  "meeting": ("meetings", [("id","id","t"),("code","code","t"),("title","title","t"),("type","type","t"),("date","date","t"),
    ("time","mtime","t"),("chair","chair","t"),("secretary","secretary","t"),("attendees","attendees","j"),
-   ("status","status","t"),("agenda","agenda","j"),("decisions","decisions","j"),("protocol","protocol","j")]),
+   ("status","status","t"),("agenda","agenda","j"),("decisions","decisions","j"),("protocol","protocol","j"),
+   ("materials","materials","j"),("projects","projects","j"),("recurrence","recurrence","j"),
+   ("planLog","plan_log","j"),("seriesId","series_id","t")]),
  "calEvent": ("cal_events", [("id","id","t"),("title","title","t"),("date","date","t"),("time","mtime","t"),
    ("type","type","t"),("participants","participants","j"),("note","note","t")]),
  "report": ("reports", [("id","id","t"),("code","code","t"),("type","type","t"),("title","title","t"),("params","params","j"),
@@ -410,7 +414,9 @@ class DB:
         vals = {}
         for js, col, ty in fields:
             v = o.get(js)
-            if ty == "j": v = psycopg2.extras.Json(v if v is not None else ([] if js in ("team","deps","comments","measures","history","events","attendees","agenda","decisions","participants","runs") else {}))
+            if ty == "t" and v is None and js in ("seriesId",): v = ""   # записи прежних версий
+            if ty == "j": v = psycopg2.extras.Json(v if v is not None else ([] if js in ("team","deps","comments","measures","history","events","attendees","agenda","decisions","participants","runs",
+                                                    "materials","projects","planLog") else {}))
             vals[col.strip('"')] = v
         return vals
     def get_ent(self, cur, kind, id_):
@@ -574,6 +580,18 @@ def seed(db):
                 dict(id="m3",code="СОВ-2026-043",title="Приёмка этапа СМТП-3",type="Приёмочное",date=D(7),time="11:00",chair="u2",secretary="u4",attendees=["u2","u4","u5","u6","u8"],status="Запланировано",
                      agenda=[{"n":1,"title":"Демонстрация сбора и архивирования данных","reporter":"u5"},{"n":2,"title":"Протокол обмена: статус согласования","reporter":"u5"}],decisions=[]),
             ]
+            # §2.5: связанные проекты, предварительные материалы и история планирования
+            for _m, _prj, _mats, _log in (
+                (meetings[0], ["p1","p3"],
+                 [{"id":"mm1","kind":"doc","docId":"d3","name":"Д-003 · Расчётная записка: бюджет радиолинии","url":"","note":"К вопросу 2","addedAt":now-8*DAY*1000,"addedBy":"u3"},
+                  {"id":"mm2","kind":"link","docId":None,"name":"Сводка загрузки подразделения","url":"\\\\srv-files\\plan\\svodka.xlsx","note":"Обновляется еженедельно","addedAt":now-8*DAY*1000,"addedBy":"u3"}],
+                 [{"ts":now-9*DAY*1000,"by":"u2","action":"move","from":{"date":D(-9),"time":"10:00"},"to":{"date":D(-7),"time":"10:00"},"reason":"Перенос по просьбе председателя"}]),
+                (meetings[1], ["p3"],
+                 [{"id":"mm3","kind":"doc","docId":"d6","name":"Д-006 · Аванпроект МПП-7 (пояснительная записка)","url":"","note":"Материал к вопросу 1","addedAt":now-2*DAY*1000,"addedBy":"u3"}], []),
+                (meetings[2], ["p2"],
+                 [{"id":"mm4","kind":"doc","docId":"d4","name":"Д-004 · Схема структурная СМТП-3","url":"","note":"Демонстрация на приёмке","addedAt":now-1*DAY*1000,"addedBy":"u4"}], []),
+            ):
+                _m["projects"] = _prj; _m["materials"] = _mats; _m["planLog"] = _log
             for m in meetings: db.save_ent(cur,"meeting",m)
             for t in tasks: db.save_ent(cur,"task",t)
             # связи решений с поручениями (техпроект §4.1: meeting_tasks — связь, а не параллельная система задач)
@@ -729,6 +747,15 @@ def get_req(db, cur, kind, id_):
 def next_seq(db, cur, key):
     s = db.settings(cur); s["seq"][key] = s["seq"].get(key, 0) + 1; db.save_settings(cur, s)
     return s["seq"][key]
+def check_time(s, name="время"):
+    """Время события в формате ЧЧ:ММ с реальными часами и минутами (ТЗ §2.5)."""
+    if not re.match(r"^\d{1,2}:\d{2}$", str(s or "")):
+        raise RpcError("Некорректное %s: ожидается ЧЧ:ММ" % name)
+    hh, mm = [int(x) for x in str(s).split(":")]
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        raise RpcError("Некорректное %s: часы 00–23, минуты 00–59" % name)
+    return "%02d:%02d" % (hh, mm)
+
 def check_date(s, name="дата"):
     try: parseD(s)
     except Exception: raise RpcError("Некорректная %s: %s" % (name, s))
@@ -1323,27 +1350,44 @@ def h_calc_delete(db, cur, u, p):
 def h_meeting_create(db, cur, u, p):
     guard(db, cur, u, "meetings", "create")
     req(p, "title", "type", "date", "time", "chair", "secretary")
-    check_date(p["date"])
+    check_date(p["date"]); p["time"] = check_time(p["time"])
+    rule = rec_validate(p.get("recurrence") or {}, p["date"])
+    projects = _meet_projects_validate(db, cur, p.get("projects") or [])
+    series_id = uid("ms") if rule["freq"] != "none" else ""
+    rec = dict(rule, seriesId=series_id, seriesN=1, master=bool(series_id), skipped=[])
     n = next_seq(db, cur, "meet")
     m = dict(id=uid("m"), code="СОВ-%d-%03d" % (today().year, n), title=p["title"].strip()[:300], type=p["type"],
              date=p["date"], time=p["time"], chair=p["chair"], secretary=p["secretary"],
              attendees=p.get("attendees", []), status="Запланировано", agenda=[], decisions=[],
-             protocol=protocol_default())
+             protocol=protocol_default(), materials=[], projects=projects, recurrence=rec,
+             seriesId=series_id, planLog=[])
     db.save_ent(cur, "meeting", m)
-    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Создано совещание", "Совещание", m["id"], {"title": m["title"], "date": m["date"]})
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Создано совещание", "Совещание", m["id"],
+             {"title": m["title"], "date": m["date"], "projects": projects, "recurrence": rec_text(rec),
+              "event": "MEETING_CREATED"})
     invite = list(dict.fromkeys([m["chair"], m["secretary"]] + (m["attendees"] or [])))
     notify_many(db, cur, [x for x in invite if x != u["id"]], "meeting.invite",
                 "Приглашение: %s" % m["title"], "%s · %s %s" % (m["code"], _fd(m["date"]), m["time"]),
                 "Совещание", m["id"], dedupe_suffix="invite")
     reminders_set(db, cur, "meeting", m, invite, DEFAULT_REMINDERS, u["id"])
-    return m, msg("Совещание создано", "Приглашения разосланы, напоминания: за 1 день и за 1 час")
+    made = _series_generate(db, cur, m, horizon=D(MEET_SERIES_HORIZON), by=u["id"]) if series_id else []
+    return m, msg("Совещание создано", "Приглашения разосланы, напоминания: за 1 день и за 1 час"
+                  + (" · %s, создано карточек серии: %d" % (rec_text(rec), len(made)) if made else ""))
 
 @reg("meeting.update")
 def h_meeting_update(db, cur, u, p):
-    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
     before = {k: m[k] for k in ("date", "time", "chair", "secretary", "attendees")}
+    if "date" in p: check_date(p["date"])
+    if "time" in p: p["time"] = check_time(p["time"])
     for k in ("title", "type", "date", "time", "chair", "secretary", "attendees"):
         if k in p: m[k] = p[k]
+    if (before["date"], before["time"]) != (m["date"], m["time"]):
+        _meet_log(m, u["id"], "move", **{"from": {"date": before["date"], "time": before["time"]},
+                                        "to": {"date": m["date"], "time": m["time"]},
+                                        "reason": (p.get("reason") or "Изменение параметров совещания").strip()[:500]})
+    elif any(before[k] != m[k] for k in ("chair", "secretary", "attendees")):
+        _meet_log(m, u["id"], "params", note="Изменены председатель, секретарь или состав участников")
     db.save_ent(cur, "meeting", m)
     db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Совещание изменено", "Совещание", m["id"], {"code": m["code"]})
     invite = list(dict.fromkeys([m["chair"], m["secretary"]] + (m.get("attendees") or [])))
@@ -1368,6 +1412,7 @@ def h_meeting_update(db, cur, u, p):
 @reg("meeting.conduct")
 def h_meeting_conduct(db, cur, u, p):
     m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    if m["status"] == MEET_CANCELLED: raise RpcError("Отменённое совещание нельзя провести — возобновите его")
     if m["date"] > dISO(today()): raise RpcError("Нельзя провести совещание раньше его даты")
     m["status"] = "Проведено"
     pr = prot_of(m)
@@ -1387,7 +1432,7 @@ def h_meeting_approve(db, cur, u, p):
 
 @reg("meeting.agenda.add")
 def h_meeting_agenda(db, cur, u, p):
-    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
     req(p, "title", "reporter")
     m["agenda"].append({"n": len(m["agenda"]) + 1, "title": p["title"][:300], "reporter": p["reporter"]})
     db.save_ent(cur, "meeting", m)
@@ -1543,6 +1588,469 @@ def h_meeting_delete(db, cur, u, p):
     db.audit(cur, "AUDIT", "warning", u["id"], "meetings", "Совещание удалено", "Совещание", m["id"], {"code": m["code"]})
     return True, msg("Совещание удалено", "Созданные поручения остались в M02")
 
+# ---------------- M16 §2.5: планирование совещаний ----------------
+# ТЗ §2.5: создание совещания, дата и время, повестка, участники, председатель и секретарь,
+# предварительные материалы, связанные проекты, изменение параметров, перенос, отмена,
+# отображение в общем календаре и регулярные совещания с повторением по расписанию.
+# Каждое фактически проведённое мероприятие серии имеет самостоятельную карточку
+# и отдельный протокол (§2.5, абз. посл.).
+
+MEET_FREQ = ("none", "daily", "weekly", "monthly")
+MEET_FREQ_NAMES = {"none": "Без повторения", "daily": "Ежедневно", "weekly": "Еженедельно", "monthly": "Ежемесячно"}
+MEET_MATERIALS_MAX = 20
+MEET_PROJECTS_MAX = 20
+MEET_SERIES_HORIZON = 30      # дней вперёд: горизонт автоматического создания дат серии
+MEET_SERIES_MAX = 60          # предел карточек за одну операцию (защита от runaway)
+MEET_CANCELLED = "Отменено"
+WEEKDAY_NAMES = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+MEET_PLAN_ACT = {"move": "Перенос", "cancel": "Отмена", "restore": "Возобновление",
+                 "params": "Изменение параметров", "series": "Регулярность",
+                 "skip": "Пропуск даты", "projects": "Связанные проекты"}
+
+def _ri(v, d=0):
+    try: return int(v)
+    except Exception: return d
+
+def rec_of(m):
+    """Правило повторения совещания (для записей прежних версий — значения по умолчанию)."""
+    r = {"freq": "none", "interval": 1, "weekdays": [], "monthDay": 0, "until": "", "count": 0,
+         "seriesId": "", "seriesN": 1, "master": False, "skipped": []}
+    r.update(m.get("recurrence") or {})
+    if r.get("freq") not in MEET_FREQ: r["freq"] = "none"
+    r["interval"] = max(1, _ri(r.get("interval"), 1))
+    r["weekdays"] = sorted({w for w in (_ri(x) for x in (r.get("weekdays") or [])) if 1 <= w <= 7})
+    r["monthDay"] = _ri(r.get("monthDay"))
+    r["count"] = _ri(r.get("count"))
+    r["seriesN"] = max(1, _ri(r.get("seriesN"), 1))
+    r["master"] = bool(r.get("master"))
+    r["until"] = r.get("until") or ""
+    r["seriesId"] = r.get("seriesId") or ""
+    if not isinstance(r.get("skipped"), list): r["skipped"] = []
+    return r
+
+def plan_of(m):
+    """Журнал планирования: переносы, отмены, возобновления, изменение параметров, серии."""
+    return m.get("planLog") if isinstance(m.get("planLog"), list) else []
+
+def materials_of(m):
+    return m.get("materials") if isinstance(m.get("materials"), list) else []
+
+def mprojects_of(m):
+    return m.get("projects") if isinstance(m.get("projects"), list) else []
+
+def meet_active(m):
+    if m.get("status") == MEET_CANCELLED:
+        raise RpcError("Совещание отменено — сначала возобновите его (кнопка «Возобновить»)", "Совещание отменено")
+    return m
+
+def rec_text(r):
+    """Человекочитаемое описание расписания (карточка, реестр, протокол)."""
+    if r["freq"] == "none": return MEET_FREQ_NAMES["none"]
+    iv = r["interval"]
+    if r["freq"] == "daily":
+        s = "Каждые %d дн" % iv if iv > 1 else "Ежедневно"
+    elif r["freq"] == "weekly":
+        s = "Каждые %d нед" % iv if iv > 1 else "Еженедельно"
+        if r["weekdays"]: s += ": " + ", ".join(WEEKDAY_NAMES[w - 1] for w in r["weekdays"])
+    else:
+        s = "Каждые %d мес" % iv if iv > 1 else "Ежемесячно"
+        if r["monthDay"]: s += ", %d числа" % r["monthDay"]
+    if r["until"]: s += " · до %s" % _fd(r["until"])
+    if r["count"]: s += " · всего %d" % r["count"]
+    return s
+
+def rec_validate(p, base_date=None):
+    """Проверка правила повторения (§2.5: повторение по заданному расписанию)."""
+    if p is None: p = {}
+    if not isinstance(p, dict): raise RpcError("Расписание задаётся объектом: периодичность, интервал, окончание")
+    if p.get("freq") is not None and p.get("freq") not in MEET_FREQ:
+        raise RpcError("Неизвестная периодичность: %s (допустимо: %s)" % (p.get("freq"), ", ".join(MEET_FREQ)))
+    r = rec_of({"recurrence": p})
+    if r["freq"] == "none":
+        return {"freq": "none", "interval": 1, "weekdays": [], "monthDay": 0, "until": "", "count": 0}
+    if r["interval"] > 30: raise RpcError("Интервал повторения — от 1 до 30")
+    if r["freq"] == "weekly" and not r["weekdays"]:
+        r["weekdays"] = [parseD(base_date).isoweekday()] if base_date else [1]
+    if r["freq"] == "monthly":
+        if not r["monthDay"]: r["monthDay"] = parseD(base_date).day if base_date else 1
+        if not 1 <= r["monthDay"] <= 31: raise RpcError("День месяца — от 1 до 31")
+    if r["until"]:
+        check_date(r["until"], "дата окончания серии")
+        if base_date and r["until"] < base_date:
+            raise RpcError("Дата окончания серии раньше даты первого совещания")
+    if r["count"] and not 1 <= r["count"] <= 104:
+        raise RpcError("Число совещаний серии — от 1 до 104")
+    return {"freq": r["freq"], "interval": r["interval"], "weekdays": r["weekdays"],
+            "monthDay": r["monthDay"], "until": r["until"], "count": r["count"]}
+
+def rec_next_date(date_s, r):
+    """Следующая дата после date_s по правилу повторения."""
+    f, iv = r["freq"], max(1, r["interval"])
+    d = parseD(date_s)
+    if f == "daily": return dISO(d + datetime.timedelta(days=iv))
+    if f == "weekly":
+        wds = sorted(set(r["weekdays"] or [d.isoweekday()]))
+        cw = d.isoweekday()
+        nxt = [w for w in wds if w > cw]
+        if nxt: return dISO(d + datetime.timedelta(days=nxt[0] - cw))
+        return dISO(d + datetime.timedelta(days=7 * iv - (cw - wds[0])))
+    if f == "monthly":
+        day = r["monthDay"] or d.day
+        y, mo = d.year, d.month + iv
+        while mo > 12: y += 1; mo -= 12
+        last = calendar.monthrange(y, mo)[1]
+        return dISO(datetime.date(y, mo, min(day, last)))
+    return None
+
+def rec_dates(start, r, existing, limit, horizon=None):
+    """Даты серии после start: без повторов, с учётом пропуска, окончания и горизонта."""
+    out, d, guard_n = [], start, 0
+    skip = {s.get("date") for s in (r.get("skipped") or []) if isinstance(s, dict)}
+    while len(out) < limit and guard_n < 500:
+        guard_n += 1
+        nd = rec_next_date(d, r)
+        if not nd: break
+        d = nd
+        if r.get("until") and nd > r["until"]: break
+        if horizon and nd > horizon: break
+        if nd in existing or nd in skip: continue
+        out.append(nd)
+    return out
+
+def series_cards(db, cur, series_id):
+    if not series_id: return []
+    cur.execute("SELECT * FROM meetings WHERE series_id=%s ORDER BY date, code", (series_id,))
+    return [db.row2obj("meeting", r) for r in cur.fetchall()]
+
+def _meet_occurrence(db, cur, master, date_s, n, by):
+    """Самостоятельная карточка очередного совещания серии: своя повестка и свой протокол."""
+    r = rec_of(master)
+    seq = next_seq(db, cur, "meet")
+    m = dict(id=uid("m"), code="СОВ-%d-%03d" % (parseD(date_s).year, seq), title=master["title"],
+             type=master["type"], date=date_s, time=master["time"], chair=master["chair"],
+             secretary=master["secretary"], attendees=list(master.get("attendees") or []),
+             status="Запланировано", agenda=[dict(a) for a in (master.get("agenda") or [])],
+             decisions=[], protocol=protocol_default(),
+             materials=[dict(x) for x in materials_of(master)], projects=list(mprojects_of(master)),
+             recurrence=dict(r, master=False, seriesN=n, skipped=[]), seriesId=r["seriesId"],
+             planLog=[{"ts": now_ms(), "by": by, "action": "series", "date": date_s,
+                       "note": "Совещание №%d серии %s" % (n, master["code"])}])
+    db.save_ent(cur, "meeting", m)
+    invite = list(dict.fromkeys([m["chair"], m["secretary"]] + m["attendees"]))
+    notify_many(db, cur, [x for x in invite if x != by], "meeting.invite",
+                "Приглашение: %s" % m["title"],
+                "%s · %s %s · серия %s" % (m["code"], _fd(m["date"]), m["time"], master["code"]),
+                "Совещание", m["id"], dedupe_suffix="invite")
+    reminders_set(db, cur, "meeting", m, invite, DEFAULT_REMINDERS, by)
+    db.audit(cur, "BUSINESS", "info", by, "meetings", "Создано очередное совещание серии",
+             "Совещание", m["id"], {"code": m["code"], "series": r["seriesId"], "n": n,
+                                    "date": date_s, "event": "MEETING_SERIES_OCCURRENCE"})
+    return m
+
+def _series_generate(db, cur, master, limit=None, horizon=None, by="system"):
+    """Создание недостающих карточек серии (идемпотентно: существующие даты не дублируются)."""
+    r = rec_of(master)
+    if r["freq"] == "none" or not r["master"] or not r["seriesId"]: return []
+    cards = series_cards(db, cur, r["seriesId"])
+    have = {c["date"] for c in cards}
+    cap = MEET_SERIES_MAX if limit is None else max(0, min(MEET_SERIES_MAX, _ri(limit)))
+    if r["count"]: cap = min(cap, max(0, r["count"] - len(cards)))
+    if cap <= 0: return []
+    dates = rec_dates(master["date"], r, have, cap, horizon)
+    n = max([rec_of(c)["seriesN"] for c in cards] or [1])
+    made = []
+    for d in dates:
+        n += 1
+        made.append(_meet_occurrence(db, cur, master, d, n, by))
+    return made
+
+def meeting_series_cycle(db, cur):
+    """Планировщик: ближайшие даты регулярных совещаний материализуются отдельными карточками."""
+    cur.execute("SELECT * FROM meetings WHERE series_id<>'' AND status<>%s ORDER BY date", (MEET_CANCELLED,))
+    rows = [db.row2obj("meeting", r) for r in cur.fetchall()]
+    made = 0
+    for m in rows:
+        r = rec_of(m)
+        if not r["master"] or r["freq"] == "none": continue
+        made += len(_series_generate(db, cur, m, horizon=D(MEET_SERIES_HORIZON), by="system"))
+        if made >= MEET_SERIES_MAX: break
+    if made:
+        LOG.info("Регулярные совещания: создано карточек %d (горизонт %d дн)", made, MEET_SERIES_HORIZON)
+        db.audit(cur, "BUSINESS", "info", "system", "meetings",
+                 "Регулярные совещания: создано карточек %d" % made, "Совещание", "",
+                 {"count": made, "horizon": MEET_SERIES_HORIZON, "event": "MEETING_SERIES_AUTO"})
+    return {"created": made}
+
+def _meet_projects_validate(db, cur, ids):
+    out = []
+    for pid in list(dict.fromkeys(ids or [])):
+        if not pid: continue
+        get_req(db, cur, "project", pid)
+        out.append(pid)
+    if len(out) > MEET_PROJECTS_MAX:
+        raise RpcError("Связанных проектов — не более %d" % MEET_PROJECTS_MAX)
+    return out
+
+def _meet_log(m, by, action, **kw):
+    log = plan_of(m)
+    rec = {"ts": now_ms(), "by": by, "action": action}
+    rec.update(kw)
+    log.append(rec)
+    m["planLog"] = log[-100:]
+    return rec
+
+@reg("meeting.materials.add")
+def h_meeting_material_add(db, cur, u, p):
+    """Предварительные материалы совещания (§2.5): документ M09 либо ссылка (ЛВС/внешний ресурс)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    mats = materials_of(m)
+    if len(mats) >= MEET_MATERIALS_MAX:
+        raise RpcError("Материалов к совещанию — не более %d" % MEET_MATERIALS_MAX)
+    note = (p.get("note") or "").strip()[:300]
+    if p.get("docId"):
+        d = get_req(db, cur, "doc", p["docId"])
+        if any(x.get("docId") == d["id"] for x in mats):
+            raise RpcError("Этот документ уже прикреплён к совещанию")
+        item = {"id": uid("mm"), "kind": "doc", "docId": d["id"], "name": "%s · %s" % (d["code"], d["title"]),
+                "url": "", "note": note, "addedAt": now_ms(), "addedBy": u["id"]}
+    else:
+        req(p, "name", "url")
+        url = p["url"].strip()[:500]
+        if re.match(r"^\s*(javascript|data|vbscript):", url, re.I):
+            raise RpcError("Недопустимая схема ссылки")
+        if any(x.get("url") == url for x in mats):
+            raise RpcError("Эта ссылка уже прикреплена к совещанию")
+        item = {"id": uid("mm"), "kind": "link", "docId": None, "name": p["name"].strip()[:200],
+                "url": url, "note": note, "addedAt": now_ms(), "addedBy": u["id"]}
+    mats.append(item); m["materials"] = mats
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Прикреплён материал к совещанию",
+             "Совещание", m["id"], {"code": m["code"], "material": item["name"], "kind": item["kind"],
+                                    "event": "MEETING_MATERIAL_ADDED"})
+    invite = list(dict.fromkeys([m["chair"], m["secretary"]] + (m.get("attendees") or [])))
+    notify_many(db, cur, [x for x in invite if x != u["id"]], "meeting.materials",
+                "Материалы к совещанию: %s" % m["title"],
+                "%s · %s · %s" % (m["code"], item["name"], _fd(m["date"])), "Совещание", m["id"],
+                dedupe_suffix="mat:%s" % item["id"])
+    return m, msg("Материал прикреплён", "Участники оповещены · всего материалов: %d" % len(mats))
+
+@reg("meeting.materials.remove")
+def h_meeting_material_remove(db, cur, u, p):
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    req(p, "materialId")
+    mats = materials_of(m)
+    keep = [x for x in mats if x.get("id") != p["materialId"]]
+    if len(keep) == len(mats): raise RpcError("Материал не найден в списке совещания")
+    m["materials"] = keep
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Материал откреплён от совещания",
+             "Совещание", m["id"], {"code": m["code"], "materialId": p["materialId"],
+                                    "event": "MEETING_MATERIAL_REMOVED"})
+    return m, msg("Материал откреплён", "Осталось материалов: %d" % len(keep))
+
+@reg("meeting.projects.set")
+def h_meeting_projects_set(db, cur, u, p):
+    """Регистрация связанных проектов совещания (§2.5)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    ids = _meet_projects_validate(db, cur, p.get("projects") or [])
+    was = set(mprojects_of(m))
+    m["projects"] = ids
+    _meet_log(m, u["id"], "projects", note="Связанные проекты: %d" % len(ids))
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Зарегистрированы связанные проекты",
+             "Совещание", m["id"], {"code": m["code"], "projects": ids, "added": sorted(set(ids) - was),
+                                    "event": "MEETING_PROJECTS"})
+    return m, msg("Связанные проекты сохранены", "Проектов: %d" % len(ids))
+
+@reg("meeting.reschedule")
+def h_meeting_reschedule(db, cur, u, p):
+    """Перенос совещания с основанием, историей и пересчётом напоминаний (§2.5, M12 §8.2)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    req(p, "date", "reason")
+    if m["status"] != "Запланировано":
+        raise RpcError("Переносить можно только запланированное совещание")
+    check_date(p["date"])
+    reason = p["reason"].strip()[:500]
+    if len(reason) < 3: raise RpcError("Укажите основание переноса (не менее 3 символов)")
+    new_time = check_time(p.get("time") or m["time"])
+    if (p["date"], new_time) == (m["date"], m["time"]):
+        raise RpcError("Дата и время не изменились — перенос не требуется")
+    was = {"date": m["date"], "time": m["time"]}
+    m["date"], m["time"] = p["date"], new_time
+    _meet_log(m, u["id"], "move", **{"from": was, "to": {"date": m["date"], "time": m["time"]}, "reason": reason})
+    db.save_ent(cur, "meeting", m)
+    invite = list(dict.fromkeys([m["chair"], m["secretary"]] + (m.get("attendees") or [])))
+    offs = sorted({r["offset_min"] for r in reminders_of(db, cur, "meeting", m["id"])}) or DEFAULT_REMINDERS
+    reminders_set(db, cur, "meeting", m, invite, offs, u["id"])
+    notify_many(db, cur, [x for x in invite if x != u["id"]], "meeting.moved",
+                "Совещание перенесено: %s" % m["title"],
+                "%s · %s %s (было %s %s) · %s" % (m["code"], _fd(m["date"]), m["time"],
+                                                  _fd(was["date"]), was["time"], reason),
+                "Совещание", m["id"], dedupe_suffix="move:%s:%s" % (m["date"], m["time"]))
+    db.audit(cur, "BUSINESS", "warning", u["id"], "meetings", "Совещание перенесено",
+             "Совещание", m["id"], {"code": m["code"], "from": was, "to": {"date": m["date"], "time": m["time"]},
+                                    "reason": reason, "event": "MEETING_RESCHEDULED"})
+    return m, msg("Совещание перенесено", "%s %s · участники оповещены, напоминания пересчитаны"
+                  % (_fd(m["date"]), m["time"]))
+
+@reg("meeting.cancel")
+def h_meeting_cancel(db, cur, u, p):
+    """Отмена совещания с основанием: статус, снятие напоминаний, оповещение (§2.5)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    req(p, "reason")
+    reason = p["reason"].strip()[:500]
+    if len(reason) < 3: raise RpcError("Укажите основание отмены (не менее 3 символов)")
+    if m["status"] == MEET_CANCELLED: raise RpcError("Совещание уже отменено")
+    if m["status"] != "Запланировано":
+        raise RpcError("Отменить можно только запланированное совещание")
+    was = {"date": m["date"], "time": m["time"], "status": m["status"]}
+    m["status"] = MEET_CANCELLED
+    _meet_log(m, u["id"], "cancel", **{"from": was, "reason": reason})
+    db.save_ent(cur, "meeting", m)
+    cur.execute("DELETE FROM reminders WHERE owner_type='meeting' AND owner_id=%s", (m["id"],))
+    invite = list(dict.fromkeys([m["chair"], m["secretary"]] + (m.get("attendees") or [])))
+    notify_many(db, cur, [x for x in invite if x != u["id"]], "meeting.cancelled",
+                "Совещание отменено: %s" % m["title"],
+                "%s · %s %s · %s" % (m["code"], _fd(m["date"]), m["time"], reason),
+                "Совещание", m["id"], dedupe_suffix="cancel")
+    db.audit(cur, "BUSINESS", "warning", u["id"], "meetings", "Совещание отменено",
+             "Совещание", m["id"], {"code": m["code"], "date": m["date"], "reason": reason,
+                                    "event": "MEETING_CANCELLED"})
+    return m, msg("Совещание отменено", "Напоминания сняты, участники оповещены · основание в истории планирования")
+
+@reg("meeting.restore")
+def h_meeting_restore(db, cur, u, p):
+    """Возобновление отменённого совещания (§2.5: изменение параметров и возврат в расписание)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    if m["status"] != MEET_CANCELLED: raise RpcError("Возобновить можно только отменённое совещание")
+    reason = (p.get("reason") or "Возобновлено по решению председателя").strip()[:500]
+    if p.get("date"):
+        check_date(p["date"]); m["date"] = p["date"]
+    if p.get("time"):
+        m["time"] = check_time(p["time"])
+    m["status"] = "Запланировано"
+    _meet_log(m, u["id"], "restore", reason=reason, date=m["date"])
+    db.save_ent(cur, "meeting", m)
+    invite = list(dict.fromkeys([m["chair"], m["secretary"]] + (m.get("attendees") or [])))
+    reminders_set(db, cur, "meeting", m, invite, DEFAULT_REMINDERS, u["id"])
+    notify_many(db, cur, [x for x in invite if x != u["id"]], "meeting.moved",
+                "Совещание возобновлено: %s" % m["title"],
+                "%s · %s %s" % (m["code"], _fd(m["date"]), m["time"]), "Совещание", m["id"],
+                dedupe_suffix="restore:%s" % m["date"])
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Совещание возобновлено",
+             "Совещание", m["id"], {"code": m["code"], "date": m["date"], "reason": reason,
+                                    "event": "MEETING_RESTORED"})
+    return m, msg("Совещание возобновлено", "Напоминания восстановлены, участники оповещены")
+
+@reg("meeting.series.update")
+def h_meeting_series_update(db, cur, u, p):
+    """Изменение расписания регулярного совещания (головная карточка серии)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    r = rec_of(m)
+    if r["seriesId"] and not r["master"]:
+        raise RpcError("Расписание изменяется в головной карточке серии %s" % r["seriesId"])
+    rule = rec_validate(p.get("rule"), m["date"])
+    if rule["freq"] == "none":
+        r.update(rule); r["master"] = False
+        m["recurrence"] = r
+        _meet_log(m, u["id"], "series", note="Повторение отключено")
+        db.save_ent(cur, "meeting", m)
+        db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Повторение совещания отключено",
+                 "Совещание", m["id"], {"code": m["code"], "event": "MEETING_SERIES_OFF"})
+        return m, msg("Повторение отключено", "Созданные совещания серии сохранены")
+    if not r["seriesId"]:
+        r["seriesId"] = uid("ms"); m["seriesId"] = r["seriesId"]
+    r.update(rule); r["master"] = True; r.setdefault("seriesN", 1)
+    m["recurrence"] = r
+    _meet_log(m, u["id"], "series", note="Расписание: " + rec_text(r))
+    changed = []
+    if p.get("applyToFuture"):
+        for c in series_cards(db, cur, r["seriesId"]):
+            if c["id"] == m["id"] or c["date"] <= m["date"] or c["status"] != "Запланировано": continue
+            cr = rec_of(c); cr.update(rule); cr["master"] = False
+            c["recurrence"] = cr
+            c["time"] = m["time"]; c["chair"] = m["chair"]; c["secretary"] = m["secretary"]
+            c["attendees"] = list(m.get("attendees") or [])
+            _meet_log(c, u["id"], "series", note="Расписание серии изменено: " + rec_text(r))
+            db.save_ent(cur, "meeting", c)
+            changed.append(c["code"])
+    db.save_ent(cur, "meeting", m)
+    made = _series_generate(db, cur, m, by=u["id"])
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Изменено расписание регулярного совещания",
+             "Совещание", m["id"], {"code": m["code"], "rule": rule, "created": len(made),
+                                    "updated": changed, "event": "MEETING_SERIES_UPDATED"})
+    return m, msg("Расписание сохранено", rec_text(r) + (" · создано карточек: %d" % len(made) if made else "")
+                  + (" · обновлено будущих: %d" % len(changed) if changed else ""))
+
+@reg("meeting.series.generate")
+def h_meeting_series_generate(db, cur, u, p):
+    """Создание очередных совещаний серии отдельными карточками (§2.5)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    r = rec_of(m)
+    if not r["master"] or r["freq"] == "none":
+        raise RpcError("Совещание не является головной карточкой регулярной серии")
+    cnt = p.get("count")
+    if cnt is not None and _ri(cnt) < 1: raise RpcError("Число создаваемых совещаний — не менее 1")
+    made = _series_generate(db, cur, m, limit=cnt,
+                            horizon=None if cnt is not None else D(MEET_SERIES_HORIZON), by=u["id"])
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Созданы очередные совещания серии",
+             "Совещание", m["id"], {"code": m["code"], "count": len(made),
+                                    "dates": [x["date"] for x in made], "event": "MEETING_SERIES_GENERATED"})
+    return {"meeting": m, "created": [{"id": x["id"], "code": x["code"], "date": x["date"]} for x in made]}, \
+        msg("Совещания серии созданы", "Новых карточек: %d · у каждой своя повестка и протокол" % len(made))
+
+@reg("meeting.series.skip")
+def h_meeting_series_skip(db, cur, u, p):
+    """Пропуск даты серии: существующая карточка отменяется, будущая дата не создаётся (§2.5)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    r = rec_of(m)
+    if not r["master"]: raise RpcError("Пропуск даты выполняется в головной карточке серии")
+    req(p, "date", "reason")
+    check_date(p["date"])
+    reason = p["reason"].strip()[:500]
+    if len(reason) < 3: raise RpcError("Укажите основание пропуска (не менее 3 символов)")
+    if p["date"] <= m["date"]: raise RpcError("Пропустить можно только дату после головного совещания")
+    cards = [c for c in series_cards(db, cur, r["seriesId"]) if c["date"] == p["date"] and c["id"] != m["id"]]
+    skipped = [s for s in (r.get("skipped") or []) if isinstance(s, dict) and s.get("date") != p["date"]]
+    skipped.append({"date": p["date"], "reason": reason, "ts": now_ms(), "by": u["id"]})
+    r["skipped"] = skipped[-100:]
+    m["recurrence"] = r
+    _meet_log(m, u["id"], "skip", date=p["date"], reason=reason)
+    db.save_ent(cur, "meeting", m)
+    cancelled = []
+    for c in cards:
+        if c["status"] != "Запланировано": continue
+        c["status"] = MEET_CANCELLED
+        _meet_log(c, u["id"], "cancel", reason="Пропуск по расписанию: " + reason, date=c["date"])
+        db.save_ent(cur, "meeting", c)
+        cur.execute("DELETE FROM reminders WHERE owner_type='meeting' AND owner_id=%s", (c["id"],))
+        inv = list(dict.fromkeys([c["chair"], c["secretary"]] + (c.get("attendees") or [])))
+        notify_many(db, cur, [x for x in inv if x != u["id"]], "meeting.cancelled",
+                    "Совещание отменено: %s" % c["title"],
+                    "%s · %s · пропуск по расписанию: %s" % (c["code"], _fd(c["date"]), reason),
+                    "Совещание", c["id"], dedupe_suffix="skip")
+        cancelled.append(c["code"])
+    db.audit(cur, "BUSINESS", "warning", u["id"], "meetings", "Пропущена дата регулярного совещания",
+             "Совещание", m["id"], {"code": m["code"], "date": p["date"], "reason": reason,
+                                    "cancelled": cancelled, "event": "MEETING_SERIES_SKIP"})
+    return m, msg("Дата серии пропущена", p["date"] + (" · отменено карточек: %d" % len(cancelled) if cancelled
+                                                       else " · совещание на эту дату создаваться не будет"))
+
+@reg("meeting.series.list")
+def h_meeting_series_list(db, cur, u, p):
+    """Состав серии: каждое проведённое мероприятие — самостоятельная карточка и протокол."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "view", m)
+    r = rec_of(m)
+    sid = r["seriesId"] or m.get("seriesId") or ""
+    cards = series_cards(db, cur, sid)
+    items = [{"id": c["id"], "code": c["code"], "date": c["date"], "time": c["time"], "status": c["status"],
+              "n": rec_of(c)["seriesN"], "master": rec_of(c)["master"], "protocol": prot_of(c)["status"],
+              "protocolVersion": prot_of(c)["version"], "decisions": len(c.get("decisions") or []),
+              "agenda": len(c.get("agenda") or [])} for c in cards]
+    return {"seriesId": sid, "rule": r, "text": rec_text(r), "items": items,
+            "planned": len([x for x in items if x["status"] == "Запланировано"]),
+            "held": len([x for x in items if x["status"] != "Запланировано" and x["status"] != MEET_CANCELLED]),
+            "cancelled": len([x for x in items if x["status"] == MEET_CANCELLED])}, None
 # ---------------- Реестр поручений и контроль исполнения (ТЗ M16 §2.11, §19.5–19.6) ----------------
 # Поручение — задача M02 (единая система задач). Реестр является представлением задач типа
 # «поручение» с производным статусом, синхронизированным со статусом задачи, и отдельным
@@ -2921,9 +3429,32 @@ def meeting_protocol_doc(db, cur, u, m):
                               ("Дата формирования", datetime.datetime.now().strftime("%d.%m.%Y %H:%M"))])
     d.toc = True
     d.h1("1. Общие сведения")
+    prj_codes = []
+    for pid in mprojects_of(m):
+        pr = db.get_ent(cur, "project", pid)
+        prj_codes.append("%s · %s" % (pr["code"], pr["name"]) if pr else pid)
     d.kv([("Наименование", m["title"]), ("Вид совещания", m["type"]),
           ("Дата и время", "%s %s" % (_fd(m["date"]), m.get("time") or "")),
-          ("Председатель", _uname(db, cur, m["chair"])), ("Секретарь", _uname(db, cur, m["secretary"]))])
+          ("Председатель", _uname(db, cur, m["chair"])), ("Секретарь", _uname(db, cur, m["secretary"])),
+          ("Связанные проекты", "; ".join(prj_codes) or "не зарегистрированы"),
+          ("Повторение", rec_text(rec_of(m)))])
+    mats = materials_of(m)
+    if mats:
+        d.h2("Предварительные материалы (§2.5)")
+        d.table(["Материал", "Вид / ссылка", "Примечание"],
+                [[x.get("name", ""), "Документ M09" if x.get("kind") == "doc" else x.get("url", ""),
+                  x.get("note") or "—"] for x in mats], widths=[3, 2.2, 1.6])
+    pl = plan_of(m)
+    if pl:
+        d.h2("Планирование: переносы, отмены, изменения (§2.5)")
+        d.table(["Дата и время", "Кто", "Действие", "Основание"],
+                [[datetime.datetime.fromtimestamp(x["ts"] / 1000).strftime("%d.%m.%Y %H:%M"),
+                  _uname(db, cur, x.get("by")), MEET_PLAN_ACT.get(x.get("action"), x.get("action", "")),
+                  (x.get("reason") or x.get("note") or "—") +
+                  (" (%s %s → %s %s)" % (_fd(x["from"]["date"]), x["from"].get("time", ""),
+                                         _fd(x["to"]["date"]), x["to"].get("time", ""))
+                   if x.get("from") and x.get("to") else "")] for x in pl],
+                widths=[1.3, 1.5, 1.4, 2.6])
     d.h1("2. Присутствовали")
     if att: d.list(["%s — %s" % (_uname(db, cur, a), _role_of(db, cur, a)) for a in att], numbered=True)
     else: d.p("Состав участников не зарегистрирован.")
@@ -3287,6 +3818,9 @@ NOTIF_TYPES = {
     "meeting.reminder":   ("Напоминание о совещании", "calendar"),
     "event.reminder":     ("Напоминание о событии календаря", "calendar"),
     "meeting.invite":     ("Приглашение на совещание", "meetings"),
+    "meeting.moved":      ("Перенос совещания", "meetings"),
+    "meeting.cancelled":  ("Отмена совещания", "meetings"),
+    "meeting.materials":  ("Материалы к совещанию", "meetings"),
     "protocol.review":    ("Протокол направлен на согласование", "meetings"),
     "protocol.approved":  ("Протокол утверждён", "meetings"),
     "protocol.rework":    ("Протокол возвращён на доработку", "meetings"),
@@ -3501,6 +4035,8 @@ def notification_cycle_cur(db, cur):
                 delivered += 1
     # 3. Контроль сроков поручений: шесть проверок и настраиваемый состав получателей (ТЗ §2.11.1)
     delivered += directive_control_cycle(db, cur)["delivered"]
+    # 3а. Регулярные совещания: ближайшие даты серии — отдельными карточками (ТЗ §2.5)
+    meeting_series_cycle(db, cur)
     # 4. Пересмотр рисков
     cur.execute("SELECT id,code,title,owner FROM risks WHERE status<>'Закрыт' AND review<=%s AND owner IS NOT NULL", (today_s,))
     for r in cur.fetchall():
@@ -3901,7 +4437,9 @@ class App(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         line = "%s - %s" % (self.address_string(), fmt % args)
-        if "/api/state" in (args[0] if args else ""):
+        # первый аргумент может быть не строкой (HTTPStatus из send_error) — приводим к тексту
+        first = str(args[0]) if args else ""
+        if "/api/state" in first:
             LOG.debug("HTTP %s", line)          # поллинг состояния — только в режиме DEBUG
         else:
             LOG.info("HTTP %s", line)
@@ -4299,7 +4837,7 @@ def main():
 
 # ================= Установка и настройка через EXE (ТЗ §7) =================
 CONFIG_PATH = os.path.join(BASE_DIR, "supip.ini")
-SCHEMA_VERSION = 4   # 2 — уведомления (v1.4.0), 3 — маршрут протокола (v1.5.0), 4 — поручения (v1.6.0)
+SCHEMA_VERSION = 5   # 2 — уведомления (v1.4.0), 3 — маршрут протокола (v1.5.0), 4 — поручения (v1.6.0), 5 — планирование совещаний (v1.10.0)
 MIGRATIONS = {   # {версия: [SQL, ...]} — применяется по порядку при старте/обновлении
     2: [  # v1.4.0: центр уведомлений и напоминаний
         """CREATE TABLE IF NOT EXISTS notifications(
@@ -4326,6 +4864,15 @@ MIGRATIONS = {   # {версия: [SQL, ...]} — применяется по п
              ts BIGINT NOT NULL, by_user TEXT, UNIQUE(decision_id, task_id))""",
         "CREATE INDEX IF NOT EXISTS ix_meeting_tasks_m ON meeting_tasks(meeting_id)",
         "CREATE INDEX IF NOT EXISTS ix_meeting_tasks_t ON meeting_tasks(task_id)",
+    ],
+    5: [  # v1.10.0: планирование совещаний (ТЗ M16 §2.5)
+        "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS materials JSONB NOT NULL DEFAULT '[]'",
+        "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS projects JSONB NOT NULL DEFAULT '[]'",
+        "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS recurrence JSONB NOT NULL DEFAULT '{}'",
+        "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS plan_log JSONB NOT NULL DEFAULT '[]'",
+        "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS series_id TEXT NOT NULL DEFAULT ''",
+        "CREATE INDEX IF NOT EXISTS ix_meetings_series ON meetings(series_id) WHERE series_id <> ''",
+        "CREATE INDEX IF NOT EXISTS ix_meetings_date ON meetings(date)",
     ],
 }
 
