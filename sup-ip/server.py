@@ -39,7 +39,7 @@ except ImportError:
     docgen = None
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -1430,14 +1430,438 @@ def h_meeting_approve(db, cur, u, p):
     _protocol_approve(db, cur, u, m, p.get("note", ""))
     return m, msg("Протокол утверждён", "Сохранена отдельная версия, участники оповещены")
 
+# ---------------- M16 §2.6: формирование повестки (экранные требования MTG-06) ----------------
+AGENDA_ST = ("Подготовлен", "Включён в повестку", "Рассматривается", "Рассмотрен", "Перенесён", "Снят с рассмотрения")
+AGENDA_OPEN = ("Подготовлен", "Включён в повестку", "Рассматривается")   # нерассмотренные вопросы
+AGENDA_TRANS = {
+    "Подготовлен":          ("Включён в повестку", "Снят с рассмотрения"),
+    "Включён в повестку":   ("Подготовлен", "Рассматривается", "Рассмотрен", "Снят с рассмотрения"),
+    "Рассматривается":      ("Включён в повестку", "Рассмотрен", "Снят с рассмотрения"),
+    "Рассмотрен":           ("Рассматривается",),
+    "Перенесён":            (),
+    "Снят с рассмотрения":  ("Подготовлен", "Включён в повестку"),
+}
+AGENDA_ITEMS_MAX = 60
+AGENDA_MAT_MAX = 10
+AGENDA_TASKS_MAX = 20
+AGENDA_DUR_MAX = 480
+AGENDA_ACT = {"add": "Добавлен", "edit": "Изменён", "move": "Изменён порядок", "status": "Статус рассмотрения",
+              "mat+": "Прикреплён материал", "mat-": "Откреплён материал",
+              "carryOut": "Перенесён на другое совещание", "carryIn": "Перенесён с другого совещания"}
+
+def agenda_of(m):
+    return m.get("agenda") if isinstance(m.get("agenda"), list) else []
+
+def agenda_norm(m):
+    """Приводит вопросы повестки к структуре §2.6: записи прежних версий дополняются полями,
+       порядковый номер всегда соответствует порядку в списке."""
+    items = agenda_of(m)
+    for i, a in enumerate(items):
+        if not a.get("id"): a["id"] = uid("aq")
+        for k, v in (("content", ""), ("prep", ""), ("durationMin", 0), ("projectId", ""), ("stageId", ""),
+                     ("riskId", ""), ("expected", ""), ("fact", ""), ("comment", ""),
+                     ("status", "Включён в повестку")):
+            if k not in a: a[k] = v
+        for k in ("taskIds", "materials", "history"):
+            if not isinstance(a.get(k), list): a[k] = []
+        for k in ("carryFrom", "carryTo", "statusAt", "statusBy"):
+            if k not in a: a[k] = None
+        a["n"] = i + 1
+    m["agenda"] = items
+    return items
+
+def agenda_find(m, p):
+    """Вопрос выбирается по устойчивому идентификатору либо по порядковому номеру."""
+    items = agenda_norm(m)
+    if p.get("itemId"):
+        a = next((x for x in items if x["id"] == p["itemId"]), None)
+        if not a: raise RpcError("Вопрос повестки не найден: %s" % p["itemId"], "Повестка", 404, "NOT_FOUND")
+        return items, a
+    if p.get("n") is not None:
+        try: n = int(p["n"])
+        except (TypeError, ValueError): raise RpcError("Порядковый номер вопроса — целое число")
+        a = next((x for x in items if x["n"] == n), None)
+        if not a: raise RpcError("Пункт повестки не найден: %s" % n, "Повестка", 404, "NOT_FOUND")
+        return items, a
+    raise RpcError("Не указан вопрос повестки (itemId или n)")
+
+def _agenda_hist(a, by, action, **kw):
+    h = a.get("history") if isinstance(a.get("history"), list) else []
+    rec = {"ts": now_ms(), "by": by, "action": action}
+    rec.update(kw)
+    h.append(rec)
+    a["history"] = h[-50:]
+    return rec
+
+def _agenda_user(db, cur, id_, what):
+    if not id_: return ""
+    cur.execute("SELECT id FROM users WHERE id=%s AND NOT blocked", (id_,))
+    if not cur.fetchone(): raise RpcError("%s не найден или заблокирован: %s" % (what, id_))
+    return id_
+
+def agenda_total_min(m):
+    return sum(int(a.get("durationMin") or 0) for a in agenda_of(m))
+
+def _agenda_fields(db, cur, m, p, a):
+    """Поля вопроса повестки (§2.6, MTG-06 9.2) с проверкой связей и диапазонов."""
+    if "title" in p:
+        t = str(p["title"] or "").strip()
+        if not t: raise RpcError("Не заполнено наименование вопроса")
+        a["title"] = t[:300]
+    if "content" in p: a["content"] = str(p["content"] or "").strip()[:4000]
+    if "reporter" in p: a["reporter"] = _agenda_user(db, cur, p["reporter"], "Докладчик")
+    if "prep" in p: a["prep"] = _agenda_user(db, cur, p["prep"], "Ответственный за подготовку")
+    if "durationMin" in p:
+        try: dur = int(p["durationMin"] or 0)
+        except (TypeError, ValueError): raise RpcError("Планируемая продолжительность — целое число минут")
+        if not (0 <= dur <= AGENDA_DUR_MAX):
+            raise RpcError("Планируемая продолжительность: 0…%d минут" % AGENDA_DUR_MAX)
+        a["durationMin"] = dur
+    if "projectId" in p:
+        pid = p["projectId"] or ""
+        if pid: get_req(db, cur, "project", pid)
+        if a.get("projectId") and pid != a["projectId"]:
+            a["stageId"] = ""; a["taskIds"] = []      # связи прежнего проекта снимаются
+        a["projectId"] = pid
+    if "stageId" in p:
+        sid = p["stageId"] or ""
+        if sid:
+            t = get_req(db, cur, "task", sid)
+            if a.get("projectId") and t.get("projectId") != a["projectId"]:
+                raise RpcError("Этап не принадлежит выбранному проекту")
+        a["stageId"] = sid
+    if "taskIds" in p:
+        ids = []
+        for tid_ in list(dict.fromkeys(p["taskIds"] or [])):
+            if not tid_: continue
+            t = get_req(db, cur, "task", tid_)
+            if a.get("projectId") and t.get("projectId") != a["projectId"]:
+                raise RpcError("Задача %s не принадлежит выбранному проекту" % t.get("code", tid_))
+            ids.append(tid_)
+        if len(ids) > AGENDA_TASKS_MAX: raise RpcError("Связанных задач — не более %d" % AGENDA_TASKS_MAX)
+        a["taskIds"] = ids
+    if "riskId" in p:
+        rid = p["riskId"] or ""
+        if rid: get_req(db, cur, "risk", rid)
+        a["riskId"] = rid
+    for k, lim in (("expected", 1000), ("fact", 2000), ("comment", 1000)):
+        if k in p: a[k] = str(p[k] or "").strip()[:lim]
+    return a
+
+def _agenda_new(db, cur, u, m, p):
+    a = {"id": uid("aq"), "n": len(agenda_of(m)) + 1, "title": "", "content": "", "reporter": "",
+         "prep": "", "durationMin": 0, "projectId": "", "stageId": "", "taskIds": [], "riskId": "",
+         "materials": [], "expected": "", "fact": "", "comment": "",
+         "status": p.get("status") or "Включён в повестку", "carryFrom": None, "carryTo": None,
+         "statusAt": now_ms(), "statusBy": u["id"], "history": []}
+    if a["status"] not in ("Подготовлен", "Включён в повестку"):
+        raise RpcError("Новый вопрос включается в повестку со статусом «Подготовлен» или «Включён в повестку»")
+    _agenda_fields(db, cur, m, p, a)
+    if not a.get("reporter"): raise RpcError("Не указан докладчик")
+    return a
+
+def _agenda_decisions(m, a):
+    return [d for d in (m.get("decisions") or [])
+            if d.get("agendaId") == a["id"] or (not d.get("agendaId") and d.get("agendaN") == a["n"])]
+
+def _agenda_sync_links(db, cur, m, old_n):
+    """Порядок вопросов изменился — ссылки решений и поручений переводятся на новые номера."""
+    by_id = {a["id"]: a for a in agenda_of(m)}
+    by_old = {v: k for k, v in old_n.items()}
+    for d in m.get("decisions") or []:
+        aid = d.get("agendaId") or by_old.get(d.get("agendaN"))
+        if aid and aid in by_id:
+            d["agendaId"] = aid
+            d["agendaN"] = by_id[aid]["n"]
+    cur.execute("SELECT id FROM tasks WHERE directive->>'meetingId' = %s", (m["id"],))
+    for r in cur.fetchall():
+        t = db.get_ent(cur, "task", r["id"])
+        dr = t.get("directive") or {}
+        aid = dr.get("agendaId") or by_old.get(dr.get("agendaN"))
+        if aid and aid in by_id:
+            dr["agendaId"] = aid
+            dr["agendaN"] = by_id[aid]["n"]
+            t["directive"] = dr
+            db.save_ent(cur, "task", t)
+
 @reg("meeting.agenda.add")
 def h_meeting_agenda(db, cur, u, p):
+    """Вопрос повестки со всеми полями §2.6 (наименование, содержание, докладчик, ответственный
+       за подготовку, проект, этап, задачи, риск, продолжительность, ожидаемый результат)."""
     m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    items = agenda_norm(m)
+    if len(items) >= AGENDA_ITEMS_MAX: raise RpcError("Вопросов повестки — не более %d" % AGENDA_ITEMS_MAX)
     req(p, "title", "reporter")
-    m["agenda"].append({"n": len(m["agenda"]) + 1, "title": p["title"][:300], "reporter": p["reporter"]})
+    a = _agenda_new(db, cur, u, m, p)
+    items.append(a)
+    _agenda_hist(a, u["id"], "add", note="Вопрос %s: %s" % (a["n"], a["title"]))
     db.save_ent(cur, "meeting", m)
-    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Добавлен вопрос повестки", "Совещание", m["id"], {"code": m["code"]})
-    return m, msg("Вопрос добавлен")
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Добавлен вопрос повестки", "Совещание", m["id"],
+             {"code": m["code"], "n": a["n"], "itemId": a["id"], "title": a["title"],
+              "durationMin": a["durationMin"], "event": "MEETING_AGENDA_ADDED"})
+    return m, msg("Вопрос добавлен", "№%s · %s · план %s мин" % (a["n"], a["title"], a["durationMin"] or "—"))
+
+@reg("meeting.agenda.update")
+def h_meeting_agenda_update(db, cur, u, p):
+    """Изменение вопроса повестки (§2.6): содержание, ответственные, связи, продолжительность."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    items, a = agenda_find(m, p)
+    if a["status"] == "Перенесён":
+        raise RpcError("Вопрос перенесён на другое совещание — изменяйте его в карточке-получателе")
+    was = {k: a.get(k) for k in ("title", "content", "reporter", "prep", "durationMin", "projectId",
+                                 "stageId", "taskIds", "riskId", "expected", "fact", "comment")}
+    _agenda_fields(db, cur, m, p, a)
+    changed = [k for k in was if was[k] != a.get(k)]
+    if not changed: raise RpcError("Поля вопроса не изменились")
+    _agenda_hist(a, u["id"], "edit", note="Изменены поля: " + ", ".join(changed))
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Изменён вопрос повестки", "Совещание", m["id"],
+             {"code": m["code"], "n": a["n"], "itemId": a["id"], "fields": changed,
+              "event": "MEETING_AGENDA_UPDATED"})
+    return m, msg("Вопрос изменён", "Поля: %s" % ", ".join(changed))
+
+@reg("meeting.agenda.move")
+def h_meeting_agenda_move(db, cur, u, p):
+    """Изменение порядка вопросов (§2.6): позиция или направление; порядок сохраняется в истории."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    items, a = agenda_find(m, p)
+    old_n = {x["id"]: x["n"] for x in items}
+    order_was = [x["n"] for x in items]
+    i = items.index(a)
+    if p.get("to") is not None:
+        try: to = int(p["to"]) - 1
+        except (TypeError, ValueError): raise RpcError("Новая позиция вопроса — целое число")
+        if not (0 <= to < len(items)): raise RpcError("Новая позиция вопроса: 1…%d" % len(items))
+    elif p.get("dir") in ("up", "down"):
+        to = i - 1 if p["dir"] == "up" else i + 1
+        if not (0 <= to < len(items)):
+            raise RpcError("Вопрос уже %s в повестке" % ("первый" if p["dir"] == "up" else "последний"))
+    else:
+        raise RpcError("Укажите новую позицию (to) или направление (dir: up|down)")
+    if to == i: raise RpcError("Порядок вопросов не изменился")
+    items.pop(i); items.insert(to, a)
+    for k, x in enumerate(items): x["n"] = k + 1
+    _agenda_hist(a, u["id"], "move", **{"from": old_n[a["id"]], "to": a["n"]})
+    _agenda_sync_links(db, cur, m, old_n)
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Изменён порядок вопросов повестки",
+             "Совещание", m["id"], {"code": m["code"], "itemId": a["id"], "from": old_n[a["id"]], "to": a["n"],
+                                    "orderWas": order_was, "order": [x["n"] for x in items],
+                                    "titles": [x["title"] for x in items], "event": "MEETING_AGENDA_REORDERED"})
+    return m, msg("Порядок изменён", "Вопрос «%s»: №%s → №%s" % (a["title"], old_n[a["id"]], a["n"]))
+
+@reg("meeting.agenda.remove")
+def h_meeting_agenda_remove(db, cur, u, p):
+    """Удаление вопроса из повестки: вопрос с решениями снимается с рассмотрения, а не удаляется."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    items, a = agenda_find(m, p)
+    if _agenda_decisions(m, a):
+        raise RpcError("По вопросу зарегистрированы решения — снимите его с рассмотрения вместо удаления")
+    old_n = {x["id"]: x["n"] for x in items}
+    items.remove(a)
+    for k, x in enumerate(items): x["n"] = k + 1
+    _agenda_sync_links(db, cur, m, old_n)
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "AUDIT", "warning", u["id"], "meetings", "Вопрос удалён из повестки", "Совещание", m["id"],
+             {"code": m["code"], "n": a["n"], "itemId": a["id"], "title": a["title"],
+              "event": "MEETING_AGENDA_REMOVED"})
+    return m, msg("Вопрос удалён", "Осталось вопросов: %d" % len(items))
+
+@reg("meeting.agenda.status")
+def h_meeting_agenda_status(db, cur, u, p):
+    """Статус рассмотрения вопроса (§2.6, MTG-06 9.3): шесть статусов с правилами переходов."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    items, a = agenda_find(m, p)
+    req(p, "status")
+    st = p["status"]
+    if st not in AGENDA_ST:
+        raise RpcError("Неизвестный статус рассмотрения: %s (допустимо: %s)" % (st, ", ".join(AGENDA_ST)))
+    if st == a["status"]: raise RpcError("Вопрос уже в статусе «%s»" % st)
+    if st == "Перенесён":
+        raise RpcError("Перенос выполняется операцией «Перенести нерассмотренные» (meeting.agenda.carryOver)")
+    if st not in AGENDA_TRANS.get(a["status"], ()):
+        raise RpcError("Переход «%s» → «%s» недопустим" % (a["status"], st))
+    if st in ("Рассматривается", "Рассмотрен") and m["date"] > D(0):
+        raise RpcError("Рассмотрение вопроса отмечается не раньше даты совещания (%s)" % _fd(m["date"]))
+    if "fact" in p: a["fact"] = str(p["fact"] or "").strip()[:2000]
+    if st == "Рассмотрен":
+        fact = (a.get("fact") or "").strip()
+        decs = _agenda_decisions(m, a)
+        if len(fact) < 3:
+            if decs: fact = "Рассмотрен: зарегистрировано решений — %d" % len(decs)
+            else: raise RpcError("Зафиксируйте фактический результат рассмотрения (не менее 3 символов)")
+        a["fact"] = fact[:2000]
+    reason = str(p.get("reason") or "").strip()[:500]
+    if st == "Снят с рассмотрения":
+        if len(reason) < 3:
+            raise RpcError("Укажите основание снятия вопроса с рассмотрения (не менее 3 символов)")
+        a["comment"] = (("Снят с рассмотрения: " + reason) if not a.get("comment")
+                        else (a["comment"] + " · Снят: " + reason))[:1000]
+    if p.get("comment"): a["comment"] = str(p["comment"]).strip()[:1000]
+    was = a["status"]
+    a["status"] = st; a["statusAt"] = now_ms(); a["statusBy"] = u["id"]
+    _agenda_hist(a, u["id"], "status", **{"from": was, "to": st, "reason": reason})
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Статус рассмотрения вопроса изменён",
+             "Совещание", m["id"], {"code": m["code"], "n": a["n"], "itemId": a["id"], "from": was, "to": st,
+                                    "reason": reason, "event": "MEETING_AGENDA_STATUS"})
+    return m, msg("Статус вопроса: %s" % st, "Вопрос №%s · %s" % (a["n"], a["title"]))
+
+@reg("meeting.agenda.materials.add")
+def h_meeting_agenda_mat_add(db, cur, u, p):
+    """Материалы вопроса (§2.6, MTG-07): документ M09 с фиксацией версии либо ссылка ЛВС."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    items, a = agenda_find(m, p)
+    mats = a["materials"]
+    if len(mats) >= AGENDA_MAT_MAX: raise RpcError("Материалов к вопросу — не более %d" % AGENDA_MAT_MAX)
+    note = (p.get("note") or "").strip()[:300]
+    if p.get("docId"):
+        d = get_req(db, cur, "doc", p["docId"])
+        if any(x.get("docId") == d["id"] for x in mats):
+            raise RpcError("Этот документ уже прикреплён к вопросу")
+        ver = max([v["v"] for v in (d.get("versions") or [])], default=1)
+        item = {"id": uid("am"), "kind": "doc", "docId": d["id"], "docV": ver,
+                "name": "%s · %s" % (d["code"], d["title"]), "url": "", "note": note,
+                "addedAt": now_ms(), "addedBy": u["id"]}
+    else:
+        req(p, "name", "url")
+        url = p["url"].strip()[:500]
+        if re.match(r"^\s*(javascript|data|vbscript):", url, re.I): raise RpcError("Недопустимая схема ссылки")
+        if any(x.get("url") == url for x in mats): raise RpcError("Эта ссылка уже прикреплена к вопросу")
+        item = {"id": uid("am"), "kind": "link", "docId": None, "docV": None,
+                "name": p["name"].strip()[:200], "url": url, "note": note,
+                "addedAt": now_ms(), "addedBy": u["id"]}
+    mats.append(item)
+    _agenda_hist(a, u["id"], "mat+", note=item["name"])
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Прикреплён материал к вопросу повестки",
+             "Совещание", m["id"], {"code": m["code"], "n": a["n"], "itemId": a["id"], "material": item["name"],
+                                    "kind": item["kind"], "docV": item["docV"],
+                                    "event": "MEETING_AGENDA_MATERIAL_ADDED"})
+    return m, msg("Материал прикреплён", "Вопрос №%s · материалов: %d%s"
+                  % (a["n"], len(mats), " · версия документа %s" % item["docV"] if item["docV"] else ""))
+
+@reg("meeting.agenda.materials.remove")
+def h_meeting_agenda_mat_del(db, cur, u, p):
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    items, a = agenda_find(m, p)
+    req(p, "materialId")
+    keep = [x for x in a["materials"] if x.get("id") != p["materialId"]]
+    if len(keep) == len(a["materials"]): raise RpcError("Материал не найден в списке вопроса")
+    a["materials"] = keep
+    _agenda_hist(a, u["id"], "mat-", note=str(p["materialId"]))
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Материал откреплён от вопроса повестки",
+             "Совещание", m["id"], {"code": m["code"], "n": a["n"], "materialId": p["materialId"],
+                                    "event": "MEETING_AGENDA_MATERIAL_REMOVED"})
+    return m, msg("Материал откреплён", "Вопрос №%s · материалов: %d" % (a["n"], len(keep)))
+
+def _agenda_next_meeting(db, cur, m):
+    """Ближайшее запланированное совещание после исходного; приоритет — та же регулярная серия."""
+    sid = (m.get("recurrence") or {}).get("seriesId") or ""
+    cards = [x for x in db.all_ent(cur, "meeting", "date")
+             if x["id"] != m["id"] and x.get("status") == "Запланировано" and x.get("date", "") >= m["date"]]
+    same = [x for x in cards if sid and (x.get("recurrence") or {}).get("seriesId") == sid]
+    pool = same or cards
+    return pool[0] if pool else None
+
+@reg("meeting.agenda.carryOver")
+def h_meeting_agenda_carry(db, cur, u, p):
+    """Перенос нерассмотренных вопросов на следующее совещание (§2.6)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    if m["status"] == MEET_CANCELLED:
+        raise RpcError("Из отменённого совещания вопросы не переносятся — сначала возобновите его")
+    items = agenda_norm(m)
+    reason = str(p.get("reason") or "").strip()[:500]
+    if len(reason) < 3: raise RpcError("Укажите основание переноса вопросов (не менее 3 символов)")
+    sel_ids = p.get("itemIds") or []
+    sel_ns = p.get("ns") or []
+    if sel_ids or sel_ns:
+        picked = []
+        for aid in sel_ids:
+            a = next((x for x in items if x["id"] == aid), None)
+            if not a: raise RpcError("Вопрос повестки не найден: %s" % aid, "Повестка", 404, "NOT_FOUND")
+            picked.append(a)
+        for n in sel_ns:
+            _items, a = agenda_find(m, {"n": n})
+            if a not in picked: picked.append(a)
+        for a in picked:
+            if a["status"] not in AGENDA_OPEN:
+                raise RpcError("Вопрос №%s уже «%s» — переносится только нерассмотренный вопрос" % (a["n"], a["status"]))
+    else:
+        picked = [a for a in items if a["status"] in AGENDA_OPEN]
+    if not picked: raise RpcError("Нерассмотренных вопросов нет — переносить нечего")
+    created = None
+    if p.get("targetId"):
+        target = get_req(db, cur, "meeting", p["targetId"])
+        if target["id"] == m["id"]: raise RpcError("Нельзя перенести вопросы в то же совещание")
+        if target["status"] != "Запланировано":
+            raise RpcError("Перенос возможен только в запланированное совещание (получатель: %s)" % target["status"])
+        if target["date"] < m["date"]:
+            raise RpcError("Совещание-получатель раньше исходного (%s)" % _fd(m["date"]))
+    elif p.get("newDate"):
+        check_date(p["newDate"])
+        if p["newDate"] < m["date"]: raise RpcError("Дата нового совещания раньше исходного (%s)" % _fd(m["date"]))
+        created, _m = h_meeting_create(db, cur, u, {
+            "title": (p.get("newTitle") or ("%s · перенесённые вопросы" % m["title"]))[:300],
+            "type": m["type"], "date": p["newDate"], "time": p.get("newTime") or m["time"],
+            "chair": m["chair"], "secretary": m["secretary"], "attendees": m.get("attendees") or [],
+            "projects": mprojects_of(m)})
+        target = created
+    else:
+        target = _agenda_next_meeting(db, cur, m)
+        if not target:
+            raise RpcError("Следующего запланированного совещания нет — укажите получателя (targetId) "
+                           "или дату нового совещания (newDate)")
+    t_items = agenda_norm(target)
+    if len(t_items) + len(picked) > AGENDA_ITEMS_MAX:
+        raise RpcError("В повестке получателя не хватит места: не более %d вопросов" % AGENDA_ITEMS_MAX)
+    moved = []
+    for a in picked:
+        copy = json.loads(json.dumps(a))
+        copy["id"] = uid("aq"); copy["n"] = len(t_items) + 1
+        copy["status"] = "Включён в повестку"; copy["fact"] = ""
+        copy["statusAt"] = now_ms(); copy["statusBy"] = u["id"]
+        copy["carryFrom"] = {"meetingId": m["id"], "code": m["code"], "n": a["n"], "date": m["date"],
+                             "ts": now_ms(), "by": u["id"], "reason": reason}
+        copy["carryTo"] = None
+        copy["history"] = [{"ts": now_ms(), "by": u["id"], "action": "carryIn",
+                            "note": "Перенесён из %s (вопрос №%s): %s" % (m["code"], a["n"], reason)}]
+        t_items.append(copy)
+        a["status"] = "Перенесён"; a["statusAt"] = now_ms(); a["statusBy"] = u["id"]
+        a["carryTo"] = {"meetingId": target["id"], "code": target["code"], "n": copy["n"],
+                        "date": target["date"], "ts": now_ms(), "by": u["id"], "reason": reason}
+        _agenda_hist(a, u["id"], "carryOut", note="Перенесён в %s, вопрос №%s" % (target["code"], copy["n"]),
+                     reason=reason)
+        moved.append({"from": a["n"], "to": copy["n"], "itemId": copy["id"], "title": a["title"]})
+    db.save_ent(cur, "meeting", m)
+    db.save_ent(cur, "meeting", target)
+    db.audit(cur, "BUSINESS", "warning", u["id"], "meetings", "Нерассмотренные вопросы перенесены",
+             "Совещание", m["id"], {"code": m["code"], "target": target["code"], "targetId": target["id"],
+                                    "count": len(moved), "items": moved, "reason": reason,
+                                    "created": bool(created), "event": "MEETING_AGENDA_CARRIED_OVER"})
+    invite = list(dict.fromkeys([target["chair"], target["secretary"]] + (target.get("attendees") or [])))
+    notify_many(db, cur, [x for x in invite if x != u["id"]], "meeting.agenda",
+                "Перенесены вопросы повестки: %s" % target["title"],
+                "%s · из %s перенесено вопросов: %d · %s" % (target["code"], m["code"], len(moved), reason),
+                "Совещание", target["id"], dedupe_suffix="carry:%s:%d" % (m["id"], now_ms()))
+    return {"moved": len(moved), "items": moved, "source": m, "target": target,
+            "targetId": target["id"], "targetCode": target["code"], "created": bool(created)}, \
+        msg("Вопросы перенесены", "%d вопр. → %s (%s)%s"
+            % (len(moved), target["code"], _fd(target["date"]), " · совещание создано" if created else ""))
+
+@reg("meeting.agenda.list")
+def h_meeting_agenda_list(db, cur, u, p):
+    """Повестка с итогами: плановое время, состав статусов, нерассмотренные вопросы."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "view", m)
+    items = agenda_norm(m)
+    db.save_ent(cur, "meeting", m)
+    counts = {s: sum(1 for a in items if a["status"] == s) for s in AGENDA_ST}
+    return {"meetingId": m["id"], "code": m["code"], "items": items, "totalMin": agenda_total_min(m),
+            "counts": counts, "open": [a["n"] for a in items if a["status"] in AGENDA_OPEN],
+            "nextMeeting": (lambda t: {"id": t["id"], "code": t["code"], "date": t["date"]} if t else None)(
+                _agenda_next_meeting(db, cur, m))}, None
+
 
 DIRECTIVE_PRIORITIES = ("Критический", "Высокий", "Средний", "Низкий")
 
@@ -3461,15 +3885,48 @@ def meeting_protocol_doc(db, cur, u, m):
     d.h1("3. Повестка дня")
     ag = m.get("agenda") or []
     if ag:
-        d.table(["№", "Вопрос", "Докладчик"],
-                [[a.get("n", i + 1), a.get("title", ""), _uname(db, cur, a.get("reporter"))] for i, a in enumerate(ag)],
-                widths=[0.5, 4, 1.6])
+        d.table(["№", "Вопрос", "Докладчик", "Ответственный за подготовку", "План, мин", "Статус"],
+                [[a.get("n", i + 1), a.get("title", ""), _uname(db, cur, a.get("reporter")),
+                  _uname(db, cur, a.get("prep")) if a.get("prep") else "—",
+                  a.get("durationMin") or "—", a.get("status") or "Включён в повестку"]
+                 for i, a in enumerate(ag)],
+                widths=[0.4, 2.6, 1.3, 1.5, 0.7, 1.2])
+        d.p("Планируемая продолжительность рассмотрения: %d мин." % agenda_total_min(m))
     else: d.p("Вопросы повестки не зарегистрированы.")
     d.h1("4. Рассмотрение вопросов")
     if ag:
         for a in ag:
             d.h2("Вопрос %s. %s" % (a.get("n", ""), a.get("title", "")))
-            d.p("Докладчик: %s." % _uname(db, cur, a.get("reporter")))
+            d.p("Докладчик: %s.%s" % (_uname(db, cur, a.get("reporter")),
+                (" Ответственный за подготовку: %s." % _uname(db, cur, a.get("prep"))) if a.get("prep") else ""))
+            if a.get("content"): d.p("Содержание: %s" % a["content"])
+            links = []
+            if a.get("projectId"):
+                links.append("проект %s" % ((db.get_ent(cur, "project", a["projectId"]) or {}).get("code") or a["projectId"]))
+            if a.get("stageId"):
+                links.append("этап %s" % ((db.get_ent(cur, "task", a["stageId"]) or {}).get("code") or a["stageId"]))
+            if a.get("taskIds"):
+                links.append("задачи: " + ", ".join((db.get_ent(cur, "task", t) or {}).get("code", t) for t in a["taskIds"]))
+            if a.get("riskId"):
+                links.append("риск %s" % ((db.get_ent(cur, "risk", a["riskId"]) or {}).get("code") or a["riskId"]))
+            if links: d.p("Связи: " + "; ".join(links) + ".")
+            if a.get("materials"):
+                d.table(["Материал", "Вид", "Примечание"],
+                        [[x.get("name", ""), ("документ M09, версия %s" % x["docV"]) if x.get("kind") == "doc"
+                          else ("ссылка: %s" % x.get("url", "")), x.get("note") or "—"] for x in a["materials"]],
+                        widths=[3.0, 2.4, 1.6])
+            if a.get("expected"): d.p("Ожидаемый результат: %s" % a["expected"])
+            d.p("Статус рассмотрения: %s." % (a.get("status") or "Включён в повестку"))
+            if a.get("fact"): d.p("Фактический результат: %s" % a["fact"])
+            if a.get("carryTo"):
+                d.p("Вопрос перенесён на совещание %s (%s), вопрос №%s. Основание: %s"
+                    % (a["carryTo"].get("code", ""), _fd(a["carryTo"].get("date")),
+                       a["carryTo"].get("n", ""), a["carryTo"].get("reason", "")))
+            if a.get("carryFrom"):
+                d.p("Вопрос перенесён с совещания %s (%s), вопрос №%s. Основание: %s"
+                    % (a["carryFrom"].get("code", ""), _fd(a["carryFrom"].get("date")),
+                       a["carryFrom"].get("n", ""), a["carryFrom"].get("reason", "")))
+            if a.get("comment"): d.p("Комментарий: %s" % a["comment"])
             d.p(a.get("discussion") or "Обсуждение зафиксировано в решениях по вопросу.")
     else:
         d.p("Материалы обсуждения не зарегистрированы.")
@@ -3821,6 +4278,7 @@ NOTIF_TYPES = {
     "meeting.moved":      ("Перенос совещания", "meetings"),
     "meeting.cancelled":  ("Отмена совещания", "meetings"),
     "meeting.materials":  ("Материалы к совещанию", "meetings"),
+    "meeting.agenda":     ("Перенос вопросов повестки", "meetings"),
     "protocol.review":    ("Протокол направлен на согласование", "meetings"),
     "protocol.approved":  ("Протокол утверждён", "meetings"),
     "protocol.rework":    ("Протокол возвращён на доработку", "meetings"),

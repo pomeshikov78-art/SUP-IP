@@ -2910,7 +2910,15 @@ function meetMinutes(m){
  (matsOf(m).length?rptTable(['Материал','Вид','Примечание'],matsOf(m).map(x=>[x.name,x.kind==='doc'?'Документ M09':'Ссылка: '+x.url,x.note||'—'])):'<p>Предварительные материалы не прикреплены.</p>')+
  (recOf(m).freq!=='none'?'<p>Регулярное совещание: '+esc(recText(recOf(m)))+(recOf(m).seriesId?' · карточка серии №'+recOf(m).seriesN:'')+'</p>':'')+
  (plogOf(m).length?'<h2>Планирование: переносы, отмены, изменения</h2>'+rptTable(['Дата и время','Кто','Действие','Основание'],plogOf(m).map(x=>[fmtDT(x.ts),U(x.by).name,PLAN_ACT[x.action]||x.action,(x.reason||x.note||'—')+(x.from&&x.to?(' ('+fmtD(x.from.date)+' '+x.from.time+' → '+fmtD(x.to.date)+' '+x.to.time+')'):'')])):'')+
- '<h2>Повестка дня</h2>'+(m.agenda.length?rptTable(['№','Вопрос','Докладчик'],m.agenda.map(a=>[a.n,a.title,U(a.reporter).name])):'<p>Повестка не сформирована.</p>')+
+ '<h2>Повестка дня</h2>'+(agOf(m).length?rptTable(['№','Вопрос','Докладчик','Подготовка','План, мин','Статус','Ожидаемый результат'],agOf(m).map(a=>[a.n,a.title,U(a.reporter).name,a.prep?U(a.prep).name:'—',a.durationMin||'—',a.status||'Включён в повестку',a.expected||'—']))+'<p>Планируемая продолжительность рассмотрения: '+agTotalMin(m)+' мин.</p>':'<p>Повестка не сформирована.</p>')+
+ (agOf(m).length?'<h2>Рассмотрение вопросов</h2>'+agOf(m).map(a=>'<p><b>Вопрос '+a.n+'. '+esc(a.title)+'</b><br>Докладчик: '+esc(U(a.reporter).name)+(a.prep?'. Ответственный за подготовку: '+esc(U(a.prep).name):'')+
+   (a.content?'<br>Содержание: '+esc(a.content):'')+
+   (agMats(a).length?'<br>Материалы: '+agMats(a).map(x=>esc(x.name)+(x.kind==='doc'?(' (версия '+x.docV+')'):'')).join('; '):'')+
+   '<br>Статус рассмотрения: '+esc(a.status||'Включён в повестку')+
+   (a.fact?'<br>Фактический результат: '+esc(a.fact):'')+
+   (a.carryTo?'<br>Перенесён на совещание '+esc(a.carryTo.code)+' ('+fmtD(a.carryTo.date)+'), вопрос №'+a.carryTo.n+'. Основание: '+esc(a.carryTo.reason||''):'')+
+   (a.carryFrom?'<br>Перенесён с совещания '+esc(a.carryFrom.code)+' ('+fmtD(a.carryFrom.date)+'), вопрос №'+a.carryFrom.n+'. Основание: '+esc(a.carryFrom.reason||''):'')+
+   (a.comment?'<br>Комментарий: '+esc(a.comment):'')+'</p>').join(''):'')+
  '<h2>Принятые решения</h2>'+(m.decisions.length?rptTable(['№','Решение','Ответственный','Срок','Пункт повестки','Поручения'],m.decisions.map((d,i)=>[i+1,d.text,U(d.resp).name,fmtD(d.due),d.agendaN?'№'+d.agendaN:'—',decTasks(d).map(t=>t.code).join(', ')||'не создано'])):'<p>Решения не зарегистрированы.</p>')+
  '<h2>Контроль исполнения</h2>'+(dirs.length?rptTable(['Поручение','Исполнитель','Соисполнители','Срок','Статус','Выполнение, %','Просрочка','Критерии завершения'],dirs.map(t=>{const dr=dirOf(t);return [t.code+' · '+t.title,U(t.assignee).name,dr.coassignees.map(u=>U(u).name).join(', ')||'—',fmtD(t.end),t.status,DONE_ST.includes(t.status)?100:t.progress,taskOverdue(t)?overDays(t)+' дн':'—',dr.criteria||'—'];})):'<p>Поручения не создавались.</p>')+
  '<h2>Согласование и утверждение</h2>'+rptTable(['Показатель','Значение'],[
@@ -3486,6 +3494,297 @@ function meetStatusBadge(s){
  return badge(s, s==='Запланировано'?'#2563eb':s==='Проведено'?'#d97706':s===MEET_CANC?'#dc2626':'#16a34a',
   s==='Запланировано'?'#dbeafe':s==='Проведено'?'#fef3c7':s===MEET_CANC?'#fee2e2':'#dcfce7');
 }
+/* ---------- MTG-06. Повестка совещания (ТЗ §2.6, экранные требования 9.1–9.4) ---------- */
+const AGENDA_ST=['Подготовлен','Включён в повестку','Рассматривается','Рассмотрен','Перенесён','Снят с рассмотрения'];
+const AGENDA_OPEN=['Подготовлен','Включён в повестку','Рассматривается'];
+const AGENDA_TRANS={'Подготовлен':['Включён в повестку','Снят с рассмотрения'],
+ 'Включён в повестку':['Подготовлен','Рассматривается','Рассмотрен','Снят с рассмотрения'],
+ 'Рассматривается':['Включён в повестку','Рассмотрен','Снят с рассмотрения'],
+ 'Рассмотрен':['Рассматривается'],'Перенесён':[],'Снят с рассмотрения':['Подготовлен','Включён в повестку']};
+const AGENDA_STC={'Подготовлен':{c:'#64748b',bg:'#f1f5f9'},'Включён в повестку':{c:'#2563eb',bg:'#dbeafe'},
+ 'Рассматривается':{c:'#d97706',bg:'#fef3c7'},'Рассмотрен':{c:'#16a34a',bg:'#dcfce7'},
+ 'Перенесён':{c:'#7c3aed',bg:'#ede9fe'},'Снят с рассмотрения':{c:'#dc2626',bg:'#fee2e2'}};
+const AG_ACT={add:'Добавлен',edit:'Изменён',move:'Изменён порядок',status:'Статус рассмотрения',
+ 'mat+':'Прикреплён материал','mat-':'Откреплён материал',
+ carryOut:'Перенесён на другое совещание',carryIn:'Перенесён с другого совещания'};
+function agOf(m){ return (Array.isArray(m&&m.agenda)?m.agenda:[]).slice().sort((a,b)=>(a.n||0)-(b.n||0)); }
+function agItem(m,key){ return agOf(m).find(a=>a.id===key||String(a.n)===String(key)); }
+function agBadge(s){ const x=AGENDA_STC[s]||{c:'#64748b',bg:'#f1f5f9'}; return badge(s,x.c,x.bg); }
+function agMats(a){ return Array.isArray(a&&a.materials)?a.materials:[]; }
+function agTasks(a){ return Array.isArray(a&&a.taskIds)?a.taskIds:[]; }
+function agHist(a){ return Array.isArray(a&&a.history)?a.history:[]; }
+function agTotalMin(m){ return agOf(m).reduce((s,a)=>s+(parseInt(a.durationMin)||0),0); }
+function agOpenItems(m){ return agOf(m).filter(a=>AGENDA_OPEN.includes(a.status||'Включён в повестку')); }
+function agDurText(min){ min=parseInt(min)||0; if(!min)return '—'; const h=Math.floor(min/60), r=min%60; return min+' мин'+(h?(' ('+h+' ч'+(r?' '+r+' мин':'')+')'):''); }
+function agDecsOf(m,a){ return (m.decisions||[]).filter(d=>d.agendaId===a.id||(!d.agendaId&&d.agendaN===a.n)); }
+function agNextOf(m){
+ const sid=recOf(m).seriesId;
+ const cards=DB.meetings.filter(x=>x.id!==m.id&&x.status==='Запланировано'&&x.date>=m.date).sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:0);
+ const same=sid?cards.filter(x=>recOf(x).seriesId===sid):[];
+ return (same.length?same:cards)[0]||null;
+}
+function agHistAll(m){
+ const rows=[];
+ agOf(m).forEach(a=>agHist(a).forEach(h=>rows.push(Object.assign({n:a.n,title:a.title,itemId:a.id},h))));
+ return rows.sort((a,b)=>b.ts-a.ts);
+}
+function agHistText(h){
+ if(h.action==='move')return '№'+h.from+' → №'+h.to;
+ if(h.action==='status')return esc(h.from||'')+' → '+esc(h.to||'')+(h.reason?(' · '+esc(h.reason)):'');
+ return esc(h.note||'')+(h.reason&&h.action!=='status'?(' · '+esc(h.reason)):'');
+}
+function meetAgendaBlock(m){
+ const mid=m.id, items=agOf(m), editable=can('meetings','edit',m)&&m.status!==MEET_CANC;
+ const open=agOpenItems(m), total=agTotalMin(m), nxt=agNextOf(m);
+ const matN=items.reduce((s,a)=>s+agMats(a).length,0);
+ let h='<div class="card" id="meet-agenda"><div class="ch">'+ic('meeting')+'Повестка дня<span class="r small mut">ТЗ §2.6 · MTG-06</span></div><div class="cb">'+
+  '<div class="stat-line"><span>Вопросов</span><b id="ma-n">'+items.length+'</b></div>'+
+  '<div class="stat-line"><span>Плановое время</span><b id="ma-min">'+agDurText(total)+'</b></div>'+
+  '<div class="stat-line"><span>Нерассмотренных</span><b id="ma-open">'+open.length+'</b></div>'+
+  '<div class="stat-line"><span>Материалов к вопросам</span><b id="ma-mat">'+matN+'</b></div>'+
+  '<div class="stat-line"><span>Следующее совещание</span><b id="ma-next">'+(nxt?(esc(nxt.code)+' · '+fmtD(nxt.date)):'—')+'</b></div>'+
+  (editable?'<div class="flexw mt8"><span class="spacer"></span>'+
+   '<button class="btn sm pri" id="ma-add" onclick="App.agendaAdd(\''+mid+'\')">'+ic('plus')+' Вопрос</button>'+
+   (open.length?'<button class="btn sm" id="ma-carry" onclick="App.agendaCarry(\''+mid+'\')">'+ic('send')+' Перенести нерассмотренные ('+open.length+')</button>':'')+
+  '</div>':'')+
+ '</div></div>';
+ h+='<div class="card mt8"><div class="cb">'+
+  (items.length?'<div class="tbl-wrap" id="ma-table"><table class="tbl"><thead><tr><th>№</th><th>Вопрос</th><th>Докладчик</th><th>Подготовка</th><th>План</th><th>Статус</th><th>Материалы</th><th>Действия</th></tr></thead><tbody>'+
+   items.map(a=>{
+    const p=a.projectId?P(a.projectId):null, mats=agMats(a), decs=agDecsOf(m,a);
+    return '<tr id="ma-row-'+a.id+'"><td class="num b">'+a.n+'</td>'+
+     '<td><b class="small">'+esc(a.title)+'</b>'+
+      (a.expected?'<div class="small mut">ожидаемый результат: '+esc(a.expected)+'</div>':'')+
+      (p?'<div class="small mut">'+esc(p.code)+(agTasks(a).length?(' · задач: '+agTasks(a).length):'')+'</div>':'')+
+      (a.carryFrom?'<div class="small mut">перенесён из '+esc(a.carryFrom.code)+' (вопрос №'+a.carryFrom.n+')</div>':'')+
+      (a.carryTo?'<div class="small mut">перенесён в '+esc(a.carryTo.code)+' (вопрос №'+a.carryTo.n+')</div>':'')+
+      (decs.length?'<div class="small mut">решений: '+decs.length+'</div>':'')+
+     '</td>'+
+     '<td class="small">'+esc(U(a.reporter).name)+'</td>'+
+     '<td class="small">'+(a.prep?esc(U(a.prep).name):'—')+'</td>'+
+     '<td class="small nowrap">'+(a.durationMin?a.durationMin+' мин':'—')+'</td>'+
+     '<td>'+agBadge(a.status||'Включён в повестку')+'</td>'+
+     '<td class="num small">'+(mats.length||'—')+'</td>'+
+     '<td><div class="flexw">'+
+      '<button class="btn sm ma-view" title="Карточка вопроса" onclick="App.agendaView(\''+mid+'\',\''+a.id+'\')">'+ic('eye')+'</button>'+
+      (editable&&a.status!=='Перенесён'?'<button class="btn sm ma-edit" title="Изменить вопрос" onclick="App.agendaModal(\''+mid+'\',\''+a.id+'\')">'+ic('edit')+'</button>':'')+
+      (editable&&a.n>1?'<button class="btn sm ma-up" title="Поднять в повестке" onclick="App.agendaMove(\''+mid+'\',\''+a.id+'\',\'up\')">'+ic('up')+'</button>':'')+
+      (editable&&a.n<items.length?'<button class="btn sm ma-down" title="Опустить в повестке" onclick="App.agendaMove(\''+mid+'\',\''+a.id+'\',\'down\')">'+ic('down')+'</button>':'')+
+      (editable?'<button class="btn sm ma-pos" title="Переместить на позицию" onclick="App.agendaPos(\''+mid+'\',\''+a.id+'\')">'+ic('layout')+'</button>':'')+
+      (editable?'<button class="btn sm ma-st" title="Статус рассмотрения" onclick="App.agendaStatus(\''+mid+'\',\''+a.id+'\')">'+ic('check')+'</button>':'')+
+      (editable?'<button class="btn sm ma-mat" title="Материалы вопроса" onclick="App.agendaMat(\''+mid+'\',\''+a.id+'\')">'+ic('file')+'</button>':'')+
+      (editable?'<button class="btn sm ma-dec" title="Зарегистрировать решение" onclick="App.decisionAdd(\''+mid+'\','+a.n+')">'+ic('tasks')+'</button>':'')+
+      (editable?'<button class="btn sm danger ma-del" title="Удалить из повестки" onclick="App.agendaDel(\''+mid+'\',\''+a.id+'\')">'+ic('trash')+'</button>':'')+
+     '</div></td></tr>';
+   }).join('')+
+   '</tbody></table></div>':emptyBlock('Повестка не сформирована','Добавьте вопросы к рассмотрению (ТЗ §2.6)','meeting'))+
+ '</div></div>';
+ const hist=agHistAll(m);
+ h+='<div class="card mt8" id="meet-agenda-hist"><div class="ch">'+ic('journal')+'История повестки<span class="r small mut">порядок вопросов сохраняется в истории</span></div><div class="cb">'+
+  (hist.length?'<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Когда</th><th>Кто</th><th>Вопрос</th><th>Действие</th><th>Подробности</th></tr></thead><tbody>'+
+   hist.slice(0,60).map(x=>'<tr><td class="nowrap small">'+fmtDT(x.ts)+'</td><td class="small">'+esc(U(x.by).name)+'</td><td class="small">№'+x.n+' · '+esc(x.title)+'</td><td class="small">'+esc(AG_ACT[x.action]||x.action)+'</td><td class="small">'+agHistText(x)+'</td></tr>').join('')+
+   '</tbody></table></div>':emptyBlock('Изменений повестки не было','Добавление, изменение порядка и статусы вопросов фиксируются здесь','journal'))+
+ '</div></div>';
+ return h;
+}
+function agLinksHtml(pid,stageId,taskIds){
+ const tasks=DB.tasks.filter(t=>t.projectId===pid);
+ const stages=tasks.filter(t=>!t.parent);
+ return field('Этап проекта',sel('ag-stage',[['','не указан'],...stages.map(t=>[t.id,t.code+' · '+t.title])],stageId||''))+
+  field('Связанные задачи',tasks.length?'<div class="flexw" style="border:1.5px solid var(--line2);border-radius:8px;padding:9px 11px;max-height:150px;overflow:auto">'+
+   tasks.map(t=>'<label class="checkline"><input type="checkbox" class="ag-task" value="'+t.id+'" '+((taskIds||[]).includes(t.id)?'checked':'')+' onchange="App.markDirty()">'+t.code+' · '+esc(t.title)+'</label>').join('')+
+   '</div>':'<div class="small mut">Выберите проект — задачи появятся здесь.</div>');
+}
+App.agendaAdd=function(mid){ App.agendaModal(mid,''); };
+App.agendaModal=function(mid,itemId){
+ const m=MEET(mid); if(!guard('meetings','edit',m))return;
+ const a=itemId?agItem(m,itemId):null;
+ if(itemId&&!a){toast('warn','Вопрос не найден','Обновите карточку совещания');return;}
+ const x=a||{title:'',content:'',reporter:App.user.id,prep:'',durationMin:15,projectId:'',stageId:'',taskIds:[],riskId:'',expected:'',comment:'',status:'Включён в повестку'};
+ openModal(mh(a?('Вопрос №'+a.n+' · изменение'):'Новый вопрос повестки','meeting')+'<div class="mb form">'+
+  '<div class="small mut mb8">Состав вопроса по ТЗ §2.6 и MTG-06 9.2: наименование, содержание, докладчик, ответственный за подготовку, связи с проектом, этапом, задачами и риском, материалы, продолжительность, ожидаемый результат.</div>'+
+  field('Наименование вопроса',inp('ag-title',x.title),true)+
+  field('Содержание вопроса',ta('ag-content',x.content,3))+
+  '<div class="row">'+field('Докладчик',sel('ag-rep',DB.users.map(u=>[u.id,u.name]),x.reporter||App.user.id),true)+
+   field('Ответственный за подготовку',sel('ag-prep',[['','не назначен'],...DB.users.map(u=>[u.id,u.name])],x.prep||''))+'</div>'+
+  '<div class="row">'+field('Планируемая продолжительность, мин',inp('ag-dur',x.durationMin||0,'number','min="0" max="480"'))+
+   field('Связанный проект',sel('ag-prj',[['','не связан'],...DB.projects.map(p=>[p.id,p.code+' · '+p.name])],x.projectId||'','onchange="App.agendaPrj()"'))+'</div>'+
+  '<div id="ag-links">'+agLinksHtml(x.projectId,x.stageId,x.taskIds)+'</div>'+
+  field('Связанный риск',sel('ag-risk',[['','не связан'],...DB.risks.map(r=>[r.id,r.code+' · '+r.title])],x.riskId||''))+
+  field('Ожидаемый результат',ta('ag-expected',x.expected,2))+
+  field('Комментарий',ta('ag-comment',x.comment,2))+
+  (a?'':'<div class="row">'+field('Начальный статус',sel('ag-status',[['Включён в повестку','Включён в повестку'],['Подготовлен','Подготовлен']],x.status))+'</div>')+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="ag-save" onclick="App.agendaSave(\''+mid+'\',\''+(itemId||'')+'\')">'+ic('save')+' '+(a?'Сохранить':'Добавить')+'</button></div>');
+};
+App.agendaPrj=function(){
+ const box=document.getElementById('ag-links');
+ if(box)box.innerHTML=agLinksHtml(val('ag-prj'),'',[]);
+ App.markDirty();
+};
+App.agendaSave=function(mid,itemId){
+ if(!requireFields(['ag-title','ag-rep']))return;
+ const data={id:mid,title:val('ag-title'),content:val('ag-content'),reporter:val('ag-rep'),prep:val('ag-prep'),
+  durationMin:parseInt(val('ag-dur'))||0,projectId:val('ag-prj'),stageId:val('ag-stage'),
+  taskIds:[...document.querySelectorAll('.ag-task:checked')].map(x=>x.value),
+  riskId:val('ag-risk'),expected:val('ag-expected'),comment:val('ag-comment')};
+ if(itemId){ data.itemId=itemId; }
+ else { data.status=val('ag-status')||'Включён в повестку'; }
+ rpc(itemId?'meeting.agenda.update':'meeting.agenda.add',data).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.agendaView=function(mid,itemId){
+ const m=MEET(mid), a=agItem(m,itemId); if(!a)return;
+ const editable=can('meetings','edit',m)&&m.status!==MEET_CANC;
+ const p=a.projectId?P(a.projectId):null, st=a.stageId?T_(a.stageId):null, rk=a.riskId?R_(a.riskId):null;
+ const mats=agMats(a), decs=agDecsOf(m,a), hist=agHist(a);
+ openModal(mh('Вопрос №'+a.n+' · '+m.code,'meeting')+'<div class="mb" id="ag-card">'+
+  '<div class="flexw mb8">'+agBadge(a.status||'Включён в повестку')+'<span class="chip">'+agDurText(a.durationMin)+'</span><span class="chip">'+esc(a.id)+'</span></div>'+
+  '<h4 style="margin:0 0 6px">'+esc(a.title)+'</h4>'+
+  (a.content?'<div class="small mb8">'+esc(a.content)+'</div>':'')+
+  '<div class="stat-line"><span>Докладчик</span><b>'+esc(U(a.reporter).name)+'</b></div>'+
+  '<div class="stat-line"><span>Ответственный за подготовку</span><b>'+(a.prep?esc(U(a.prep).name):'—')+'</b></div>'+
+  '<div class="stat-line"><span>Планируемая продолжительность</span><b>'+agDurText(a.durationMin)+'</b></div>'+
+  '<div class="stat-line"><span>Связанный проект</span><b>'+(p?('<span class="dep-chip" onclick="App.closeModal(true);openProject(\''+p.id+'\')">'+esc(p.code)+'</span>'):'—')+'</b></div>'+
+  '<div class="stat-line"><span>Этап</span><b>'+(st?('<span class="dep-chip" onclick="App.closeModal(true);openTask(\''+st.id+'\')">'+esc(st.code)+'</span>'):'—')+'</b></div>'+
+  '<div class="stat-line"><span>Связанные задачи</span><b>'+(agTasks(a).length?agTasks(a).map(id=>{const t=T_(id);return t?('<span class="dep-chip" onclick="App.closeModal(true);openTask(\''+t.id+'\')">'+esc(t.code)+'</span>'):esc(id);}).join(' '):'—')+'</b></div>'+
+  '<div class="stat-line"><span>Риск</span><b>'+(rk?('<span class="dep-chip" onclick="App.closeModal(true);openRisk(\''+rk.id+'\')">'+esc(rk.code)+'</span>'):'—')+'</b></div>'+
+  '<div class="stat-line"><span>Ожидаемый результат</span><b>'+esc(a.expected||'—')+'</b></div>'+
+  '<div class="stat-line"><span>Фактический результат</span><b id="agc-fact">'+esc(a.fact||'—')+'</b></div>'+
+  '<div class="stat-line"><span>Комментарий</span><b>'+esc(a.comment||'—')+'</b></div>'+
+  '<div class="stat-line"><span>Статус установлен</span><b>'+(a.statusAt?fmtDT(a.statusAt)+' · '+esc(U(a.statusBy).name):'—')+'</b></div>'+
+  (a.carryFrom?'<div class="small mut mt8">Перенесён из '+esc(a.carryFrom.code)+' (вопрос №'+a.carryFrom.n+', '+fmtD(a.carryFrom.date)+') · '+esc(a.carryFrom.reason||'')+'</div>':'')+
+  (a.carryTo?'<div class="small mut mt8">Перенесён в <span class="dep-chip" onclick="App.closeModal(true);openMeeting(\''+a.carryTo.meetingId+'\')">'+esc(a.carryTo.code)+'</span> (вопрос №'+a.carryTo.n+') · '+esc(a.carryTo.reason||'')+'</div>':'')+
+  '<h4 style="margin:14px 0 8px">Материалы вопроса ('+mats.length+')</h4>'+
+  (mats.length?'<div class="list-rows" id="agc-mats">'+mats.map(x=>'<div class="lr" style="cursor:default">'+ic(x.kind==='doc'?'file':'link')+
+    '<div class="lt"><b>'+esc(x.name)+'</b><small>'+(x.kind==='doc'?('документ M09 · версия '+x.docV+(agDocOutdated(x)?' · исходный документ обновлён':'')):('ссылка: '+esc(x.url)))+(x.note?' · '+esc(x.note):'')+' · '+esc(U(x.addedBy).name)+' '+fmtDT(x.addedAt)+'</small></div>'+
+    (x.kind==='doc'&&DOC(x.docId)?'<button class="btn sm" onclick="App.closeModal(true);openDoc(\''+x.docId+'\')">'+ic('eye')+'</button>':'')+
+   '</div>').join('')+'</div>':'<div class="small mut">Материалы не прикреплены.</div>')+
+  '<h4 style="margin:14px 0 8px">Решения по вопросу ('+decs.length+')</h4>'+
+  (decs.length?'<div class="list-rows">'+decs.map((d,i)=>'<div class="lr" style="cursor:default"><span class="chip">№'+(i+1)+'</span><div class="lt"><b>'+esc(d.text)+'</b><small>'+esc(U(d.resp).name)+' · срок '+fmtD(d.due)+'</small></div></div>').join('')+'</div>':'<div class="small mut">Решения не зарегистрированы.</div>')+
+  '<h4 style="margin:14px 0 8px">История вопроса</h4>'+
+  (hist.length?'<div class="tbl-wrap" id="ag-hist"><table class="tbl"><thead><tr><th>Когда</th><th>Кто</th><th>Действие</th><th>Подробности</th></tr></thead><tbody>'+
+   hist.slice().reverse().map(x=>'<tr><td class="nowrap small">'+fmtDT(x.ts)+'</td><td class="small">'+esc(U(x.by).name)+'</td><td class="small">'+esc(AG_ACT[x.action]||x.action)+'</td><td class="small">'+agHistText(x)+'</td></tr>').join('')+
+   '</tbody></table></div>':'<div class="small mut">Изменений не было.</div>')+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Закрыть</button>'+
+  (editable?'<button class="btn" id="agc-mat" onclick="App.agendaMat(\''+mid+'\',\''+a.id+'\')">'+ic('file')+' Материалы</button>':'')+
+  (editable?'<button class="btn" id="agc-st" onclick="App.agendaStatus(\''+mid+'\',\''+a.id+'\')">'+ic('check')+' Статус</button>':'')+
+  (editable?'<button class="btn" id="agc-dec" onclick="App.decisionAdd(\''+mid+'\','+a.n+')">'+ic('tasks')+' Решение</button>':'')+
+  (editable&&a.status!=='Перенесён'?'<button class="btn pri" id="agc-edit" onclick="App.agendaModal(\''+mid+'\',\''+a.id+'\')">'+ic('edit')+' Изменить</button>':'')+
+  '</div>');
+};
+function agDocOutdated(x){
+ const d=x&&x.docId?DOC(x.docId):null; if(!d)return false;
+ const cur=Math.max(...(d.versions||[]).map(v=>v.v||1),1);
+ return cur>(x.docV||1);
+}
+App.agendaMove=function(mid,itemId,dir){
+ const m=MEET(mid); if(!guard('meetings','edit',m))return;
+ rpc('meeting.agenda.move',{id:mid,itemId:itemId,dir:dir}).then(r=>{if(r)openMeeting(mid);});
+};
+App.agendaPos=function(mid,itemId){
+ const m=MEET(mid), a=agItem(m,itemId), items=agOf(m); if(!a)return;
+ openModal(mh('Перемещение вопроса №'+a.n,'layout')+'<div class="mb form">'+
+  '<div class="small mut mb8">Порядок вопросов сохраняется в истории; ссылки решений и поручений пересчитываются на новые номера (ТЗ §2.6).</div>'+
+  field('Новая позиция',sel('agp-to',items.map(x=>[x.n,'№'+x.n+' · '+x.title]),a.n),true)+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="agp-save" onclick="App.agendaPosSave(\''+mid+'\',\''+a.id+'\')">'+ic('save')+' Переместить</button></div>');
+};
+App.agendaPosSave=function(mid,itemId){
+ rpc('meeting.agenda.move',{id:mid,itemId:itemId,to:parseInt(val('agp-to'))||0}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.agendaDel=function(mid,itemId){
+ const m=MEET(mid), a=agItem(m,itemId); if(!a)return;
+ if(!guard('meetings','edit',m))return;
+ if(!confirm('Удалить вопрос №'+a.n+' «'+a.title+'» из повестки?'))return;
+ rpc('meeting.agenda.remove',{id:mid,itemId:itemId}).then(r=>{if(r)openMeeting(mid);});
+};
+App.agendaStatus=function(mid,itemId){
+ const m=MEET(mid), a=agItem(m,itemId); if(!a)return;
+ if(!guard('meetings','edit',m))return;
+ const cur=a.status||'Включён в повестку', next=AGENDA_TRANS[cur]||[];
+ if(!next.length){toast('warn','Переходов нет','Вопрос «'+cur+'» изменяется только в карточке-получателе');return;}
+ openModal(mh('Статус рассмотрения · вопрос №'+a.n,'check')+'<div class="mb form">'+
+  '<div class="flexw mb8">'+agBadge(cur)+'</div>'+
+  '<div class="small mut mb8">Статусы по MTG-06 9.3. Перенос на следующее совещание выполняется операцией «Перенести нерассмотренные».</div>'+
+  field('Новый статус',sel('ags-st',next.map(s=>[s,s]),next[0],'onchange="App.agendaStKind()"'),true)+
+  '<div id="ags-fact-box">'+field('Фактический результат рассмотрения',ta('ags-fact',a.fact||'',3),false,'Обязателен при статусе «Рассмотрен», если по вопросу нет решений')+'</div>'+
+  '<div id="ags-reason-box" style="display:none">'+field('Основание снятия с рассмотрения',ta('ags-reason','',2))+'</div>'+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="ags-save" onclick="App.agendaStatusSave(\''+mid+'\',\''+a.id+'\')">'+ic('save')+' Установить статус</button></div>');
+ App.agendaStKind();
+};
+App.agendaStKind=function(){
+ const st=val('ags-st');
+ const f=document.getElementById('ags-fact-box'), r=document.getElementById('ags-reason-box');
+ if(f)f.style.display=st==='Рассмотрен'?'':'none';
+ if(r)r.style.display=st==='Снят с рассмотрения'?'':'none';
+ App.markDirty();
+};
+App.agendaStatusSave=function(mid,itemId){
+ const st=val('ags-st');
+ if(st==='Снят с рассмотрения'&&!requireFields(['ags-reason']))return;
+ rpc('meeting.agenda.status',{id:mid,itemId:itemId,status:st,fact:val('ags-fact'),reason:val('ags-reason')})
+  .then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.agendaMat=function(mid,itemId){
+ const m=MEET(mid), a=agItem(m,itemId); if(!a)return;
+ const editable=can('meetings','edit',m)&&m.status!==MEET_CANC, mats=agMats(a);
+ openModal(mh('Материалы вопроса №'+a.n,'file')+'<div class="mb form">'+
+  '<div class="small mut mb8">При добавлении документа M09 фиксируется конкретная версия: последующее обновление исходного документа не меняет сформированный комплект (ТЗ §2.6, MTG-07).</div>'+
+  (mats.length?'<div class="list-rows mb8" id="agm-list">'+mats.map(x=>'<div class="lr" style="cursor:default">'+ic(x.kind==='doc'?'file':'link')+
+    '<div class="lt"><b>'+esc(x.name)+'</b><small>'+(x.kind==='doc'?('версия '+x.docV+(agDocOutdated(x)?' · исходный документ обновлён до более новой версии':'')):('ссылка: '+esc(x.url)))+(x.note?' · '+esc(x.note):'')+'</small></div>'+
+    (x.kind==='doc'&&DOC(x.docId)?'<button class="btn sm" onclick="App.closeModal(true);openDoc(\''+x.docId+'\')">'+ic('eye')+'</button>':'')+
+    (editable?'<button class="btn sm danger agm-del" onclick="App.agendaMatDel(\''+mid+'\',\''+a.id+'\',\''+x.id+'\')">'+ic('trash')+'</button>':'')+
+   '</div>').join('')+'</div>':'<div class="small mut mb8">Материалы не прикреплены.</div>')+
+  (editable?'<div id="agm-form">'+field('Вид материала',sel('agm-kind',[['doc','Документ M09'],['link','Ссылка (файл ЛВС, ресурс)']],'doc','onchange="App.agendaMatKind()"'))+
+   '<div id="agm-doc-box">'+field('Документ',sel('agm-doc',DB.docs.map(d=>[d.id,d.code+' · '+d.title]),DB.docs.length?DB.docs[0].id:''),true)+'</div>'+
+   '<div id="agm-link-box" style="display:none">'+field('Наименование',inp('agm-name',''))+field('Ссылка или путь',inp('agm-url','','text','placeholder="\\\\server\\share\\file.pdf или https://…"'))+'</div>'+
+   field('Примечание',inp('agm-note',''))+'</div>':'')+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Закрыть</button>'+
+  (editable?'<button class="btn pri" id="agm-save" onclick="App.agendaMatAdd(\''+mid+'\',\''+a.id+'\')">'+ic('plus')+' Прикрепить</button>':'')+'</div>');
+};
+App.agendaMatKind=function(){
+ const k=val('agm-kind');
+ const a=document.getElementById('agm-doc-box'), b=document.getElementById('agm-link-box');
+ if(a)a.style.display=k==='doc'?'':'none';
+ if(b)b.style.display=k==='link'?'':'none';
+ App.markDirty();
+};
+App.agendaMatAdd=function(mid,itemId){
+ const data={id:mid,itemId:itemId,note:val('agm-note')};
+ if(val('agm-kind')==='doc'){ if(!requireFields(['agm-doc']))return; data.docId=val('agm-doc'); }
+ else { if(!requireFields(['agm-name','agm-url']))return; data.name=val('agm-name'); data.url=val('agm-url'); }
+ rpc('meeting.agenda.materials.add',data).then(r=>{if(r){App.closeModal(true);openMeeting(mid);App.agendaMat(mid,itemId);}});
+};
+App.agendaMatDel=function(mid,itemId,matId){
+ if(!confirm('Открепить материал от вопроса повестки?'))return;
+ rpc('meeting.agenda.materials.remove',{id:mid,itemId:itemId,materialId:matId}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);App.agendaMat(mid,itemId);}});
+};
+App.agendaCarry=function(mid){
+ const m=MEET(mid); if(!guard('meetings','edit',m))return;
+ const open=agOpenItems(m), nxt=agNextOf(m);
+ if(!open.length){toast('warn','Нерассмотренных вопросов нет','Переносить нечего');return;}
+ const targets=DB.meetings.filter(x=>x.id!==mid&&x.status==='Запланировано'&&x.date>=m.date).sort((a,b)=>a.date<b.date?-1:1);
+ openModal(mh('Перенос нерассмотренных вопросов','send')+'<div class="mb form">'+
+  '<div class="small mut mb8">Нерассмотренные вопросы переносятся на следующее совещание с сохранением связей и материалов; в исходной повестке они получают статус «Перенесён» (ТЗ §2.6).</div>'+
+  field('Совещание-получатель',sel('agc-target',[['auto',nxt?('Ближайшее · '+nxt.code+' · '+fmtD(nxt.date)):'Ближайшее запланированное'],['new','Создать новое совещание'],...targets.map(x=>[x.id,x.code+' · '+fmtD(x.date)+' · '+x.title])],'auto','onchange="App.agendaCarryKind()"'),true)+
+  '<div id="agc-new-box" style="display:none"><div class="row">'+field('Дата нового совещания',inp('agc-date',D(7),'date'),true)+field('Время',inp('agc-time',m.time,'time'))+'</div>'+
+   field('Наименование нового совещания',inp('agc-title',m.title+' · перенесённые вопросы'))+'</div>'+
+  field('Вопросы к переносу','<div class="flexw" style="border:1.5px solid var(--line2);border-radius:8px;padding:9px 11px">'+
+   open.map(a=>'<label class="checkline"><input type="checkbox" class="agc-chk" value="'+a.id+'" checked onchange="App.markDirty()">№'+a.n+' · '+esc(a.title)+'</label>').join('')+'</div>')+
+  field('Основание переноса',ta('agc-reason','',2),true)+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="agc-save" onclick="App.agendaCarrySave(\''+mid+'\')">'+ic('send')+' Перенести</button></div>');
+};
+App.agendaCarryKind=function(){
+ const b=document.getElementById('agc-new-box');
+ if(b)b.style.display=val('agc-target')==='new'?'':'none';
+ App.markDirty();
+};
+App.agendaCarrySave=function(mid){
+ if(!requireFields(['agc-reason']))return;
+ const t=val('agc-target');
+ const data={id:mid,reason:val('agc-reason'),itemIds:[...document.querySelectorAll('.agc-chk:checked')].map(x=>x.value)};
+ if(t==='new'){ if(!requireFields(['agc-date']))return; data.newDate=val('agc-date'); data.newTime=val('agc-time'); data.newTitle=val('agc-title'); }
+ else if(t!=='auto'){ data.targetId=t; }
+ rpc('meeting.agenda.carryOver',data).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
 function meetPlanBlock(m){
  const mid=m.id, editable=can('meetings','edit',m), r=recOf(m), mats=matsOf(m), prj=mprjOf(m), log=plogOf(m), ser=meetSeriesOf(m);
  const planned=m.status==='Запланировано', cancelled=m.status===MEET_CANC;
@@ -3671,10 +3970,7 @@ function openMeeting(mid){
   '<div class="list-rows">'+m.attendees.map(u=>'<div class="lr" style="cursor:default">'+avatar(U(u))+'<div class="lt"><b>'+esc(U(u).name)+'</b><small>'+esc(U(u).position)+'</small></div>'+(u===m.chair?'<span class="chip">председатель</span>':u===m.secretary?'<span class="chip">секретарь</span>':'')+'</div>').join('')+'</div>';
  }
  if(tab==='plan'){ body=meetPlanBlock(m); }
- if(tab==='agenda'){
-  body=(editable?'<div class="flexw mb8"><span class="spacer"></span><button class="btn sm pri" onclick="App.agendaAdd(\''+mid+'\')">'+ic('plus')+' Вопрос</button></div>':'')+
-  (m.agenda.length?'<div class="list-rows">'+m.agenda.map(a=>'<div class="lr" style="cursor:default"><span class="sn" style="width:24px;height:24px;border-radius:7px;background:var(--acc-bg);color:var(--acc);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:11px;flex:none">'+a.n+'</span><div class="lt"><b>'+esc(a.title)+'</b><small>докладчик: '+esc(U(a.reporter).name)+'</small></div></div>').join('')+'</div>':emptyBlock('Повестка не сформирована','Добавьте вопросы к рассмотрению','meeting'));
- }
+ if(tab==='agenda'){ body=meetAgendaBlock(m); }
  if(tab==='dec'){
   body=(editable?'<div class="flexw mb8"><span class="small mut">Решение фиксируется с ответственным и сроком; поручение создаётся в M02.</span><span class="spacer"></span><button class="btn sm pri" onclick="App.decisionAdd(\''+mid+'\')">'+ic('plus')+' Решение</button></div>':'')+
   (m.decisions.length?m.decisions.map((d,i)=>{
@@ -3722,19 +4018,12 @@ App.meetApprove=function(mid){
  const m=MEET(mid);
  rpc('meeting.approve',{id:mid}).then(r=>{if(r)openMeeting(mid);});
 };
-App.agendaAdd=function(mid){
- openModal(mh('Вопрос повестки','meeting')+'<div class="mb form">'+field('Формулировка вопроса',inp('ag-title',''),true)+field('Докладчик',sel('ag-rep',DB.users.map(u=>[u.id,u.name]),App.user.id))+'</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" onclick="App.agendaSave(\''+mid+'\')">Добавить</button></div>');
-};
-App.agendaSave=function(mid){
- if(!requireFields(['ag-title']))return;
- const m=MEET(mid);
- rpc('meeting.agenda.add',{id:mid,title:val('ag-title'),reporter:val('ag-rep')}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
-};
-App.decisionAdd=function(mid){
+App.decisionAdd=function(mid,agN){
  const m=MEET(mid)||{agenda:[]};
+ const agPre=(agN==null?'':String(agN));
  openModal(mh('Решение совещания','check')+'<div class="mb form">'+field('Формулировка решения',ta('de-text','',3),true)+
  '<div class="row">'+field('Ответственный',sel('de-resp',DB.users.map(u=>[u.id,u.name]),'u5'),true)+field('Срок исполнения',inp('de-due',D(7),'date'),true)+'</div>'+
- field('Пункт повестки',sel('de-ag',[['','не привязан'],...m.agenda.map(a=>[a.n,'№'+a.n+' · '+a.title])],''))+
+ field('Пункт повестки',sel('de-ag',[['','не привязан'],...m.agenda.map(a=>[a.n,'№'+a.n+' · '+a.title])],agPre))+
  '<label class="checkline"><input type="checkbox" id="de-task" checked> Сразу создать поручение (задачу M02)</label>'+
  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" onclick="App.decisionSave(\''+mid+'\')">Зафиксировать</button></div>');
 };

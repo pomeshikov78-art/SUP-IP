@@ -395,6 +395,228 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
  await page.evaluate(()=>{App.f.mt={tab:'next'};renderView();});
  await sleep(300);
 
+ console.log('== M16 §2.6 / MTG-06: формирование повестки ==');
+ const agToday = new Date().toISOString().slice(0,10);
+ const agDate = off => new Date(Date.now()+off*864e5).toISOString().slice(0,10);
+ const agRes = await rpcAs(admCookie,'meeting.create',{title:'E2E повестка MTG-06',type:'Техническое',
+  date:agToday,time:'10:00',chair:'u2',secretary:'u3',attendees:['u2','u3','u5'],projects:['p1']});
+ const agMid = (agRes.result||{}).id;
+ ok('совещание для повестки создано', !!agMid);
+ const agTargetRes = await rpcAs(admCookie,'meeting.create',{title:'E2E получатель переноса',type:'Техническое',
+  date:agDate(7),time:'10:00',chair:'u2',secretary:'u3',attendees:['u2','u3','u5']});
+ const agTarget = (agTargetRes.result||{}).id;
+ await page.evaluate(()=>pollState());
+ await sleep(400);
+ await page.evaluate(m=>{App.f.meetTab='agenda';openMeeting(m);},agMid);
+ await sleep(450);
+ ok('карточка: вкладка «Повестка»', (await page.$('#mt-tab-agenda'))!==null && (await page.$('#meet-agenda'))!==null);
+ ok('повестка пуста: счётчики обнулены', (await txtOf('#ma-n'))==='0' && (await txtOf('#ma-open'))==='0');
+ ok('кнопка добавления вопроса', await page.$('#ma-add')!==null);
+ ok('история повестки на экране', await page.$('#meet-agenda-hist')!==null);
+
+ // добавление вопроса со всеми полями §2.6 / MTG-06 9.2
+ await page.evaluate(()=>document.getElementById('ma-add').click());
+ await sleep(350);
+ ok('форма вопроса: полный состав полей', (await page.$('#ag-title'))!==null && (await page.$('#ag-content'))!==null &&
+    (await page.$('#ag-rep'))!==null && (await page.$('#ag-prep'))!==null && (await page.$('#ag-dur'))!==null &&
+    (await page.$('#ag-prj'))!==null && (await page.$('#ag-risk'))!==null && (await page.$('#ag-expected'))!==null);
+ await page.evaluate(()=>{
+  document.getElementById('ag-title').value='Отклонение по расчёту МПП-7';
+  document.getElementById('ag-content').value='Сравнение расчёта и стендовых измерений';
+  document.getElementById('ag-rep').value='u6';
+  document.getElementById('ag-prep').value='u3';
+  document.getElementById('ag-dur').value='25';
+  document.getElementById('ag-prj').value='p1'; App.agendaPrj();
+  document.getElementById('ag-risk').value='r1';
+  document.getElementById('ag-expected').value='Утвердить корректировку алгоритма';
+ });
+ await sleep(200);
+ ok('этап и задачи выбираются по связанному проекту', (await page.$('#ag-stage'))!==null && (await page.$$('.ag-task')).length>0);
+ await page.evaluate(()=>{
+  const st=document.getElementById('ag-stage');
+  if(st.options.length>1)st.value=st.options[1].value;
+  const t=document.querySelector('.ag-task'); if(t)t.checked=true;
+ });
+ await page.evaluate(()=>document.getElementById('ag-save').click());
+ await sleep(900);
+ const ag1 = await page.evaluate(m=>{const a=(DB.meetings.find(x=>x.id===m).agenda||[])[0];return a?{id:a.id,n:a.n,st:a.status,dur:a.durationMin,prj:a.projectId,tasks:a.taskIds,risk:a.riskId,prep:a.prep}:null;},agMid);
+ ok('вопрос добавлен в повестку', !!ag1 && ag1.n===1, JSON.stringify(ag1));
+ ok('докладчик, подготовка, связи и продолжительность сохранены', !!ag1 && ag1.dur===25 && ag1.prj==='p1' && ag1.risk==='r1' && ag1.prep==='u3' && ag1.tasks.length===1);
+ ok('счётчик вопросов и плановое время', (await txtOf('#ma-n'))==='1' && (await txtOf('#ma-min')).includes('25 мин'));
+ ok('таблица повестки MTG-06 9.1', (await page.$$('#ma-table tbody tr')).length===1 && (await drawerTxt()).includes('Отклонение по расчёту МПП-7'));
+ ok('ожидаемый результат виден в списке', (await drawerTxt()).includes('Утвердить корректировку алгоритма'));
+
+ // ещё два вопроса
+ for(const [t,dur] of [['Готовность стендовых измерений',15],['План работ по замечаниям',10]]){
+  await page.evaluate(m=>App.agendaAdd(m),agMid);
+  await sleep(250);
+  await page.evaluate((t,d)=>{document.getElementById('ag-title').value=t;document.getElementById('ag-dur').value=String(d);document.getElementById('ag-rep').value='u5';},t,dur);
+  await page.evaluate(()=>document.getElementById('ag-save').click());
+  await sleep(700);
+ }
+ ok('в повестке три вопроса', (await txtOf('#ma-n'))==='3' && (await txtOf('#ma-min')).includes('50 мин'));
+
+ // карточка вопроса и изменение
+ await page.evaluate(()=>document.querySelector('.ma-view').click());
+ await sleep(350);
+ ok('карточка вопроса MTG-06 9.2', (await page.$('#ag-card'))!==null && (await modalTxt()).includes('Ответственный за подготовку'));
+ ok('в карточке видны связи и история', (await modalTxt()).includes('Связанные задачи') && (await page.$('#ag-hist'))!==null);
+ await page.evaluate(()=>document.getElementById('agc-edit').click());
+ await sleep(300);
+ await page.evaluate(()=>{document.getElementById('ag-dur').value='30';});
+ await page.evaluate(()=>document.getElementById('ag-save').click());
+ await sleep(800);
+ ok('вопрос изменён через карточку', (await txtOf('#ma-min')).includes('55 мин'), await txtOf('#ma-min'));
+
+ // порядок вопросов: вверх/вниз и на позицию
+ const agOrder = ()=>page.evaluate(m=>(DB.meetings.find(x=>x.id===m).agenda||[]).map(a=>a.title),agMid);
+ const ord0 = await agOrder();
+ await page.evaluate(()=>document.querySelectorAll('.ma-down')[0].click());
+ await sleep(800);
+ const ord1 = await agOrder();
+ ok('порядок вопросов изменён кнопкой «вниз»', ord1[0]===ord0[1] && ord1[1]===ord0[0], ord1.join(' | '));
+ await page.evaluate(()=>document.querySelectorAll('.ma-up')[0].click());
+ await sleep(800);
+ ok('порядок восстановлен кнопкой «вверх»', (await agOrder()).join('|')===ord0.join('|'));
+ await page.evaluate(()=>document.querySelectorAll('.ma-pos')[0].click());
+ await sleep(300);
+ ok('окно перемещения на позицию', (await page.$('#agp-to'))!==null && (await modalTxt()).includes('ссылки решений и поручений'));
+ await page.evaluate(()=>{document.getElementById('agp-to').value='3';});
+ await page.evaluate(()=>document.getElementById('agp-save').click());
+ await sleep(800);
+ ok('вопрос перемещён на указанную позицию', (await agOrder())[2]===ord0[0]);
+ ok('изменение порядка сохранено в истории', (await page.$eval('#meet-agenda-hist',e=>e.textContent)).includes('Изменён порядок'));
+
+ // материалы вопроса с фиксацией версии документа M09
+ await page.evaluate(()=>document.querySelector('.ma-mat').click());
+ await sleep(350);
+ ok('окно материалов вопроса', (await page.$('#agm-kind'))!==null && (await modalTxt()).includes('фиксируется конкретная версия'));
+ await page.evaluate(()=>{document.getElementById('agm-doc').value='d1';document.getElementById('agm-note').value='Расчёт к вопросу';});
+ await page.evaluate(()=>document.getElementById('agm-save').click());
+ await sleep(900);
+ ok('документ M09 прикреплён к вопросу', (await txtOf('#ma-mat'))==='1' && (await modalTxt()).includes('версия'));
+ const agDocV = await page.evaluate(m=>{const a=DB.meetings.find(x=>x.id===m).agenda.find(x=>(x.materials||[]).length);return a.materials[0].docV;},agMid);
+ await rpcAs(admCookie,'doc.version',{id:'d1',fileName:'raschet_v2.pdf',note:'Обновление расчёта'});
+ await page.evaluate(()=>pollState());
+ await sleep(400);
+ const agDocV2 = await page.evaluate(m=>{const a=DB.meetings.find(x=>x.id===m).agenda.find(x=>(x.materials||[]).length);return a.materials[0].docV;},agMid);
+ ok('версия документа в комплекте материалов не изменилась', agDocV2===agDocV, agDocV+'→'+agDocV2);
+ await page.evaluate(()=>{document.getElementById('agm-kind').value='link';App.agendaMatKind();
+  document.getElementById('agm-name').value='Протокол измерений';document.getElementById('agm-url').value='\\\\lvs-srv\\share\\izmer.pdf';});
+ ok('переключение вида материала на ссылку ЛВС', await page.$eval('#agm-link-box',e=>e.style.display!=='none'));
+ await page.evaluate(()=>document.getElementById('agm-save').click());
+ await sleep(900);
+ ok('ссылка ЛВС прикреплена к вопросу', (await txtOf('#ma-mat'))==='2');
+ const dlgAg = d=>{ d.accept().catch(()=>{}); };
+ page.on('dialog',dlgAg);
+ await page.evaluate(()=>document.querySelectorAll('.agm-del')[1].click());
+ await sleep(900);
+ ok('материал откреплён от вопроса', (await txtOf('#ma-mat'))==='1');
+ page.off('dialog',dlgAg);
+ await page.evaluate(()=>App.closeModal(true));
+ await sleep(250);
+
+ // статусы рассмотрения (MTG-06 9.3)
+ await page.evaluate(()=>document.querySelector('.ma-st').click());
+ await sleep(300);
+ const agStOpts = await page.$$eval('#ags-st option',os=>os.map(o=>o.value));
+ ok('переходы статусов ограничены правилами', agStOpts.includes('Рассматривается') && !agStOpts.includes('Перенесён'), agStOpts.join(','));
+ await page.evaluate(()=>{document.getElementById('ags-st').value='Рассматривается';App.agendaStKind();});
+ await page.evaluate(()=>document.getElementById('ags-save').click());
+ await sleep(800);
+ ok('вопрос переведён в «Рассматривается»', (await drawerTxt()).includes('Рассматривается'));
+ await page.evaluate(()=>document.querySelector('.ma-st').click());
+ await sleep(300);
+ await page.evaluate(()=>{document.getElementById('ags-st').value='Рассмотрен';App.agendaStKind();
+  document.getElementById('ags-fact').value='Корректировка алгоритма утверждена';});
+ ok('поле фактического результата показано', await page.$eval('#ags-fact-box',e=>e.style.display!=='none'));
+ await page.evaluate(()=>document.getElementById('ags-save').click());
+ await sleep(800);
+ ok('вопрос рассмотрен с фактическим результатом', (await page.evaluate(m=>DB.meetings.find(x=>x.id===m).agenda[0].status,agMid))==='Рассмотрен');
+ ok('фактический результат сохранён', (await page.evaluate(m=>DB.meetings.find(x=>x.id===m).agenda[0].fact,agMid)).includes('утверждена'));
+
+ // решение по вопросу: пункт повестки подставляется автоматически
+ await page.evaluate(()=>document.querySelector('.ma-dec').click());
+ await sleep(350);
+ ok('решение привязывается к пункту повестки', (await page.$eval('#de-ag',e=>e.value))==='1');
+ await page.evaluate(d=>{document.getElementById('de-text').value='E2E решение по вопросу повестки';
+  document.getElementById('de-resp').value='u5';document.getElementById('de-due').value=d;},agDate(5));
+ await page.evaluate(m=>App.decisionSave(m),agMid);
+ await sleep(900);
+ const agDec = await page.evaluate(m=>{const d=(DB.meetings.find(x=>x.id===m).decisions||[])[0];return d?{n:d.agendaN,id:d.agendaId}:null;},agMid);
+ ok('решение зарегистрировано по вопросу №1', !!agDec && agDec.n===1, JSON.stringify(agDec));
+
+ // снятие с рассмотрения требует основания
+ await page.evaluate(()=>document.querySelectorAll('.ma-st')[2].click());
+ await sleep(300);
+ await page.evaluate(()=>{document.getElementById('ags-st').value='Снят с рассмотрения';App.agendaStKind();});
+ ok('основание снятия с рассмотрения запрашивается', await page.$eval('#ags-reason-box',e=>e.style.display!=='none'));
+ await page.evaluate(()=>{document.getElementById('ags-reason').value='Вопрос снят по решению председателя';});
+ await page.evaluate(()=>document.getElementById('ags-save').click());
+ await sleep(800);
+ ok('вопрос снят с рассмотрения', (await page.evaluate(m=>DB.meetings.find(x=>x.id===m).agenda[2].status,agMid))==='Снят с рассмотрения');
+
+ // удаление вопроса без решений
+ page.on('dialog',dlgAg);
+ const agN0 = await page.evaluate(m=>DB.meetings.find(x=>x.id===m).agenda.length,agMid);
+ await page.evaluate(()=>document.querySelectorAll('.ma-del')[1].click());
+ await sleep(900);
+ page.off('dialog',dlgAg);
+ ok('вопрос без решений удалён из повестки', (await page.evaluate(m=>DB.meetings.find(x=>x.id===m).agenda.length,agMid))===agN0-1);
+ ok('нумерация после удаления сплошная', (await page.evaluate(m=>DB.meetings.find(x=>x.id===m).agenda.map(a=>a.n),agMid)).join(',')==='1,2');
+
+ // перенос нерассмотренных вопросов на следующее совещание
+ await page.evaluate(m=>App.agendaAdd(m),agMid);
+ await sleep(300);
+ await page.evaluate(()=>{document.getElementById('ag-title').value='Готовность проектной документации';
+  document.getElementById('ag-rep').value='u3';document.getElementById('ag-dur').value='20';});
+ await page.evaluate(()=>document.getElementById('ag-save').click());
+ await sleep(800);
+ ok('кнопка переноса нерассмотренных', await page.$('#ma-carry')!==null);
+ await page.evaluate(()=>document.getElementById('ma-carry').click());
+ await sleep(350);
+ ok('окно переноса: получатель и основание', (await page.$('#agc-target'))!==null && (await page.$('#agc-reason'))!==null && (await page.$$('.agc-chk')).length>0);
+ await page.evaluate(t=>{document.getElementById('agc-target').value=t;App.agendaCarryKind();
+  document.getElementById('agc-reason').value='Не хватило времени совещания';},agTarget);
+ await page.evaluate(()=>document.getElementById('agc-save').click());
+ await sleep(1000);
+ const agCarry = await page.evaluate((m,t)=>{
+  const src=DB.meetings.find(x=>x.id===m), dst=DB.meetings.find(x=>x.id===t);
+  return {src:(src.agenda||[]).map(a=>a.status),dst:(dst.agenda||[]).map(a=>({n:a.n,st:a.status,from:(a.carryFrom||{}).code}))};
+ },agMid,agTarget);
+ ok('нерассмотренный вопрос перенесён', agCarry.src.includes('Перенесён') && agCarry.dst.length===1, JSON.stringify(agCarry));
+ ok('в получателе вопрос включён в повестку со ссылкой на источник', agCarry.dst[0].st==='Включён в повестку' && /^СОВ-/.test(agCarry.dst[0].from||''), JSON.stringify(agCarry.dst));
+ ok('нерассмотренных в исходной повестке не осталось', (await txtOf('#ma-open'))==='0');
+
+ // перенос в новое совещание
+ await page.evaluate(m=>App.agendaAdd(m),agMid);
+ await sleep(300);
+ await page.evaluate(()=>{document.getElementById('ag-title').value='Вопрос для нового совещания';document.getElementById('ag-rep').value='u3';});
+ await page.evaluate(()=>document.getElementById('ag-save').click());
+ await sleep(800);
+ await page.evaluate(()=>document.getElementById('ma-carry').click());
+ await sleep(350);
+ await page.evaluate(d=>{document.getElementById('agc-target').value='new';App.agendaCarryKind();
+  document.getElementById('agc-date').value=d;document.getElementById('agc-time').value='11:00';
+  document.getElementById('agc-reason').value='Продолжение на следующей неделе';},agDate(14));
+ ok('режим создания нового совещания', await page.$eval('#agc-new-box',e=>e.style.display!=='none'));
+ await page.evaluate(()=>document.getElementById('agc-save').click());
+ await sleep(1100);
+ const agNew = await page.evaluate(d=>{const m=DB.meetings.find(x=>x.date===d&&x.time==='11:00'&&/перенесённые вопросы/.test(x.title));
+  return m?{code:m.code,n:(m.agenda||[]).length,from:((m.agenda||[])[0]||{}).carryFrom}:null;},agDate(14));
+ ok('создано новое совещание-получатель', !!agNew && agNew.n===1, JSON.stringify(agNew));
+ ok('перенесённый вопрос помнит источник', !!agNew && !!agNew.from && /^СОВ-/.test(agNew.from.code||''));
+
+ // повестка в печатной форме протокола
+ await page.evaluate(m=>{App.f.meetTab='prot';openMeeting(m);},agMid);
+ await sleep(500);
+ const agProt = await drawerTxt();
+ ok('повестка попала в протокол совещания', agProt.includes('Повестка дня') && agProt.includes('Отклонение по расчёту МПП-7'));
+ ok('протокол: рассмотрение вопросов с фактическим результатом', agProt.includes('Рассмотрение вопросов') && agProt.includes('Корректировка алгоритма утверждена'));
+ ok('протокол: плановое время и перенос вопросов', agProt.includes('Планируемая продолжительность рассмотрения') && agProt.includes('Перенесён на совещание'));
+ await page.evaluate(()=>{App.closeDrawer();App.f.mt={tab:'next'};nav('meetings');});
+ await sleep(300);
+
  console.log('== M16 §2.9: маршрут согласования и версии протокола ==');
  // совещание готовит администратор, секретарь — текущий пользователь браузера (volkova, u3)
  const sessOf = async login => {

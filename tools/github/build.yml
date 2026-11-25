@@ -86,6 +86,9 @@ jobs:
       - name: Испытания планирования совещаний (ТЗ §2.5)
         working-directory: sup-ip
         run: python tests/planning_test.py --base http://127.0.0.1:8000
+      - name: Испытания формирования повестки (ТЗ §2.6, MTG-06)
+        working-directory: sup-ip
+        run: python tests/agenda_test.py --base http://127.0.0.1:8000
       - name: Испытания установки, запуска и журналов (со сборкой сценария NSIS)
         working-directory: sup-ip
         run: |
