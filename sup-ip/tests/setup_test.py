@@ -457,6 +457,30 @@ def main():
             if made:
                 os.remove(exe)
 
+    print("== N. Публикация Release: имена активов и идемпотентность ==")
+    wf = os.path.join(os.path.dirname(ROOT), ".github", "workflows", "build.yml")
+    if not os.path.isfile(wf):
+        print("  --  сценарий автосборки отсутствует в поставке (пропуск)")
+    else:
+        w = io.open(wf, encoding="utf-8").read()
+        rel = w[w.index("- name: Публикация Release"):]
+        nxt = rel.find("\n      - name:", 1)
+        if nxt > 0: rel = rel[:nxt]
+        check("Release: руководства публикуются под латинскими именами",
+              "SUP-IP_User_Manual" in rel and "SUP-IP_Admin_Manual" in rel)
+        check("Release: нет выгрузки кириллических имён активов (GitHub → «_.docx», коллизия 422)",
+              "docs/*.docx" not in rel and 'files+=("$f")' not in rel)
+        check("Release: создание отделено от выгрузки активов",
+              "gh release view" in rel and "gh release upload" in rel)
+        check("Release: повторная выгрузка не падает (--clobber)", "--clobber" in rel)
+        names = re.findall(r'"((?:sup-ip/dist|docs)/[^"]+)"', rel)
+        check("Release: все имена активов ASCII", all(n.isascii() for n in names),
+              [n for n in names if not n.isascii()])
+        check("Release: копируется и DOCX, и DOC", "for e in docx doc; do" in rel)
+        wf2 = os.path.join(os.path.dirname(ROOT), "tools", "github", "build.yml")
+        if os.path.isfile(wf2):
+            check("копия сценария в tools/github идентична", io.open(wf2, encoding="utf-8").read() == w)
+
     print("\nИТОГ: %d ok, %d FAIL" % (ok, fail))
     return 1 if fail else 0
 

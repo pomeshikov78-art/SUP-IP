@@ -218,9 +218,17 @@ jobs:
         run: |
           v=${{ steps.ver.outputs.version }}
           files=("sup-ip/dist/SUP-IP.exe" "sup-ip/dist/SUP-IP-Setup-$v.exe" "sup-ip/dist/SUP-IP-Setup.exe" "SUP-IP_server.zip")
-          for f in docs/*.docx docs/*.doc; do [ -f "$f" ] && files+=("$f"); done
+          # GitHub отбрасывает не-ASCII символы в именах активов Release: кириллические имена
+          # превращаются в «_.docx» и сталкиваются (HTTP 422 already_exists). Публикуем латиницей.
+          for p in "Руководство_пользователя:SUP-IP_User_Manual" "Руководство_администратора:SUP-IP_Admin_Manual"; do
+            ru=${p%%:*}; en=${p##*:}
+            for e in docx doc; do
+              if [ -f "docs/$ru.$e" ]; then cp "docs/$ru.$e" "docs/$en.$e"; files+=("docs/$en.$e"); fi
+            done
+          done
           if [ -f "sup-ip/dist/SUP-IP-Setup-full-$v.exe" ]; then
             files+=("sup-ip/dist/SUP-IP-Setup-full-$v.exe" "sup-ip/dist/SUP-IP-Setup-full.exe")
           fi
-          gh release create "v$v" --title "СУП-ИП v$v" --notes-file CHANGELOG.md "${files[@]}" \
-          || gh release upload "v$v" "${files[@]}" --clobber
+          gh release view "v$v" >/dev/null 2>&1 \
+            || gh release create "v$v" --title "СУП-ИП v$v" --notes-file CHANGELOG.md
+          gh release upload "v$v" "${files[@]}" --clobber
