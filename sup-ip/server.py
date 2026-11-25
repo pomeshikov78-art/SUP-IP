@@ -39,7 +39,7 @@ except ImportError:
     docgen = None
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -269,7 +269,8 @@ CREATE TABLE IF NOT EXISTS users(
   id TEXT PRIMARY KEY, login TEXT UNIQUE NOT NULL, name TEXT NOT NULL, role TEXT NOT NULL,
   position TEXT NOT NULL DEFAULT '', capacity INT NOT NULL DEFAULT 8, color TEXT NOT NULL DEFAULT '#2563eb',
   blocked BOOLEAN NOT NULL DEFAULT FALSE, pass_salt TEXT NOT NULL, pass_hash TEXT NOT NULL,
-  failed INT NOT NULL DEFAULT 0, lock_until BIGINT NOT NULL DEFAULT 0, absences JSONB NOT NULL DEFAULT '[]');
+  failed INT NOT NULL DEFAULT 0, lock_until BIGINT NOT NULL DEFAULT 0, absences JSONB NOT NULL DEFAULT '[]',
+  department TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS sessions(
   token TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   created BIGINT NOT NULL, last_seen BIGINT NOT NULL);
@@ -286,7 +287,8 @@ CREATE TABLE IF NOT EXISTS meetings(
   status TEXT NOT NULL, agenda JSONB NOT NULL DEFAULT '[]', decisions JSONB NOT NULL DEFAULT '[]',
   protocol JSONB NOT NULL DEFAULT '{}', materials JSONB NOT NULL DEFAULT '[]',
   projects JSONB NOT NULL DEFAULT '[]', recurrence JSONB NOT NULL DEFAULT '{}',
-  plan_log JSONB NOT NULL DEFAULT '[]', series_id TEXT NOT NULL DEFAULT '');
+  plan_log JSONB NOT NULL DEFAULT '[]', series_id TEXT NOT NULL DEFAULT '',
+  participants JSONB NOT NULL DEFAULT '[]', actual_composition JSONB NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS risks(
   id TEXT PRIMARY KEY, code TEXT UNIQUE NOT NULL, title TEXT NOT NULL, cat TEXT NOT NULL,
   project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, p INT NOT NULL, i INT NOT NULL,
@@ -380,7 +382,8 @@ ENT = {
    ("time","mtime","t"),("chair","chair","t"),("secretary","secretary","t"),("attendees","attendees","j"),
    ("status","status","t"),("agenda","agenda","j"),("decisions","decisions","j"),("protocol","protocol","j"),
    ("materials","materials","j"),("projects","projects","j"),("recurrence","recurrence","j"),
-   ("planLog","plan_log","j"),("seriesId","series_id","t")]),
+   ("planLog","plan_log","j"),("seriesId","series_id","t"),
+   ("participants","participants","j"),("actual","actual_composition","j")]),
  "calEvent": ("cal_events", [("id","id","t"),("title","title","t"),("date","date","t"),("time","mtime","t"),
    ("type","type","t"),("participants","participants","j"),("note","note","t")]),
  "report": ("reports", [("id","id","t"),("code","code","t"),("type","type","t"),("title","title","t"),("params","params","j"),
@@ -469,7 +472,7 @@ class DB:
         cur.execute("INSERT INTO events(id,ts,cat,level,user_id,module,action,obj,obj_id,details) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (uid("e"), now_ms(), cat, level, user_id or "system", module, action, obj, obj_id or "", psycopg2.extras.Json(details or {})))
     def users_public(self, cur):
-        cur.execute("SELECT id,login,name,role,position,capacity,color,blocked,absences FROM users ORDER BY id")
+        cur.execute("SELECT id,login,name,role,position,department,capacity,color,blocked,absences FROM users ORDER BY id")
         return [dict(r) for r in cur.fetchall()]
     def state(self, cur, me_id):
         s = {"v": 3, "rev": self.rev(cur), "me": me_id, "server": {"name": APP_NAME, "version": VERSION, "db": "PostgreSQL"}}
@@ -498,20 +501,20 @@ def seed(db):
             if cur.fetchone()["n"] > 0: return False
             now = now_ms()
             users = [
-                ("u1","admin","Соколов Артём","admin","Инженер-администратор",8,"#7c3aed"),
-                ("u2","morozov","Морозов Дмитрий","head","Начальник инженерного подразделения",8,"#0e7490"),
-                ("u3","volkova","Волкова Елена","pm","Руководитель проектов",8,"#2563eb"),
-                ("u4","lebedev","Лебедев Игорь","pm","Руководитель проектов",8,"#c026d3"),
-                ("u5","novikov","Новиков Сергей","exec","Инженер-конструктор",8,"#16a34a"),
-                ("u6","kozlova","Козлова Мария","exec","Инженер-расчётчик",8,"#ea580c"),
-                ("u7","orlov","Орлов Павел","exec","Инженер-испытатель",8,"#0891b2"),
-                ("u8","zaytseva","Зайцева Нина","observer","Специалист по качеству",8,"#64748b"),
+                ("u1","admin","Соколов Артём","admin","Инженер-администратор",8,"#7c3aed","Инженерное подразделение"),
+                ("u2","morozov","Морозов Дмитрий","head","Начальник инженерного подразделения",8,"#0e7490","Инженерное подразделение"),
+                ("u3","volkova","Волкова Елена","pm","Руководитель проектов",8,"#2563eb","Группа управления проектами"),
+                ("u4","lebedev","Лебедев Игорь","pm","Руководитель проектов",8,"#c026d3","Группа управления проектами"),
+                ("u5","novikov","Новиков Сергей","exec","Инженер-конструктор",8,"#16a34a","Конструкторская группа"),
+                ("u6","kozlova","Козлова Мария","exec","Инженер-расчётчик",8,"#ea580c","Расчётная группа"),
+                ("u7","orlov","Орлов Павел","exec","Инженер-испытатель",8,"#0891b2","Группа испытаний"),
+                ("u8","zaytseva","Зайцева Нина","observer","Специалист по качеству",8,"#64748b","Служба качества"),
             ]
-            for id_,login,name,role,pos,cap,color in users:
+            for id_,login,name,role,pos,cap,color,dept in users:
                 salt,h = pass_hash("demo")
                 abs_ = [{"from":D(6),"to":D(10),"reason":"Отпуск"}] if id_=="u7" else []
-                cur.execute("INSERT INTO users(id,login,name,role,position,capacity,color,pass_salt,pass_hash,absences) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                            (id_,login,name,role,pos,cap,color,salt,h,psycopg2.extras.Json(abs_)))
+                cur.execute("INSERT INTO users(id,login,name,role,position,department,capacity,color,pass_salt,pass_hash,absences) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                            (id_,login,name,role,pos,dept,cap,color,salt,h,psycopg2.extras.Json(abs_)))
             projects = [
                 dict(id="p1",code="П-2026-01",name="Модернизация радиорелейной линии РРЛ-240",cat="Модернизация",status="Выполняется",pm="u3",start=D(-45),end=D(40),budgetHours=1200,team=["u3","u5","u6","u7"],desc="Модернизация действующей радиорелейной линии: замена приёмопередатчиков, пересчёт бюджета радиолинии, пусконаладка и приёмочные испытания.",baseline={},baselineAt=None,createdAt=now-45*DAY*1000),
                 dict(id="p2",code="П-2026-02",name="Система мониторинга технологических параметров СМТП-3",cat="Разработка",status="Выполняется",pm="u4",start=D(-60),end=D(25),budgetHours=1600,team=["u4","u5","u6"],desc="Разработка аппаратно-программного комплекса сбора и визуализации технологических параметров производства.",baseline={},baselineAt=None,createdAt=now-60*DAY*1000),
@@ -1360,7 +1363,11 @@ def h_meeting_create(db, cur, u, p):
              date=p["date"], time=p["time"], chair=p["chair"], secretary=p["secretary"],
              attendees=p.get("attendees", []), status="Запланировано", agenda=[], decisions=[],
              protocol=protocol_default(), materials=[], projects=projects, recurrence=rec,
-             seriesId=series_id, planLog=[])
+             seriesId=series_id, planLog=[], participants=[], actual={})
+    for x in part_norm(m, u["id"]):        # §2.7: состав участников; приглашения рассылает создание совещания
+        x["invite"] = "Направлено"; x["invitedAt"] = now_ms(); x["invitedBy"] = u["id"]
+        _part_hist(x, u["id"], "invite", **{"from": "Не направлено", "to": "Направлено",
+                                            "note": "Приглашение при создании совещания"})
     db.save_ent(cur, "meeting", m)
     db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Создано совещание", "Совещание", m["id"],
              {"title": m["title"], "date": m["date"], "projects": projects, "recurrence": rec_text(rec),
@@ -1388,6 +1395,12 @@ def h_meeting_update(db, cur, u, p):
                                         "reason": (p.get("reason") or "Изменение параметров совещания").strip()[:500]})
     elif any(before[k] != m[k] for k in ("chair", "secretary", "attendees")):
         _meet_log(m, u["id"], "params", note="Изменены председатель, секретарь или состав участников")
+    was_members = set([before["chair"], before["secretary"]] + (before["attendees"] or []))
+    for x in part_norm(m, u["id"]):        # §2.7: состав участников следует за полями совещания
+        if x["userId"] not in was_members:
+            x["invite"] = "Направлено"; x["invitedAt"] = now_ms(); x["invitedBy"] = u["id"]
+            _part_hist(x, u["id"], "invite", **{"from": "Не направлено", "to": "Направлено",
+                                                "note": "Приглашение при изменении состава"})
     db.save_ent(cur, "meeting", m)
     db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Совещание изменено", "Совещание", m["id"], {"code": m["code"]})
     invite = list(dict.fromkeys([m["chair"], m["secretary"]] + (m.get("attendees") or [])))
@@ -1862,6 +1875,410 @@ def h_meeting_agenda_list(db, cur, u, p):
             "nextMeeting": (lambda t: {"id": t["id"], "code": t["code"], "date": t["date"]} if t else None)(
                 _agenda_next_meeting(db, cur, m))}, None
 
+
+# ---------------- M16 §2.7: участники совещания (экранные требования MTG-05) ----------------
+PART_ROLES = ("Председатель", "Секретарь", "Докладчик", "Участник", "Эксперт", "Наблюдатель", "Контролирующее лицо")
+PART_FIXED = ("Председатель", "Секретарь")          # задаются полями совещания, а не ролью участника
+INVITE_ST = ("Не направлено", "Направлено", "Подтверждено", "Отклонено", "Требует уточнения")
+INVITE_ANSWERS = ("Подтверждено", "Отклонено", "Требует уточнения")
+PART_ST = ("Не определено", "Присутствовал", "Отсутствовал", "Подключился дистанционно", "Участвовал частично")
+PART_PRESENT = ("Присутствовал", "Подключился дистанционно", "Участвовал частично")
+PART_MAX = 50
+PART_HIST_MAX = 50
+PART_ACT = {"add": "Добавлен в состав", "edit": "Изменены сведения", "invite": "Приглашение направлено",
+            "response": "Ответ на приглашение", "attendance": "Отмечено фактическое участие",
+            "bulk": "Массовое изменение статуса", "remove": "Исключён из состава"}
+
+def parts_of(m):
+    return m.get("participants") if isinstance(m.get("participants"), list) else []
+
+def _part_hist(part, by, action, **kw):
+    h = part.get("history") if isinstance(part.get("history"), list) else []
+    rec = {"ts": now_ms(), "by": by, "action": action}
+    rec.update(kw)
+    h.append(rec)
+    part["history"] = h[-PART_HIST_MAX:]
+    return rec
+
+def _part_new(user_id, role, by, required=False, comment=""):
+    return {"id": uid("mp"), "userId": user_id, "role": role, "required": bool(required),
+            "invite": "Не направлено", "invitedAt": None, "invitedBy": "", "respondedAt": None,
+            "responseNote": "", "participation": "Не определено", "participationAt": None,
+            "participationBy": "", "comment": str(comment or "").strip()[:500],
+            "addedAt": now_ms(), "addedBy": by, "history": []}
+
+def part_norm(m, by="system"):
+    """Состав участников приводится к структуре §2.7/MTG-05: председатель и секретарь всегда
+       в составе, записи прежних версий (только attendees) дополняются полями."""
+    old = {x.get("userId"): x for x in parts_of(m) if x.get("userId")}
+    members = list(dict.fromkeys([x for x in [m.get("chair"), m.get("secretary")] + (m.get("attendees") or []) if x]))
+    items = []
+    for uid_ in members:
+        role = "Председатель" if uid_ == m.get("chair") else ("Секретарь" if uid_ == m.get("secretary") else "Участник")
+        x = old.get(uid_)
+        if not x:
+            x = _part_new(uid_, role, by, required=role in PART_FIXED)
+            _part_hist(x, by, "add", note="Включён в состав участников")
+        x.setdefault("id", uid("mp"))
+        x["userId"] = uid_
+        if role in PART_FIXED: x["role"] = role                     # роль председателя/секретаря не переопределяется
+        elif x.get("role") not in PART_ROLES or x.get("role") in PART_FIXED: x["role"] = "Участник"
+        x["required"] = True if role in PART_FIXED else bool(x.get("required"))
+        if x.get("invite") not in INVITE_ST: x["invite"] = "Не направлено"
+        if x.get("participation") not in PART_ST: x["participation"] = "Не определено"
+        for k, lim in (("comment", 500), ("responseNote", 500)):
+            x[k] = str(x.get(k) or "")[:lim]
+        for k in ("invitedAt", "respondedAt", "participationAt"):
+            if x.get(k) is not None and not isinstance(x.get(k), (int, float)): x[k] = None
+        for k in ("invitedBy", "participationBy", "addedBy"):
+            x[k] = str(x.get(k) or "")
+        if not isinstance(x.get("history"), list): x["history"] = []
+        items.append(x)
+    m["participants"] = items
+    m["attendees"] = members                                        # единый состав для напоминаний и оповещений
+    return items
+
+def part_find(m, p):
+    items = part_norm(m)
+    key = p.get("pid") or p.get("participantId")
+    if key:
+        x = next((a for a in items if a["id"] == key), None)
+        if not x: raise RpcError("Участник не найден в составе совещания: %s" % key, "Участники", 404, "NOT_FOUND")
+        return items, x
+    if p.get("userId"):
+        x = next((a for a in items if a["userId"] == p["userId"]), None)
+        if not x: raise RpcError("Сотрудник %s не включён в состав совещания" % p["userId"], "Участники", 404, "NOT_FOUND")
+        return items, x
+    raise RpcError("Не указан участник совещания (pid или userId)")
+
+def part_pick(m, p):
+    """Выборка участников для массовых операций: pid/userId, all либо фильтр по статусу."""
+    items = part_norm(m)
+    ids = list(p.get("pids") or []) + list(p.get("userIds") or [])
+    if ids:
+        picked = []
+        for key in ids:
+            x = next((a for a in items if a["id"] == key or a["userId"] == key), None)
+            if not x: raise RpcError("Участник не найден в составе совещания: %s" % key, "Участники", 404, "NOT_FOUND")
+            if x not in picked: picked.append(x)
+        return items, picked
+    if p.get("all"): return items, list(items)
+    flt = p.get("filter") or ""
+    if flt:
+        picked = [a for a in items if a["invite"] == flt or a["participation"] == flt
+                  or (flt == "Обязательные" and a["required"])]
+        if not picked: raise RpcError("По условию «%s» участников не найдено" % flt)
+        return items, picked
+    raise RpcError("Укажите участников (pids/userIds), all=true либо условие отбора (filter)")
+
+def _part_user(db, cur, user_id):
+    cur.execute("SELECT id,name,position,department,blocked FROM users WHERE id=%s", (user_id,))
+    r = cur.fetchone()
+    if not r: raise RpcError("Сотрудник не найден в справочнике: %s" % user_id, "Участники", 404, "NOT_FOUND")
+    if r["blocked"]: raise RpcError("Сотрудник заблокирован и не может участвовать: %s" % r["name"])
+    return r
+
+def _part_started(m):
+    """Фактическое участие регистрируется после проведения совещания (§2.7) либо в день совещания."""
+    if m.get("status") == MEET_CANCELLED:
+        raise RpcError("У отменённого совещания фактический состав не регистрируется")
+    if m.get("status") in ("Проведено", "Протокол утверждён"): return True
+    if m.get("date", "") <= dISO(today()): return True
+    raise RpcError("Фактическое участие регистрируется после проведения совещания (%s)" % _fd(m["date"]))
+
+def _part_counts(items):
+    return {"invite": {s: sum(1 for a in items if a["invite"] == s) for s in INVITE_ST},
+            "participation": {s: sum(1 for a in items if a["participation"] == s) for s in PART_ST},
+            "required": sum(1 for a in items if a["required"]),
+            "present": sum(1 for a in items if a["participation"] in PART_PRESENT),
+            "unknown": sum(1 for a in items if a["participation"] == "Не определено")}
+
+def _part_reminders(db, cur, m, by):
+    """Напоминания пересчитываются на актуальный состав участников (M12 §8.2)."""
+    if m.get("status") == MEET_CANCELLED: return 0
+    return reminders_set(db, cur, "meeting", m, [a["userId"] for a in parts_of(m)], DEFAULT_REMINDERS, by)
+
+@reg("meeting.participants.list")
+def h_meeting_parts_list(db, cur, u, p):
+    """Состав участников с приглашениями, подтверждением и фактическим участием (MTG-05 8.1)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "view", m)
+    items = part_norm(m, u["id"])
+    db.save_ent(cur, "meeting", m)
+    users = {x["id"]: x for x in db.users_public(cur)}
+    rows = [dict(a, name=(users.get(a["userId"]) or {}).get("name", ""),
+                 position=(users.get(a["userId"]) or {}).get("position", ""),
+                 department=(users.get(a["userId"]) or {}).get("department", ""),
+                 systemRole=(users.get(a["userId"]) or {}).get("role", "")) for a in items]
+    return {"meetingId": m["id"], "code": m["code"], "items": rows, "counts": _part_counts(items),
+            "actual": m.get("actual") or {}, "total": len(items),
+            "canAttendance": m.get("status") != MEET_CANCELLED and (
+                m.get("status") in ("Проведено", "Протокол утверждён") or m.get("date", "") <= dISO(today())),
+            "roles": list(PART_ROLES), "inviteStates": list(INVITE_ST), "participationStates": list(PART_ST)}, None
+
+@reg("meeting.participants.add")
+def h_meeting_parts_add(db, cur, u, p):
+    """Добавление участников из единого справочника сотрудников (§2.7, MTG-05 8.4)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    items = part_norm(m, u["id"])
+    ids = [x for x in ([p["userId"]] if p.get("userId") else []) + list(p.get("userIds") or []) if x]
+    if not ids: raise RpcError("Не выбран сотрудник из справочника")
+    role = p.get("role") or "Участник"
+    if role not in PART_ROLES: raise RpcError("Неизвестная роль на совещании: %s (допустимо: %s)" % (role, ", ".join(PART_ROLES)))
+    if role in PART_FIXED:
+        raise RpcError("Роль «%s» задаётся полем совещания, а не составом участников" % role)
+    added = []
+    for uid_ in dict.fromkeys(ids):
+        usr = _part_user(db, cur, uid_)
+        if any(a["userId"] == uid_ for a in items):
+            raise RpcError("%s уже включён в состав совещания" % usr["name"])
+        if len(items) >= PART_MAX: raise RpcError("Участников совещания — не более %d" % PART_MAX)
+        x = _part_new(uid_, role, u["id"], required=p.get("required"), comment=p.get("comment"))
+        _part_hist(x, u["id"], "add", note="Добавлен из справочника: %s · %s" % (usr["name"], role))
+        items.append(x)
+        added.append({"userId": uid_, "name": usr["name"], "role": role})
+    m["participants"] = items
+    m["attendees"] = [a["userId"] for a in items]
+    _meet_log(m, u["id"], "params", note="Добавлены участники: " + ", ".join(x["name"] for x in added))
+    db.save_ent(cur, "meeting", m)
+    _part_reminders(db, cur, m, u["id"])
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Добавлены участники совещания", "Совещание", m["id"],
+             {"code": m["code"], "added": added, "role": role, "total": len(items),
+              "event": "MEETING_PARTICIPANT_ADDED"})
+    return m, msg("Участники добавлены", "%d чел. · всего в составе: %d" % (len(added), len(items)))
+
+@reg("meeting.participants.update")
+def h_meeting_parts_update(db, cur, u, p):
+    """Изменение роли на совещании, обязательности и комментария (MTG-05 8.1, 8.4)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    items, x = part_find(m, p)
+    was = {k: x.get(k) for k in ("role", "required", "comment")}
+    if "role" in p:
+        role = p["role"]
+        if role not in PART_ROLES: raise RpcError("Неизвестная роль на совещании: %s" % role)
+        if role in PART_FIXED: raise RpcError("Роль «%s» задаётся полем совещания" % role)
+        if x["userId"] in (m.get("chair"), m.get("secretary")):
+            raise RpcError("Роль председателя и секретаря изменяется в карточке совещания")
+        x["role"] = role
+    if "required" in p:
+        if x["userId"] in (m.get("chair"), m.get("secretary")) and not p["required"]:
+            raise RpcError("Председатель и секретарь — обязательные участники совещания")
+        x["required"] = bool(p["required"])
+    if "comment" in p: x["comment"] = str(p["comment"] or "").strip()[:500]
+    changed = [k for k in was if was[k] != x.get(k)]
+    if not changed: raise RpcError("Сведения об участнике не изменились")
+    _part_hist(x, u["id"], "edit", note="Изменены поля: " + ", ".join(changed))
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Изменены сведения об участнике", "Совещание", m["id"],
+             {"code": m["code"], "userId": x["userId"], "fields": changed,
+              "role": x["role"], "required": x["required"], "event": "MEETING_PARTICIPANT_UPDATED"})
+    return m, msg("Сведения об участнике изменены", "Поля: %s" % ", ".join(changed))
+
+@reg("meeting.participants.remove")
+def h_meeting_parts_remove(db, cur, u, p):
+    """Исключение из состава: председателя и секретаря исключить нельзя, отмеченное участие сохраняется."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    items, x = part_find(m, p)
+    if x["userId"] in (m.get("chair"), m.get("secretary")):
+        raise RpcError("Председателя и секретаря нельзя исключить из состава — измените их в карточке совещания")
+    if x["participation"] != "Не определено":
+        raise RpcError("Фактическое участие уже отмечено («%s») — состав сохраняется в протоколе; "
+                       "отметьте «Отсутствовал» вместо исключения" % x["participation"])
+    items.remove(x)
+    m["participants"] = items
+    m["attendees"] = [a["userId"] for a in items]
+    _meet_log(m, u["id"], "params", note="Исключён участник: %s" % _uname(db, cur, x["userId"]))
+    db.save_ent(cur, "meeting", m)
+    _part_reminders(db, cur, m, u["id"])
+    db.audit(cur, "AUDIT", "warning", u["id"], "meetings", "Участник исключён из состава совещания",
+             "Совещание", m["id"], {"code": m["code"], "userId": x["userId"], "role": x["role"],
+                                    "event": "MEETING_PARTICIPANT_REMOVED"})
+    return m, msg("Участник исключён", "В составе: %d чел." % len(items))
+
+@reg("meeting.participants.invite")
+def h_meeting_parts_invite(db, cur, u, p):
+    """Направление приглашений (MTG-05 8.2, 8.4): статус «Направлено» и уведомление сотруднику."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    if m.get("status") != "Запланировано":
+        raise RpcError("Приглашения направляются на запланированное совещание (сейчас: %s)" % m["status"])
+    items, picked = part_pick(m, p)
+    note = str(p.get("note") or "").strip()[:500]
+    sent = []
+    for x in picked:
+        was = x["invite"]
+        x["invite"] = "Направлено"; x["invitedAt"] = now_ms(); x["invitedBy"] = u["id"]
+        x["respondedAt"] = None; x["responseNote"] = note
+        _part_hist(x, u["id"], "invite", **{"from": was, "to": "Направлено", "note": note})
+        sent.append(x["userId"])
+    db.save_ent(cur, "meeting", m)
+    n = notify_many(db, cur, [x for x in sent if x != u["id"]], "meeting.invite",
+                    "Приглашение: %s" % m["title"],
+                    "%s · %s %s%s" % (m["code"], _fd(m["date"]), m.get("time") or "", " · " + note if note else ""),
+                    "Совещание", m["id"], dedupe_suffix="invite:%d" % now_ms())
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Направлены приглашения участникам", "Совещание", m["id"],
+             {"code": m["code"], "count": len(sent), "users": sent, "delivered": n, "note": note,
+              "event": "MEETING_PARTICIPANTS_INVITED"})
+    return {"sent": len(sent), "delivered": n, "meeting": m}, \
+        msg("Приглашения направлены", "%d участн. · уведомлений доставлено: %d" % (len(sent), n))
+
+@reg("meeting.participants.respond")
+def h_meeting_parts_respond(db, cur, u, p):
+    """Подтверждение участия: отвечает сам участник, секретарь может отметить за него (MTG-05 8.2)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "view", m); meet_active(m)
+    items = part_norm(m, u["id"])
+    target = p.get("userId") or u["id"]
+    if target != u["id"]:
+        guard(db, cur, u, "meetings", "edit", m)                 # за другого — только с правом редактирования
+    x = next((a for a in items if a["userId"] == target), None)
+    if not x: raise RpcError("Сотрудник не включён в состав совещания", "Участники", 404, "NOT_FOUND")
+    st = p.get("status")
+    if st not in INVITE_ANSWERS:
+        raise RpcError("Ответ на приглашение: %s" % ", ".join(INVITE_ANSWERS))
+    if x["invite"] == "Не направлено":
+        raise RpcError("Приглашение не направлено — сначала отправьте его участнику")
+    note = str(p.get("note") or "").strip()[:500]
+    if st == "Требует уточнения" and len(note) < 3:
+        raise RpcError("Укажите, что требует уточнения (не менее 3 символов)")
+    was = x["invite"]
+    x["invite"] = st; x["respondedAt"] = now_ms(); x["responseNote"] = note
+    _part_hist(x, u["id"], "response", **{"from": was, "to": st, "note": note})
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Ответ на приглашение зарегистрирован",
+             "Совещание", m["id"], {"code": m["code"], "userId": target, "from": was, "to": st, "note": note,
+                                    "event": "MEETING_INVITE_RESPONSE"})
+    notify_many(db, cur, [z for z in [m.get("chair"), m.get("secretary")] if z and z != u["id"]],
+                "meeting.invite.response", "Ответ на приглашение: %s" % m["title"],
+                "%s · %s: %s%s" % (m["code"], _uname(db, cur, target), st, " · " + note if note else ""),
+                "Совещание", m["id"], dedupe_suffix="resp:%s:%d" % (target, now_ms()))
+    return m, msg("Ответ зарегистрирован: %s" % st, _uname(db, cur, target))
+
+@reg("meeting.participants.attendance")
+def h_meeting_parts_attendance(db, cur, u, p):
+    """Отметка фактического участия (MTG-05 8.3): только по факту, не по открытию карточки."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    _part_started(m)
+    items, x = part_find(m, p)
+    st = p.get("participation") or p.get("status")
+    if st not in PART_ST:
+        raise RpcError("Неизвестный статус участия: %s (допустимо: %s)" % (st, ", ".join(PART_ST)))
+    if st == x["participation"] and "comment" not in p:
+        raise RpcError("Участник уже отмечен как «%s»" % st)
+    was = x["participation"]
+    x["participation"] = st; x["participationAt"] = now_ms(); x["participationBy"] = u["id"]
+    if "comment" in p: x["comment"] = str(p["comment"] or "").strip()[:500]
+    _part_hist(x, u["id"], "attendance", **{"from": was, "to": st})
+    if m.get("actual"): m["actual"] = {}                            # снимок состава устарел — требуется перерегистрация
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Отмечено фактическое участие", "Совещание", m["id"],
+             {"code": m["code"], "userId": x["userId"], "from": was, "to": st,
+              "event": "MEETING_PARTICIPATION"})
+    return m, msg("Участие отмечено: %s" % st, _uname(db, cur, x["userId"]))
+
+@reg("meeting.participants.bulk")
+def h_meeting_parts_bulk(db, cur, u, p):
+    """Массовое изменение статуса приглашения или участия — с обязательным подтверждением (MTG-05 8.4)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    invite = p.get("invite"); part = p.get("participation")
+    if bool(invite) == bool(part):
+        raise RpcError("Укажите одно изменение: статус приглашения (invite) либо участия (participation)")
+    if invite and invite not in INVITE_ST: raise RpcError("Неизвестный статус приглашения: %s" % invite)
+    if invite == "Не направлено": raise RpcError("Массово можно направлять приглашения, а не отзывать их")
+    if invite in INVITE_ANSWERS: raise RpcError("Ответ на приглашение регистрирует сам участник (meeting.participants.respond)")
+    if part and part not in PART_ST: raise RpcError("Неизвестный статус участия: %s" % part)
+    if part: _part_started(m)
+    else:
+        meet_active(m)
+        if m.get("status") != "Запланировано":
+            raise RpcError("Приглашения направляются на запланированное совещание (сейчас: %s)" % m["status"])
+    items, picked = part_pick(m, p)
+    field = "invite" if invite else "participation"
+    new = invite or part
+    targets = [x for x in picked if x[field] != new]
+    if not targets: raise RpcError("Выбранные участники уже в статусе «%s»" % new)
+    if not p.get("confirm"):
+        raise RpcError("Массовое изменение статуса требует подтверждения: %d участн. → «%s»"
+                       % (len(targets), new), "Подтвердите операцию", 409, "NEED_CONFIRM")
+    note = str(p.get("comment") or p.get("note") or "").strip()[:500]
+    changed = []
+    for x in targets:
+        was = x[field]
+        x[field] = new
+        if field == "invite":
+            x["invitedAt"] = now_ms(); x["invitedBy"] = u["id"]; x["respondedAt"] = None
+        else:
+            x["participationAt"] = now_ms(); x["participationBy"] = u["id"]
+        if note: x["comment"] = note
+        _part_hist(x, u["id"], "bulk", **{"from": was, "to": new, "field": field, "note": note})
+        changed.append({"userId": x["userId"], "from": was, "to": new})
+    if field == "participation" and m.get("actual"): m["actual"] = {}
+    db.save_ent(cur, "meeting", m)
+    delivered = 0
+    if field == "invite":
+        delivered = notify_many(db, cur, [x["userId"] for x in changed if x["userId"] != u["id"]],
+                                "meeting.invite", "Приглашение: %s" % m["title"],
+                                "%s · %s %s" % (m["code"], _fd(m["date"]), m.get("time") or ""),
+                                "Совещание", m["id"], dedupe_suffix="invite:%d" % now_ms())
+    db.audit(cur, "BUSINESS", "warning", u["id"], "meetings", "Массовое изменение статуса участников",
+             "Совещание", m["id"], {"code": m["code"], "field": field, "to": new, "count": len(changed),
+                                    "changed": changed, "event": "MEETING_PARTICIPANTS_BULK"})
+    return {"changed": len(changed), "field": field, "to": new, "delivered": delivered, "meeting": m}, \
+        msg("Статус изменён у %d участн." % len(changed), "%s → «%s»" % ("Приглашение" if field == "invite" else "Участие", new))
+
+@reg("meeting.participants.actual")
+def h_meeting_parts_actual(db, cur, u, p):
+    """Регистрация фактического состава участников после проведения совещания (§2.7)."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    if m.get("status") not in ("Проведено", "Протокол утверждён"):
+        raise RpcError("Фактический состав регистрируется после проведения совещания (сейчас: %s)" % m["status"])
+    items = part_norm(m, u["id"])
+    pending = [a for a in items if a["required"] and a["participation"] == "Не определено"]
+    if pending:
+        raise RpcError("Не отмечено участие обязательных участников: %s"
+                       % ", ".join(_uname(db, cur, a["userId"]) for a in pending))
+    users = {x["id"]: x for x in db.users_public(cur)}
+    def row(a):
+        usr = users.get(a["userId"]) or {}
+        return {"userId": a["userId"], "name": usr.get("name", ""), "position": usr.get("position", ""),
+                "department": usr.get("department", ""), "role": a["role"], "required": a["required"],
+                "participation": a["participation"], "comment": a["comment"]}
+    counts = _part_counts(items)
+    snap = {"at": now_ms(), "by": u["id"], "note": str(p.get("note") or "").strip()[:500],
+            "total": len(items), "counts": counts,
+            "present": [row(a) for a in items if a["participation"] in PART_PRESENT],
+            "absent": [row(a) for a in items if a["participation"] == "Отсутствовал"],
+            "unknown": [row(a) for a in items if a["participation"] == "Не определено"],
+            "all": [row(a) for a in items]}
+    m["actual"] = snap
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Зарегистрирован фактический состав участников",
+             "Совещание", m["id"], {"code": m["code"], "total": snap["total"], "present": len(snap["present"]),
+                                    "absent": len(snap["absent"]), "unknown": len(snap["unknown"]),
+                                    "event": "MEETING_ACTUAL_COMPOSITION"})
+    return {"actual": snap, "meeting": m}, \
+        msg("Фактический состав зарегистрирован", "участвовали: %d · отсутствовали: %d · не определено: %d"
+            % (len(snap["present"]), len(snap["absent"]), len(snap["unknown"])))
+
+@reg("admin.user.profile")
+def h_user_profile(db, cur, u, p):
+    """Единый справочник сотрудников (§2.7, M05 §3.5): ФИО, должность, подразделение."""
+    guard(db, cur, u, "admin", "edit")
+    req(p, "id")
+    cur.execute("SELECT id,name,position,department FROM users WHERE id=%s", (p["id"],))
+    r = cur.fetchone()
+    if not r: raise RpcError("Сотрудник не найден", "Справочник", 404, "NOT_FOUND")
+    was = dict(r)
+    vals = {}
+    for k, lim in (("name", 100), ("position", 100), ("department", 100)):
+        if k in p:
+            v = str(p[k] or "").strip()[:lim]
+            if k == "name" and not v: raise RpcError("Не заполнено ФИО сотрудника")
+            vals[k] = v
+    changed = [k for k in vals if vals[k] != was.get(k)]
+    if not changed: raise RpcError("Сведения о сотруднике не изменились")
+    cur.execute("UPDATE users SET %s WHERE id=%%s" % ", ".join("%s=%%s" % k for k in vals),
+                tuple(vals[k] for k in vals) + (p["id"],))
+    db.audit(cur, "AUDIT", "info", u["id"], "admin", "Изменены сведения о сотруднике", "Пользователь", p["id"],
+             {"fields": changed, "values": vals, "event": "USER_PROFILE_UPDATED"})
+    return True, msg("Сведения о сотруднике сохранены", "Поля: %s" % ", ".join(changed))
 
 DIRECTIVE_PRIORITIES = ("Критический", "Высокий", "Средний", "Низкий")
 
@@ -3279,8 +3696,9 @@ def h_user_create(db, cur, u, p):
     colors = ["#2563eb", "#16a34a", "#ea580c", "#7c3aed", "#0891b2", "#c026d3", "#ca8a04"]
     salt, h = pass_hash(p.get("password") or "demo")
     id_ = uid("u")
-    cur.execute("INSERT INTO users(id,login,name,role,position,capacity,color,pass_salt,pass_hash) VALUES(%s,%s,%s,%s,%s,8,%s,%s,%s)",
+    cur.execute("INSERT INTO users(id,login,name,role,position,department,capacity,color,pass_salt,pass_hash) VALUES(%s,%s,%s,%s,%s,%s,8,%s,%s,%s)",
                 (id_, p["login"].strip().lower(), p["name"].strip()[:100], p["role"], p.get("position", "Инженер")[:100],
+                 (p.get("department") or "Инженерное подразделение")[:100],
                  colors[secrets.randbelow(len(colors))], salt, h))
     db.audit(cur, "SECURITY", "info", u["id"], "admin", "Создана учётная запись", "Пользователь", id_, {"login": p["login"], "role": p["role"]})
     return True, msg("Пользователь создан", "Пароль по умолчанию: demo")
@@ -3880,7 +4298,35 @@ def meeting_protocol_doc(db, cur, u, m):
                    if x.get("from") and x.get("to") else "")] for x in pl],
                 widths=[1.3, 1.5, 1.4, 2.6])
     d.h1("2. Присутствовали")
-    if att: d.list(["%s — %s" % (_uname(db, cur, a), _role_of(db, cur, a)) for a in att], numbered=True)
+    parts = part_norm(m)
+    if parts:
+        usr = {x["id"]: x for x in db.users_public(cur)}
+        d.table(["ФИО", "Должность", "Подразделение", "Роль на совещании", "Обязательность", "Приглашение", "Фактическое участие"],
+                [[(usr.get(a["userId"]) or {}).get("name", a["userId"]),
+                  (usr.get(a["userId"]) or {}).get("position", "—"),
+                  (usr.get(a["userId"]) or {}).get("department", "") or "—",
+                  a["role"], "обязательный" if a["required"] else "необязательный",
+                  a["invite"], a["participation"]] for a in parts],
+                widths=[1.5, 1.5, 1.4, 1.1, 0.9, 1.0, 1.3])
+        cnt = _part_counts(parts)
+        d.p("Всего в составе: %d чел. · участвовали: %d · отсутствовали: %d · участие не определено: %d."
+            % (len(parts), cnt["present"], cnt["participation"]["Отсутствовал"], cnt["unknown"]))
+        snap = m.get("actual") or {}
+        if snap.get("at"):
+            d.p("Фактический состав зарегистрирован %s (%s).%s"
+                % (datetime.datetime.fromtimestamp(snap["at"] / 1000).strftime("%d.%m.%Y %H:%M"),
+                   _uname(db, cur, snap.get("by")), (" " + snap["note"]) if snap.get("note") else ""))
+        absent = [a for a in parts if a["participation"] == "Отсутствовал"]
+        if absent:
+            d.p("Приглашены, но не участвовали: " + "; ".join(
+                "%s (%s)%s" % (_uname(db, cur, a["userId"]), a["role"],
+                               " — " + a["comment"] if a.get("comment") else "") for a in absent))
+        unclear = [a for a in parts if a["invite"] in ("Отклонено", "Требует уточнения")]
+        if unclear:
+            d.p("Ответы на приглашения: " + "; ".join(
+                "%s — %s%s" % (_uname(db, cur, a["userId"]), a["invite"],
+                               " (" + a["responseNote"] + ")" if a.get("responseNote") else "") for a in unclear))
+    elif att: d.list(["%s — %s" % (_uname(db, cur, a), _role_of(db, cur, a)) for a in att], numbered=True)
     else: d.p("Состав участников не зарегистрирован.")
     d.h1("3. Повестка дня")
     ag = m.get("agenda") or []
@@ -4275,6 +4721,7 @@ NOTIF_TYPES = {
     "meeting.reminder":   ("Напоминание о совещании", "calendar"),
     "event.reminder":     ("Напоминание о событии календаря", "calendar"),
     "meeting.invite":     ("Приглашение на совещание", "meetings"),
+    "meeting.invite.response": ("Ответ на приглашение", "meetings"),
     "meeting.moved":      ("Перенос совещания", "meetings"),
     "meeting.cancelled":  ("Отмена совещания", "meetings"),
     "meeting.materials":  ("Материалы к совещанию", "meetings"),
@@ -4696,9 +5143,15 @@ def log_tail(name, lines=300):
         f.seek(start)
         data = f.read()
         if start > 0 and utf16: data = head + data
+        if start > 0 and not utf16:
+            # хвост большого журнала начинается с середины строки: обрезаем до первой полной
+            # строки ДО распознавания кодировки — иначе разрезанный символ UTF-8 приводил
+            # к ложному определению cp1251/cp866 и «кракозябрам» во всём хвосте
+            nl = data.find(b"\n")
+            if nl >= 0: data = data[nl + 1:]
     text = decode_log_bytes(data)
     rows = text.splitlines()
-    if start > 0 and rows: rows = rows[1:]        # первая строка блока может быть неполной
+    if start > 0 and utf16 and rows: rows = rows[1:]   # первая строка блока может быть неполной
     return rows[-n:]
 
 class ReportList(list):
@@ -5332,7 +5785,7 @@ def main():
 
 # ================= Установка и настройка через EXE (ТЗ §7) =================
 CONFIG_PATH = os.path.join(BASE_DIR, "supip.ini")
-SCHEMA_VERSION = 5   # 2 — уведомления (v1.4.0), 3 — маршрут протокола (v1.5.0), 4 — поручения (v1.6.0), 5 — планирование совещаний (v1.10.0)
+SCHEMA_VERSION = 6   # 2 — уведомления (v1.4.0), 3 — маршрут протокола (v1.5.0), 4 — поручения (v1.6.0), 5 — планирование совещаний (v1.10.0), 6 — участники совещания и подразделение (v1.13.0)
 MIGRATIONS = {   # {версия: [SQL, ...]} — применяется по порядку при старте/обновлении
     2: [  # v1.4.0: центр уведомлений и напоминаний
         """CREATE TABLE IF NOT EXISTS notifications(
@@ -5368,6 +5821,12 @@ MIGRATIONS = {   # {версия: [SQL, ...]} — применяется по п
         "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS series_id TEXT NOT NULL DEFAULT ''",
         "CREATE INDEX IF NOT EXISTS ix_meetings_series ON meetings(series_id) WHERE series_id <> ''",
         "CREATE INDEX IF NOT EXISTS ix_meetings_date ON meetings(date)",
+    ],
+    6: [  # v1.13.0: участники совещания (ТЗ M16 §2.7, MTG-05) и подразделение в справочнике сотрудников
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS department TEXT NOT NULL DEFAULT ''",
+        "UPDATE users SET department='Инженерное подразделение' WHERE department=''",
+        "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS participants JSONB NOT NULL DEFAULT '[]'",
+        "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS actual_composition JSONB NOT NULL DEFAULT '{}'",
     ],
 }
 

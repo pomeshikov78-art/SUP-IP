@@ -2026,7 +2026,28 @@ Views.resources=function(){
     if(!uniqConf.length)return emptyBlock('Конфликтов нет','Перегрузок в горизонте 14 дней не выявлено','check');
     return '<div class="list-rows">'+uniqConf.slice(0,8).map(c=>'<div class="lr" onclick="App.resCell(\''+c.u.id+'\',\''+c.d+'\')"><span style="color:var(--err)">'+ic('alert')+'</span><div class="lt"><b>'+esc(c.u.name)+' · '+fmtD(c.d)+'</b><small>'+c.l.hours+' ч при норме '+c.l.cap+' ч · задач: '+c.l.tasks.map(t=>t.code).join(', ')+'</small></div><b style="color:var(--err)">'+c.l.pct+'%</b></div>').join('')+'</div>';})()+
   '</div></div>'+
- '</div>';
+ '</div>'+
+ '<div class="card mt14" id="res-directory"><div class="ch">'+ic('users')+'Справочник сотрудников<span class="r small mut">единый справочник: ФИО, должность, подразделение (ТЗ §2.7, M05 §3.5)</span></div><div class="cb">'+
+  '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>ФИО</th><th>Должность</th><th>Подразделение</th><th>Роль в системе</th><th>Норма, ч/день</th><th>Состояние</th>'+(can('admin','edit')?'<th>Действия</th>':'')+'</tr></thead><tbody>'+
+  DB.users.map(u=>'<tr id="res-row-'+u.id+'"><td><div class="flex">'+avatar(u,'sm')+'<b class="small">'+esc(u.name)+'</b></div></td><td class="small">'+esc(u.position||'—')+'</td><td class="small">'+esc(u.department||'—')+'</td><td class="small">'+esc(ROLES[u.role]?ROLES[u.role].name:u.role)+'</td><td class="num small">'+u.capacity+'</td><td class="small">'+(u.blocked?'заблокирован':'активен')+'</td>'+
+   (can('admin','edit')?'<td><button class="btn sm res-edit" onclick="App.userProfile(\''+u.id+'\')">'+ic('edit')+'</button></td>':'')+'</tr>').join('')+
+  '</tbody></table></div>'+
+ '</div></div>';
+};
+App.userProfile=function(uid_){
+ if(!guard('admin','edit'))return;
+ const u=U(uid_);
+ openModal(mh('Справочник сотрудников · '+u.name,'users')+'<div class="mb form">'+
+  '<div class="small mut mb8">ФИО, должность и подразделение используются в составе участников совещаний и в протоколах (ТЗ §2.7).</div>'+
+  field('ФИО',inp('ud-name',u.name),true)+
+  field('Должность',inp('ud-pos',u.position))+
+  field('Подразделение',inp('ud-dept',u.department||''))+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="ud-save" onclick="App.userProfileSave(\''+uid_+'\')">'+ic('save')+' Сохранить</button></div>');
+};
+App.userProfileSave=function(uid_){
+ if(!requireFields(['ud-name']))return;
+ rpc('admin.user.profile',{id:uid_,name:val('ud-name'),position:val('ud-pos'),department:val('ud-dept')})
+  .then(r=>{if(r){App.closeModal(true);renderView();}});
 };
 App.resExport=function(){ if(!guard('resources','export'))return;
  const days=[...Array(14)].map((_,i)=>D(i));
@@ -2904,7 +2925,13 @@ App.meetSave=function(mid){
 function meetMinutes(m){
  const dirs=DB.tasks.filter(t=>t.meetingId===m.id);
  return '<h1>ПРОТОКОЛ № '+esc(m.code.replace('СОВ-',''))+'</h1><div class="rmeta">'+esc(m.title)+' · '+esc(m.type)+' · '+fmtD(m.date)+' '+esc(m.time)+' · СУП-ИП</div>'+
- '<h2>Присутствовали</h2><p>Председатель: '+esc(U(m.chair).name)+'. Секретарь: '+esc(U(m.secretary).name)+'.<br>Участники: '+m.attendees.map(u=>esc(U(u).name)).join(', ')+'.</p>'+
+ '<h2>Присутствовали</h2><p>Председатель: '+esc(U(m.chair).name)+'. Секретарь: '+esc(U(m.secretary).name)+'.</p>'+
+ (partsOf(m).length?rptTable(['ФИО','Должность','Подразделение','Роль на совещании','Обязательность','Приглашение','Фактическое участие'],
+   partsOf(m).map(x=>{const u=U(x.userId);return [u.name,u.position||'—',u.department||'—',x.role,x.required?'обязательный':'необязательный',x.invite,x.participation];}))+
+  '<p>Всего в составе: '+partCounts(m).total+' чел. · участвовали: '+partCounts(m).present+' · отсутствовали: '+partCounts(m).absent+' · участие не определено: '+partCounts(m).unknown+'.</p>'+
+  ((m.actual||{}).at?'<p>Фактический состав зарегистрирован '+fmtDT(m.actual.at)+' ('+esc(U(m.actual.by).name)+')'+(m.actual.note?('. '+esc(m.actual.note)):'')+'.</p>':'')+
+  (partsOf(m).some(x=>x.participation==='Отсутствовал')?'<p>Приглашены, но не участвовали: '+partsOf(m).filter(x=>x.participation==='Отсутствовал').map(x=>esc(U(x.userId).name)+' ('+esc(x.role)+')'+(x.comment?(' — '+esc(x.comment)):'')).join('; ')+'.</p>':'')
+  :'<p>Состав участников не зарегистрирован.</p>')+
  '<h2>Связанные проекты и предварительные материалы</h2>'+
  (mprjOf(m).length?rptTable(['Проект','Наименование','Статус'],mprjOf(m).map(id=>{const x=P(id);return x?[x.code,x.name,x.status]:[id,'—','—'];})):'<p>Связанные проекты не зарегистрированы.</p>')+
  (matsOf(m).length?rptTable(['Материал','Вид','Примечание'],matsOf(m).map(x=>[x.name,x.kind==='doc'?'Документ M09':'Ссылка: '+x.url,x.note||'—'])):'<p>Предварительные материалы не прикреплены.</p>')+
@@ -3494,6 +3521,268 @@ function meetStatusBadge(s){
  return badge(s, s==='Запланировано'?'#2563eb':s==='Проведено'?'#d97706':s===MEET_CANC?'#dc2626':'#16a34a',
   s==='Запланировано'?'#dbeafe':s==='Проведено'?'#fef3c7':s===MEET_CANC?'#fee2e2':'#dcfce7');
 }
+/* ---------- MTG-05. Участники совещания (ТЗ §2.7, экранные требования 8.1–8.4) ---------- */
+const PART_ROLES=['Председатель','Секретарь','Докладчик','Участник','Эксперт','Наблюдатель','Контролирующее лицо'];
+const PART_FIXED=['Председатель','Секретарь'];
+const INVITE_ST=['Не направлено','Направлено','Подтверждено','Отклонено','Требует уточнения'];
+const INVITE_ANSWERS=['Подтверждено','Отклонено','Требует уточнения'];
+const PART_ST=['Не определено','Присутствовал','Отсутствовал','Подключился дистанционно','Участвовал частично'];
+const PART_PRESENT=['Присутствовал','Подключился дистанционно','Участвовал частично'];
+const PART_ACT={add:'Добавлен в состав',edit:'Изменены сведения',invite:'Приглашение направлено',
+ response:'Ответ на приглашение',attendance:'Фактическое участие',bulk:'Массовое изменение статуса',remove:'Исключён из состава'};
+function partsOf(m){
+ if(!m)return [];
+ const list=Array.isArray(m.participants)?m.participants:[], by={};
+ list.forEach(x=>{ if(x&&x.userId)by[x.userId]=x; });
+ const members=[...new Set([m.chair,m.secretary,...(m.attendees||[])].filter(Boolean))];
+ return members.map(id=>{
+  const fixed=id===m.chair?'Председатель':id===m.secretary?'Секретарь':'';
+  const x=by[id]||{};
+  return Object.assign({id:'mp_'+id,userId:id,role:fixed||'Участник',required:!!fixed,invite:'Не направлено',
+   participation:'Не определено',comment:'',history:[],invitedAt:null,respondedAt:null,participationAt:null},
+   x,{userId:id,role:fixed||(PART_ROLES.includes(x.role)&&!PART_FIXED.includes(x.role)?x.role:'Участник'),
+      required:fixed?true:!!x.required});
+ });
+}
+function partOf(m,uid){ return partsOf(m).find(x=>x.userId===uid); }
+const invBadge=s=>{const c={'Не направлено':['#64748b','#f1f5f9'],'Направлено':['#2563eb','#dbeafe'],
+ 'Подтверждено':['#16a34a','#dcfce7'],'Отклонено':['#dc2626','#fee2e2'],'Требует уточнения':['#d97706','#fef3c7']}[s]||['#64748b','#f1f5f9'];
+ return badge(s,c[0],c[1]);};
+const attBadge=s=>{const c={'Не определено':['#64748b','#f1f5f9'],'Присутствовал':['#16a34a','#dcfce7'],
+ 'Отсутствовал':['#dc2626','#fee2e2'],'Подключился дистанционно':['#0891b2','#cffafe'],
+ 'Участвовал частично':['#d97706','#fef3c7']}[s]||['#64748b','#f1f5f9'];
+ return badge(s,c[0],c[1]);};
+function partCounts(m){
+ const it=partsOf(m);
+ return {total:it.length, required:it.filter(x=>x.required).length,
+  invited:it.filter(x=>x.invite!=='Не направлено').length,
+  confirmed:it.filter(x=>x.invite==='Подтверждено').length,
+  declined:it.filter(x=>x.invite==='Отклонено').length,
+  unclear:it.filter(x=>x.invite==='Требует уточнения').length,
+  present:it.filter(x=>PART_PRESENT.includes(x.participation)).length,
+  absent:it.filter(x=>x.participation==='Отсутствовал').length,
+  unknown:it.filter(x=>x.participation==='Не определено').length};
+}
+function partHistAll(m){
+ const rows=[];
+ partsOf(m).forEach(x=>(Array.isArray(x.history)?x.history:[]).forEach(h=>rows.push(Object.assign({userId:x.userId,name:U(x.userId).name},h))));
+ return rows.sort((a,b)=>b.ts-a.ts);
+}
+function partHistText(h){
+ if(h.action==='invite'||h.action==='attendance'||h.action==='response'||h.action==='bulk')
+  return esc(h.from||'')+' → '+esc(h.to||'')+(h.note?(' · '+esc(h.note)):'');
+ return esc(h.note||'');
+}
+function partAnswerText(x){
+ if(INVITE_ANSWERS.includes(x.invite))return invBadge(x.invite)+(x.respondedAt?'<div class="small mut">'+fmtDT(x.respondedAt)+'</div>':'');
+ return x.invite==='Направлено'?'<span class="small mut">ожидается ответ</span>':'<span class="small mut">—</span>';
+}
+function meetPartsBlock(m){
+ const mid=m.id, it=partsOf(m), c=partCounts(m), snap=m.actual||{};
+ const editable=can('meetings','edit',m)&&m.status!==MEET_CANC;
+ const started=m.status!=='Запланировано'||m.date<=dISO(TODAY);
+ const conducted=m.status==='Проведено'||m.status==='Протокол утверждён';
+ const mine=partOf(m,App.user.id);
+ let h='<div class="card" id="meet-parts"><div class="ch">'+ic('users')+'Участники совещания<span class="r small mut">ТЗ §2.7 · MTG-05</span></div><div class="cb">'+
+  '<div class="stat-line"><span>Всего в составе</span><b id="mpa-n">'+c.total+'</b></div>'+
+  '<div class="stat-line"><span>Обязательных участников</span><b id="mpa-req">'+c.required+'</b></div>'+
+  '<div class="stat-line"><span>Приглашения направлены</span><b id="mpa-inv">'+c.invited+'</b></div>'+
+  '<div class="stat-line"><span>Подтвердили / отклонили / уточняют</span><b id="mpa-ans">'+c.confirmed+' / '+c.declined+' / '+c.unclear+'</b></div>'+
+  '<div class="stat-line"><span>Участвовали / отсутствовали / не определено</span><b id="mpa-att">'+c.present+' / '+c.absent+' / '+c.unknown+'</b></div>'+
+  '<div class="stat-line"><span>Фактический состав</span><b id="mpa-actual">'+(snap.at?('зарегистрирован '+fmtDT(snap.at)+' · '+esc(U(snap.by).name)):'не зарегистрирован')+'</b></div>'+
+  '<div class="flexw mt8">'+
+   (mine&&mine.invite!=='Не направлено'?'<button class="btn sm" id="mpa-my" onclick="App.partAnswer(\''+mid+'\',\''+App.user.id+'\')">'+ic('check')+' Моё участие</button>':'')+
+   '<span class="spacer"></span>'+
+   (editable?'<button class="btn sm pri" id="mpa-add" onclick="App.partAdd(\''+mid+'\')">'+ic('plus')+' Участник</button>':'')+
+   (editable&&m.status==='Запланировано'?'<button class="btn sm" id="mpa-invite" onclick="App.partInvite(\''+mid+'\')">'+ic('send')+' Пригласить</button>':'')+
+   (editable&&started?'<button class="btn sm" id="mpa-bulk" onclick="App.partBulk(\''+mid+'\')">'+ic('users')+' Массово отметить</button>':'')+
+   (editable&&conducted?'<button class="btn sm" id="mpa-actual-btn" onclick="App.partActual(\''+mid+'\')">'+ic('save')+' Зарегистрировать состав</button>':'')+
+  '</div>'+
+  (snap.at?'<div class="small mut mt8">Участвовали: '+((snap.present||[]).length)+' · отсутствовали: '+((snap.absent||[]).length)+' · не определено: '+((snap.unknown||[]).length)+(snap.note?(' · '+esc(snap.note)):'')+'</div>':'')+
+ '</div></div>';
+ h+='<div class="card mt8"><div class="cb">'+
+  (it.length?'<div class="tbl-wrap" id="mpa-table"><table class="tbl"><thead><tr><th>ФИО</th><th>Должность</th><th>Подразделение</th><th>Роль</th><th>Обязательность</th><th>Приглашение</th><th>Подтверждение участия</th><th>Фактическое участие</th><th>Комментарий</th><th>Действия</th></tr></thead><tbody>'+
+   it.map(x=>{const u=U(x.userId);
+    return '<tr id="mpa-row-'+x.userId+'"><td><div class="flex">'+avatar(u,'sm')+'<b class="small">'+esc(u.name)+'</b></div></td>'+
+     '<td class="small">'+esc(u.position||'—')+'</td>'+
+     '<td class="small">'+esc(u.department||'—')+'</td>'+
+     '<td class="small">'+esc(x.role)+(x.userId===m.chair?' <span class="chip">председатель</span>':x.userId===m.secretary?' <span class="chip">секретарь</span>':'')+'</td>'+
+     '<td class="small">'+(x.required?'обязательный':'необязательный')+'</td>'+
+     '<td>'+invBadge(x.invite)+(x.invitedAt?'<div class="small mut">'+fmtDT(x.invitedAt)+'</div>':'')+'</td>'+
+     '<td>'+partAnswerText(x)+(x.responseNote?'<div class="small mut">'+esc(x.responseNote)+'</div>':'')+'</td>'+
+     '<td>'+attBadge(x.participation)+(x.participationAt?'<div class="small mut">'+fmtDT(x.participationAt)+'</div>':'')+'</td>'+
+     '<td class="small">'+esc(x.comment||'—')+'</td>'+
+     '<td><div class="flexw">'+
+      '<button class="btn sm mpa-view" title="Карточка участника" onclick="App.partView(\''+mid+'\',\''+x.userId+'\')">'+ic('eye')+'</button>'+
+      (editable&&!PART_FIXED.includes(x.role)?'<button class="btn sm mpa-edit" title="Изменить роль и сведения" onclick="App.partEdit(\''+mid+'\',\''+x.userId+'\')">'+ic('edit')+'</button>':'')+
+      (editable&&m.status==='Запланировано'?'<button class="btn sm mpa-inv" title="Направить приглашение" onclick="App.partInvite(\''+mid+'\',\''+x.userId+'\')">'+ic('send')+'</button>':'')+
+      (editable&&x.invite!=='Не направлено'?'<button class="btn sm mpa-ans" title="Отметить ответ на приглашение" onclick="App.partAnswer(\''+mid+'\',\''+x.userId+'\')">'+ic('check')+'</button>':'')+
+      (editable&&started?'<button class="btn sm mpa-att" title="Отметить фактическое участие" onclick="App.partAttend(\''+mid+'\',\''+x.userId+'\')">'+ic('users')+'</button>':'')+
+      (editable&&!PART_FIXED.includes(x.role)&&x.participation==='Не определено'?'<button class="btn sm danger mpa-del" title="Исключить из состава" onclick="App.partDel(\''+mid+'\',\''+x.userId+'\')">'+ic('trash')+'</button>':'')+
+     '</div></td></tr>';}).join('')+
+   '</tbody></table></div>':emptyBlock('Состав участников не сформирован','Добавьте сотрудников из единого справочника','users'))+
+ '</div></div>';
+ const hist=partHistAll(m);
+ h+='<div class="card mt8" id="meet-parts-hist"><div class="ch">'+ic('journal')+'История состава участников</div><div class="cb">'+
+  (hist.length?'<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Когда</th><th>Кто</th><th>Участник</th><th>Действие</th><th>Подробности</th></tr></thead><tbody>'+
+   hist.slice(0,60).map(x=>'<tr><td class="nowrap small">'+fmtDT(x.ts)+'</td><td class="small">'+esc(U(x.by).name)+'</td><td class="small">'+esc(x.name)+'</td><td class="small">'+esc(PART_ACT[x.action]||x.action)+'</td><td class="small">'+partHistText(x)+'</td></tr>').join('')+
+   '</tbody></table></div>':emptyBlock('Изменений состава не было','Добавление, приглашения, ответы и отметки участия фиксируются здесь','journal'))+
+ '</div></div>';
+ return h;
+}
+App.partAdd=function(mid){
+ const m=MEET(mid); if(!guard('meetings','edit',m))return;
+ const inList=partsOf(m).map(x=>x.userId);
+ const free=DB.users.filter(u=>!inList.includes(u.id)&&!u.blocked);
+ if(!free.length){toast('warn','Все сотрудники уже в составе','Свободных сотрудников в справочнике нет');return;}
+ openModal(mh('Добавление участников','users')+'<div class="mb form">'+
+  '<div class="small mut mb8">Участники выбираются из единого справочника сотрудников: ФИО, должность и подразделение подставляются автоматически (ТЗ §2.7).</div>'+
+  field('Сотрудники','<div class="flexw" style="border:1.5px solid var(--line2);border-radius:8px;padding:9px 11px;max-height:190px;overflow:auto">'+
+   free.map(u=>'<label class="checkline"><input type="checkbox" class="pa-user" value="'+u.id+'" onchange="App.markDirty()">'+esc(u.name)+' · '+esc(u.position)+' · '+esc(u.department||'—')+'</label>').join('')+'</div>',true)+
+  '<div class="row">'+field('Роль на совещании',sel('pa-role',PART_ROLES.filter(r=>!PART_FIXED.includes(r)).map(r=>[r,r]),'Участник'))+
+   field('Обязательность','<label class="checkline"><input type="checkbox" id="pa-req" onchange="App.markDirty()"> Обязательный участник</label>')+'</div>'+
+  field('Комментарий',ta('pa-comment','',2))+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="pa-save" onclick="App.partAddSave(\''+mid+'\')">'+ic('save')+' Добавить</button></div>');
+};
+App.partAddSave=function(mid){
+ const ids=[...document.querySelectorAll('.pa-user:checked')].map(x=>x.value);
+ if(!ids.length){toast('warn','Выберите сотрудников','Отметьте хотя бы одного сотрудника из справочника');return;}
+ const req=document.getElementById('pa-req');
+ rpc('meeting.participants.add',{id:mid,userIds:ids,role:val('pa-role'),required:!!(req&&req.checked),comment:val('pa-comment')})
+  .then(r=>{if(r){App.closeModal(true);App.f.meetTab='part';openMeeting(mid);}});
+};
+App.partEdit=function(mid,uid){
+ const m=MEET(mid), x=partOf(m,uid); if(!x||!guard('meetings','edit',m))return;
+ openModal(mh('Участник: '+U(uid).name,'edit')+'<div class="mb form">'+
+  '<div class="small mut mb8">'+esc(U(uid).position)+' · '+esc(U(uid).department||'—')+' · сведения берутся из справочника сотрудников.</div>'+
+  field('Роль на совещании',sel('pe-role',PART_ROLES.filter(r=>!PART_FIXED.includes(r)).map(r=>[r,r]),x.role))+
+  '<label class="checkline"><input type="checkbox" id="pe-req" '+(x.required?'checked':'')+' onchange="App.markDirty()"> Обязательный участник</label>'+
+  field('Комментарий',ta('pe-comment',x.comment,2))+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="pe-save" onclick="App.partEditSave(\''+mid+'\',\''+uid+'\')">'+ic('save')+' Сохранить</button></div>');
+};
+App.partEditSave=function(mid,uid){
+ const req=document.getElementById('pe-req');
+ rpc('meeting.participants.update',{id:mid,userId:uid,role:val('pe-role'),required:!!(req&&req.checked),comment:val('pe-comment')})
+  .then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.partInvite=function(mid,uid){
+ const m=MEET(mid); if(!guard('meetings','edit',m))return;
+ const it=partsOf(m);
+ openModal(mh('Приглашение участникам','send')+'<div class="mb form">'+
+  '<div class="small mut mb8">Приглашение направляется во внутренний центр уведомлений (автономная ЛВС, ТЗ §8.3). Статус участника меняется на «Направлено» (MTG-05 8.2).</div>'+
+  field('Кому направить','<div class="flexw" style="border:1.5px solid var(--line2);border-radius:8px;padding:9px 11px;max-height:190px;overflow:auto">'+
+   it.map(x=>'<label class="checkline"><input type="checkbox" class="pi-chk" value="'+x.userId+'" '+((uid?x.userId===uid:x.invite==='Не направлено')?'checked':'')+' onchange="App.markDirty()">'+esc(U(x.userId).name)+' · '+esc(x.role)+' · '+esc(x.invite)+'</label>').join('')+'</div>',true)+
+  field('Примечание к приглашению',ta('pi-note','',2))+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="pi-save" onclick="App.partInviteSave(\''+mid+'\')">'+ic('send')+' Направить</button></div>');
+};
+App.partInviteSave=function(mid){
+ const ids=[...document.querySelectorAll('.pi-chk:checked')].map(x=>x.value);
+ if(!ids.length){toast('warn','Выберите участников','Отметьте хотя бы одного участника');return;}
+ rpc('meeting.participants.invite',{id:mid,userIds:ids,note:val('pi-note')})
+  .then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.partAnswer=function(mid,uid){
+ const m=MEET(mid), x=partOf(m,uid); if(!x)return;
+ if(uid!==App.user.id&&!guard('meetings','edit',m))return;
+ openModal(mh('Ответ на приглашение · '+U(uid).name,'check')+'<div class="mb form">'+
+  '<div class="flexw mb8">'+invBadge(x.invite)+'</div>'+
+  '<div class="small mut mb8">Подтверждение участия регистрирует сам участник; секретарь может отметить ответ за него (MTG-05 8.2). Фактическое участие отмечается отдельно, после проведения совещания.</div>'+
+  field('Ответ',sel('pr-st',INVITE_ANSWERS.map(s=>[s,s]),INVITE_ANSWERS.includes(x.invite)?x.invite:'Подтверждено'),true)+
+  field('Пояснение',ta('pr-note',x.responseNote||'',2),'','Обязательно для ответа «Требует уточнения»')+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="pr-save" onclick="App.partAnswerSave(\''+mid+'\',\''+uid+'\')">'+ic('save')+' Зарегистрировать ответ</button></div>');
+};
+App.partAnswerSave=function(mid,uid){
+ rpc('meeting.participants.respond',{id:mid,userId:uid,status:val('pr-st'),note:val('pr-note')})
+  .then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.partAttend=function(mid,uid){
+ const m=MEET(mid), x=partOf(m,uid); if(!x||!guard('meetings','edit',m))return;
+ openModal(mh('Фактическое участие · '+U(uid).name,'users')+'<div class="mb form">'+
+  '<div class="flexw mb8">'+attBadge(x.participation)+'</div>'+
+  '<div class="small mut mb8">Фактический состав регистрируется после проведения совещания (§2.7). Открытие карточки совещания не считается присутствием (MTG-05 8.3).</div>'+
+  field('Фактическое участие',sel('pt-st',PART_ST.map(s=>[s,s]),x.participation),true)+
+  field('Комментарий',ta('pt-comment',x.comment||'',2))+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="pt-save" onclick="App.partAttendSave(\''+mid+'\',\''+uid+'\')">'+ic('save')+' Отметить</button></div>');
+};
+App.partAttendSave=function(mid,uid){
+ rpc('meeting.participants.attendance',{id:mid,userId:uid,participation:val('pt-st'),comment:val('pt-comment')})
+  .then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.partBulk=function(mid){
+ const m=MEET(mid); if(!guard('meetings','edit',m))return;
+ const it=partsOf(m), conducted=m.status==='Проведено'||m.status==='Протокол утверждён'||m.date<=dISO(TODAY);
+ openModal(mh('Массовое изменение статуса участников','users')+'<div class="mb form">'+
+  '<div class="small mut mb8">Массовые операции требуют подтверждения (MTG-05 8.4). Ответы на приглашения регистрирует сам участник.</div>'+
+  field('Что изменить',sel('pb-kind',[['participation','Фактическое участие'],['invite','Статус приглашения']],conducted?'participation':'invite','onchange="App.partBulkKind()"'))+
+  '<div id="pb-st-box"></div>'+
+  field('Участники','<div class="flexw" style="border:1.5px solid var(--line2);border-radius:8px;padding:9px 11px;max-height:190px;overflow:auto">'+
+   it.map(x=>'<label class="checkline"><input type="checkbox" class="pb-chk" value="'+x.userId+'" checked onchange="App.markDirty()">'+esc(U(x.userId).name)+' · '+esc(x.role)+(x.required?' · обязательный':'')+'</label>').join('')+'</div>')+
+  field('Комментарий',ta('pb-comment','',2))+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="pb-save" onclick="App.partBulkSave(\''+mid+'\')">'+ic('save')+' Изменить статус</button></div>');
+ App.partBulkKind();
+};
+App.partBulkKind=function(){
+ const box=document.getElementById('pb-st-box'); if(!box)return;
+ const k=val('pb-kind');
+ box.innerHTML=field('Новый статус',sel('pb-st',(k==='invite'?['Направлено']:PART_ST).map(s=>[s,s]),k==='invite'?'Направлено':'Присутствовал'));
+ App.markDirty();
+};
+App.partBulkSave=function(mid,confirmed){
+ const ids=[...document.querySelectorAll('.pb-chk:checked')].map(x=>x.value);
+ if(!ids.length){toast('warn','Выберите участников','Отметьте хотя бы одного участника');return;}
+ const payload={id:mid,userIds:ids,comment:val('pb-comment')};
+ payload[val('pb-kind')]=val('pb-st');
+ if(confirmed)payload.confirm=true;
+ rpc('meeting.participants.bulk',payload).then(r=>{
+  if(r){App.closeModal(true);openMeeting(mid);return;}
+  const e=App.lastRpcError||{};
+  if(e.code==='NEED_CONFIRM'&&!confirmed&&confirm(e.message+'\n\nПодтверждаете массовое изменение статуса?'))
+   App.partBulkSave(mid,true);
+ });
+};
+App.partActual=function(mid){
+ const m=MEET(mid); if(!guard('meetings','edit',m))return;
+ const c=partCounts(m), snap=m.actual||{};
+ openModal(mh('Регистрация фактического состава','save')+'<div class="mb form">'+
+  '<div class="small mut mb8">Фактический состав участников фиксируется после проведения совещания и попадает в протокол (§2.7). У обязательных участников участие должно быть отмечено.</div>'+
+  '<div class="stat-line"><span>Участвовали</span><b>'+c.present+'</b></div>'+
+  '<div class="stat-line"><span>Отсутствовали</span><b>'+c.absent+'</b></div>'+
+  '<div class="stat-line"><span>Участие не определено</span><b>'+c.unknown+'</b></div>'+
+  (snap.at?'<div class="small mut mt8">Предыдущая регистрация: '+fmtDT(snap.at)+' · '+esc(U(snap.by).name)+'</div>':'')+
+  field('Примечание',ta('pac-note',snap.note||'',2))+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" id="pac-save" onclick="App.partActualSave(\''+mid+'\')">'+ic('save')+' Зарегистрировать</button></div>');
+};
+App.partActualSave=function(mid){
+ rpc('meeting.participants.actual',{id:mid,note:val('pac-note')}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.partDel=function(mid,uid){
+ const m=MEET(mid); if(!guard('meetings','edit',m))return;
+ if(!confirm('Исключить '+U(uid).name+' из состава участников совещания?'))return;
+ rpc('meeting.participants.remove',{id:mid,userId:uid}).then(r=>{if(r)openMeeting(mid);});
+};
+App.partView=function(mid,uid){
+ const m=MEET(mid), x=partOf(m,uid); if(!x)return;
+ const u=U(uid), hist=Array.isArray(x.history)?x.history:[];
+ const editable=can('meetings','edit',m)&&m.status!==MEET_CANC;
+ openModal(mh('Участник совещания · '+m.code,'users')+'<div class="mb" id="mpa-card">'+
+  '<div class="flex mb8">'+avatar(u)+'<div><b>'+esc(u.name)+'</b><div class="small mut">'+esc(u.position)+' · '+esc(u.department||'—')+'</div></div></div>'+
+  '<div class="flexw mb8">'+invBadge(x.invite)+attBadge(x.participation)+'<span class="chip">'+esc(x.role)+'</span>'+(x.required?'<span class="chip">обязательный</span>':'')+'</div>'+
+  '<div class="stat-line"><span>Роль на совещании</span><b>'+esc(x.role)+'</b></div>'+
+  '<div class="stat-line"><span>Обязательность участия</span><b>'+(x.required?'обязательный':'необязательный')+'</b></div>'+
+  '<div class="stat-line"><span>Приглашение</span><b>'+(x.invitedAt?(fmtDT(x.invitedAt)+' · '+esc(U(x.invitedBy).name)):'не направлялось')+'</b></div>'+
+  '<div class="stat-line"><span>Ответ на приглашение</span><b>'+(x.respondedAt?(fmtDT(x.respondedAt)+(x.responseNote?(' · '+esc(x.responseNote)):'')):'—')+'</b></div>'+
+  '<div class="stat-line"><span>Фактическое участие</span><b>'+(x.participationAt?(esc(x.participation)+' · '+fmtDT(x.participationAt)+' · '+esc(U(x.participationBy).name)):esc(x.participation))+'</b></div>'+
+  '<div class="stat-line"><span>Комментарий</span><b>'+esc(x.comment||'—')+'</b></div>'+
+  '<h4 style="margin:14px 0 8px">История участника</h4>'+
+  (hist.length?'<div class="tbl-wrap" id="mpa-hist"><table class="tbl"><thead><tr><th>Когда</th><th>Кто</th><th>Действие</th><th>Подробности</th></tr></thead><tbody>'+
+   hist.slice().reverse().map(z=>'<tr><td class="nowrap small">'+fmtDT(z.ts)+'</td><td class="small">'+esc(U(z.by).name)+'</td><td class="small">'+esc(PART_ACT[z.action]||z.action)+'</td><td class="small">'+partHistText(z)+'</td></tr>').join('')+
+   '</tbody></table></div>':'<div class="small mut">Изменений не было.</div>')+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Закрыть</button>'+
+  (editable&&x.invite!=='Не направлено'?'<button class="btn" id="mpa-card-ans" onclick="App.partAnswer(\''+mid+'\',\''+uid+'\')">'+ic('check')+' Ответ</button>':'')+
+  (editable?'<button class="btn" id="mpa-card-att" onclick="App.partAttend(\''+mid+'\',\''+uid+'\')">'+ic('users')+' Участие</button>':'')+
+  (editable&&!PART_FIXED.includes(x.role)?'<button class="btn pri" id="mpa-card-edit" onclick="App.partEdit(\''+mid+'\',\''+uid+'\')">'+ic('edit')+' Изменить</button>':'')+
+  '</div>');
+};
 /* ---------- MTG-06. Повестка совещания (ТЗ §2.6, экранные требования 9.1–9.4) ---------- */
 const AGENDA_ST=['Подготовлен','Включён в повестку','Рассматривается','Рассмотрен','Перенесён','Снят с рассмотрения'];
 const AGENDA_OPEN=['Подготовлен','Включён в повестку','Рассматривается'];
@@ -3969,6 +4258,7 @@ function openMeeting(mid){
   '<h4 style="margin:14px 0 8px">Участники ('+m.attendees.length+')</h4>'+
   '<div class="list-rows">'+m.attendees.map(u=>'<div class="lr" style="cursor:default">'+avatar(U(u))+'<div class="lt"><b>'+esc(U(u).name)+'</b><small>'+esc(U(u).position)+'</small></div>'+(u===m.chair?'<span class="chip">председатель</span>':u===m.secretary?'<span class="chip">секретарь</span>':'')+'</div>').join('')+'</div>';
  }
+ if(tab==='part'){ body=meetPartsBlock(m); }
  if(tab==='plan'){ body=meetPlanBlock(m); }
  if(tab==='agenda'){ body=meetAgendaBlock(m); }
  if(tab==='dec'){
@@ -3998,7 +4288,7 @@ function openMeeting(mid){
   protBlock(m)+
   '<div class="card"><div class="cb report-doc">'+meetMinutes(m)+'</div></div>';
  }
- const tabs=[['info','Информация'],['plan','Планирование'],['agenda','Повестка ('+m.agenda.length+')'],['dec','Решения ('+m.decisions.length+')'],['dir','Поручения ('+dirs.length+')'],['prot','Протокол'+(protOf(m).version?' (ред. '+protOf(m).version+')':'')]];
+ const tabs=[['info','Информация'],['part','Участники ('+partsOf(m).length+')'],['plan','Планирование'],['agenda','Повестка ('+m.agenda.length+')'],['dec','Решения ('+m.decisions.length+')'],['dir','Поручения ('+dirs.length+')'],['prot','Протокол'+(protOf(m).version?' (ред. '+protOf(m).version+')':'')]];
  openDrawer(dh(m.code+' · '+m.type,m.title,meetStatusBadge(m.status)+' <span class="chip">'+fmtD(m.date)+' '+esc(m.time)+'</span>'+prBadge(protOf(m).status))+
  '<div class="db"><div class="tabs">'+tabs.map(([k,n])=>'<button id="mt-tab-'+k+'" class="'+(tab===k?'on':'')+'" onclick="App.f.meetTab=\''+k+'\';openMeeting(\''+mid+'\')">'+n+'</button>').join('')+'</div>'+body+'</div>'+
  '<div class="df">'+

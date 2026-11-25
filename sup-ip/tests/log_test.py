@@ -55,6 +55,32 @@ def main():
     c, j, _ = adm.login("admin")
     check("вход администратора", c == 200 and j.get("ok"), c)
 
+    print("== Чтение хвоста большого журнала (кодировки) ==")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("supip_log_test", SERVER)
+    srv = importlib.util.module_from_spec(spec); spec.loader.exec_module(srv)
+    with tempfile.TemporaryDirectory() as td:
+        was = srv.LOG_DIR
+        srv.LOG_DIR = td
+        try:
+            big = os.path.join(td, "supip.log")
+            line = "2026-11-25 10:00:00 WARNING [supip] ВХОД отклонён: неверный пароль (проверка кодировки)\n"
+            with open(big, "w", encoding="utf-8") as f:
+                for i in range(9000): f.write(line)          # > 512 КиБ: хвост читается с середины файла
+            rows = srv.log_tail("supip.log", 50)
+            check("хвост большого журнала читается в UTF-8", len(rows) == 50 and all("ВХОД отклонён" in x for x in rows),
+                  rows[-1][:120] if rows else None)
+            check("в хвосте нет «кракозябр»", not any("╨" in x or "┬" in x for x in rows))
+            u16 = os.path.join(td, "installer.log")
+            with open(u16, "wb") as f:
+                f.write(b"\xff\xfe")
+                for i in range(9000): f.write(line.encode("utf-16-le"))
+            rows = srv.log_tail("installer.log", 40)
+            check("хвост большого журнала UTF-16LE читается верно",
+                  len(rows) == 40 and all("ВХОД отклонён" in x for x in rows), rows[-1][:120] if rows else None)
+        finally:
+            srv.LOG_DIR = was
+
     print("== Журнал работы сервера ==")
     r = adm.logs()
     files = [f["name"] for f in r.get("files", [])]

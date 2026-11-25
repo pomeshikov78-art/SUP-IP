@@ -395,6 +395,166 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
  await page.evaluate(()=>{App.f.mt={tab:'next'};renderView();});
  await sleep(300);
 
+ console.log('== M16 §2.7 / MTG-05: участники совещания ==');
+ const ptToday = new Date().toISOString().slice(0,10);
+ const ptDate = off => new Date(Date.now()+off*864e5).toISOString().slice(0,10);
+ const ptRes = await rpcAs(admCookie,'meeting.create',{title:'E2E участники MTG-05',type:'Техническое',
+  date:ptToday,time:'12:00',chair:'u2',secretary:'u3',attendees:['u2','u3','u5']});
+ const ptMid = (ptRes.result||{}).id;
+ ok('совещание для участников создано', !!ptMid);
+ await page.evaluate(()=>pollState());
+ await sleep(400);
+ await page.evaluate(m=>{App.f.meetTab='part';openMeeting(m);},ptMid);
+ await sleep(450);
+ ok('карточка: вкладка «Участники»', (await page.$('#mt-tab-part'))!==null && (await page.$('#meet-parts'))!==null);
+ ok('председатель и секретарь в составе', (await txtOf('#mpa-n'))==='3' && (await txtOf('#mpa-req'))==='2');
+ ok('приглашения при создании направлены', (await txtOf('#mpa-inv'))==='3');
+ ok('таблица MTG-05 8.1: подразделение и подтверждение', (await page.$$('#mpa-table tbody tr')).length===3 &&
+    (await page.$eval('#mpa-table thead',e=>e.textContent)).includes('Подразделение') &&
+    (await page.$eval('#mpa-table thead',e=>e.textContent)).includes('Подтверждение участия'));
+ ok('фактическое участие изначально не определено', (await drawerTxt()).includes('Не определено') && (await txtOf('#mpa-actual')).includes('не зарегистрирован'));
+ ok('история состава участников на экране', await page.$('#meet-parts-hist')!==null);
+
+ // добавление участника из справочника
+ await page.evaluate(()=>document.getElementById('mpa-add').click());
+ await sleep(350);
+ ok('форма выбора из справочника сотрудников', (await page.$$('.pa-user')).length>0 && (await page.$('#pa-role'))!==null);
+ ok('в форме видны должность и подразделение', (await modalTxt()).includes('Расчётная группа'));
+ await page.evaluate(()=>{
+  document.querySelector('.pa-user[value="u6"]').checked=true;
+  document.getElementById('pa-role').value='Докладчик';
+  document.getElementById('pa-req').checked=true;
+  document.getElementById('pa-comment').value='Доклад по бюджету радиолинии';
+ });
+ await page.evaluate(()=>document.getElementById('pa-save').click());
+ await sleep(900);
+ ok('участник добавлен в состав', (await txtOf('#mpa-n'))==='4' && (await page.$('#mpa-row-u6'))!==null);
+ ok('роль и обязательность сохранены', (await page.$eval('#mpa-row-u6',e=>e.textContent)).includes('Докладчик') &&
+    (await page.$eval('#mpa-row-u6',e=>e.textContent)).includes('обязательный'));
+ ok('добавленному приглашение не направлено', (await txtOf('#mpa-inv'))==='3');
+
+ // направление приглашения и ответ участника
+ await page.evaluate(()=>document.querySelector('#mpa-row-u6 .mpa-inv').click());
+ await sleep(350);
+ ok('окно приглашения', (await page.$('#pi-note'))!==null && (await page.$$('.pi-chk')).length===4);
+ await page.evaluate(()=>{document.getElementById('pi-note').value='Подготовьте расчёт к совещанию';});
+ await page.evaluate(()=>document.getElementById('pi-save').click());
+ await sleep(900);
+ ok('приглашение направлено', (await txtOf('#mpa-inv'))==='4' && (await page.$eval('#mpa-row-u6',e=>e.textContent)).includes('Направлено'));
+ await page.evaluate(()=>document.querySelector('#mpa-row-u6 .mpa-ans').click());
+ await sleep(350);
+ ok('окно ответа на приглашение', (await page.$('#pr-st'))!==null && (await modalTxt()).includes('Подтверждение участия'));
+ await page.evaluate(()=>{document.getElementById('pr-st').value='Подтверждено';document.getElementById('pr-note').value='Буду лично';});
+ await page.evaluate(()=>document.getElementById('pr-save').click());
+ await sleep(900);
+ ok('ответ участника зарегистрирован', (await txtOf('#mpa-ans')).startsWith('1 /') && (await page.$eval('#mpa-row-u6',e=>e.textContent)).includes('Подтверждено'));
+ ok('свой ответ доступен участнику', await page.$('#mpa-my')!==null);
+ await page.evaluate(()=>document.getElementById('mpa-my').click());
+ await sleep(300);
+ await page.evaluate(()=>{document.getElementById('pr-st').value='Требует уточнения';document.getElementById('pr-note').value='Уточните время начала';});
+ await page.evaluate(()=>document.getElementById('pr-save').click());
+ await sleep(900);
+ ok('ответ «Требует уточнения» зарегистрирован', (await txtOf('#mpa-ans')).endsWith('/ 1'));
+
+ // изменение роли и сведений
+ await page.evaluate(()=>document.querySelector('#mpa-row-u6 .mpa-edit').click());
+ await sleep(300);
+ ok('окно изменения сведений участника', (await page.$('#pe-role'))!==null && (await page.$('#pe-req'))!==null);
+ await page.evaluate(()=>{document.getElementById('pe-role').value='Эксперт';});
+ await page.evaluate(()=>document.getElementById('pe-save').click());
+ await sleep(900);
+ ok('роль участника изменена', (await page.$eval('#mpa-row-u6',e=>e.textContent)).includes('Эксперт'));
+
+ // до даты совещания участие не отмечается
+ const ptFutRes = await rpcAs(admCookie,'meeting.create',{title:'E2E будущее совещание',type:'Оперативное',
+  date:ptDate(6),time:'09:00',chair:'u2',secretary:'u3',attendees:['u2','u3']});
+ const ptFut = (ptFutRes.result||{}).id;
+ await page.evaluate(()=>pollState());
+ await sleep(350);
+ await page.evaluate(m=>{App.f.meetTab='part';openMeeting(m);},ptFut);
+ await sleep(400);
+ ok('до даты совещания отметки участия недоступны', (await page.$$('.mpa-att')).length===0 && (await page.$('#mpa-actual-btn'))===null);
+
+ // фактическое участие после проведения
+ await rpcAs(admCookie,'meeting.conduct',{id:ptMid});
+ await page.evaluate(()=>pollState());
+ await sleep(400);
+ await page.evaluate(m=>{App.f.meetTab='part';openMeeting(m);},ptMid);
+ await sleep(450);
+ ok('проведение не отмечает присутствие автоматически', (await txtOf('#mpa-att')).endsWith('/ 4'), await txtOf('#mpa-att'));
+ for(const [uid_,st] of [['u2','Присутствовал'],['u3','Подключился дистанционно'],['u5','Отсутствовал'],['u6','Участвовал частично']]){
+  await page.evaluate(u=>document.querySelector('#mpa-row-'+u+' .mpa-att').click(),uid_);
+  await sleep(300);
+  await page.evaluate(s=>{document.getElementById('pt-st').value=s;},st);
+  await page.evaluate(()=>document.getElementById('pt-save').click());
+  await sleep(800);
+ }
+ ok('фактическое участие отмечено по всем участникам', (await txtOf('#mpa-att'))==='3 / 1 / 0', await txtOf('#mpa-att'));
+ ok('дистанционное и частичное участие отображаются', (await drawerTxt()).includes('Подключился дистанционно') && (await drawerTxt()).includes('Участвовал частично'));
+
+ // массовая операция с подтверждением
+ const dlgPt = d=>{ d.accept().catch(()=>{}); };
+ await page.evaluate(()=>document.getElementById('mpa-bulk').click());
+ await sleep(350);
+ ok('окно массовой операции', (await page.$('#pb-kind'))!==null && (await page.$$('.pb-chk')).length===4);
+ await page.evaluate(()=>{
+  document.getElementById('pb-kind').value='participation'; App.partBulkKind();
+  document.getElementById('pb-st').value='Присутствовал';
+  document.querySelectorAll('.pb-chk').forEach(x=>{x.checked=(x.value==='u5');});
+  document.getElementById('pb-comment').value='Вернулся с объекта';
+ });
+ page.on('dialog',dlgPt);
+ await page.evaluate(()=>document.getElementById('pb-save').click());
+ await sleep(1400);
+ page.off('dialog',dlgPt);
+ ok('массовая операция выполнена после подтверждения', (await txtOf('#mpa-att'))==='4 / 0 / 0', await txtOf('#mpa-att'));
+ ok('комментарий массовой операции применён', (await page.$eval('#mpa-row-u5',e=>e.textContent)).includes('Вернулся с объекта'));
+
+ // регистрация фактического состава
+ await page.evaluate(()=>document.getElementById('mpa-actual-btn').click());
+ await sleep(350);
+ ok('окно регистрации фактического состава', (await page.$('#pac-note'))!==null && (await modalTxt()).includes('Участвовали'));
+ await page.evaluate(()=>{document.getElementById('pac-note').value='Состав зафиксирован секретарём';});
+ await page.evaluate(()=>document.getElementById('pac-save').click());
+ await sleep(1000);
+ ok('фактический состав зарегистрирован', (await txtOf('#mpa-actual')).includes('зарегистрирован'), await txtOf('#mpa-actual'));
+
+ // карточка участника и исключение из состава
+ await page.evaluate(()=>document.querySelector('#mpa-row-u6 .mpa-view').click());
+ await sleep(350);
+ ok('карточка участника с историей', (await page.$('#mpa-card'))!==null && (await page.$('#mpa-hist'))!==null);
+ ok('в карточке видны приглашение и участие', (await modalTxt()).includes('Ответ на приглашение') && (await modalTxt()).includes('Фактическое участие'));
+ await page.evaluate(()=>App.closeModal(true));
+ await sleep(250);
+ await page.evaluate(m=>App.partAdd(m),ptMid);
+ await sleep(300);
+ await page.evaluate(()=>{document.querySelector('.pa-user[value="u4"]').checked=true;});
+ await page.evaluate(()=>document.getElementById('pa-save').click());
+ await sleep(900);
+ ok('ещё один участник добавлен', (await txtOf('#mpa-n'))==='5');
+ page.on('dialog',dlgPt);
+ await page.evaluate(()=>document.querySelector('#mpa-row-u4 .mpa-del').click());
+ await sleep(1000);
+ page.off('dialog',dlgPt);
+ ok('участник без отметки исключён из состава', (await txtOf('#mpa-n'))==='4');
+ ok('у председателя и секретаря нет кнопки исключения', (await page.$('#mpa-row-u2 .mpa-del'))===null && (await page.$('#mpa-row-u3 .mpa-del'))===null);
+ ok('история состава заполнена', (await page.$$eval('#meet-parts-hist tbody tr',rs=>rs.length))>5);
+
+ // протокол с фактическим составом
+ await page.evaluate(m=>{App.f.meetTab='prot';openMeeting(m);},ptMid);
+ await sleep(500);
+ const ptProt = await drawerTxt();
+ ok('протокол: состав с подразделением и ролями', ptProt.includes('Присутствовали') && ptProt.includes('Подразделение') && ptProt.includes('Роль на совещании'));
+ ok('протокол: регистрация фактического состава', ptProt.includes('Фактический состав зарегистрирован'));
+
+ // справочник сотрудников в M05
+ await page.evaluate(()=>{App.closeDrawer();nav('resources');});
+ await sleep(450);
+ ok('M05: справочник сотрудников с подразделением', (await page.$('#res-directory'))!==null &&
+    (await page.$eval('#res-directory',e=>e.textContent)).includes('Расчётная группа'));
+ await page.evaluate(()=>{App.f.mt={tab:'next'};nav('meetings');});
+ await sleep(300);
+
  console.log('== M16 §2.6 / MTG-06: формирование повестки ==');
  const agToday = new Date().toISOString().slice(0,10);
  const agDate = off => new Date(Date.now()+off*864e5).toISOString().slice(0,10);
@@ -1050,6 +1210,18 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
  await sleep(400);
  ok('журнал клиента (буфер браузера)', (await page.evaluate(()=>document.getElementById('modal-root').textContent)).includes('Журнал клиента'));
  await page.evaluate(()=>App.closeModal(true));
+
+ console.log('== M05: правка справочника сотрудников администратором ==');
+ await page.evaluate(()=>nav('resources'));
+ await sleep(450);
+ ok('администратору доступна правка справочника', (await page.$$('.res-edit')).length>0);
+ await page.evaluate(()=>document.querySelector('#res-row-u7 .res-edit').click());
+ await sleep(300);
+ ok('форма справочника: ФИО, должность, подразделение', (await page.$('#ud-name'))!==null && (await page.$('#ud-pos'))!==null && (await page.$('#ud-dept'))!==null);
+ await page.evaluate(()=>{document.getElementById('ud-dept').value='Группа испытаний и измерений';});
+ await page.evaluate(()=>document.getElementById('ud-save').click());
+ await sleep(900);
+ ok('подразделение сотрудника сохранено', (await page.$eval('#res-row-u7',e=>e.textContent)).includes('Группа испытаний и измерений'));
 
  console.log('== Сессия и выход ==');
  await page.evaluate(()=>App.logout());

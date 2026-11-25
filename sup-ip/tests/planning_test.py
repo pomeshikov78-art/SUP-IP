@@ -448,8 +448,8 @@ def main():
     check("после восстановления расписание сохранено", sm and sm[0]["recurrence"]["freq"] in ("none", "daily"), sm[:1])
     check("после восстановления история сохранена", sm and isinstance(sm[0]["planLog"], list) and len(sm[0]["planLog"]) > 0)
     src = open(SERVER, encoding="utf-8").read()
-    check("схема БД обновлена до версии 5", "SCHEMA_VERSION = 5" in src)
-    check("миграция 4→5 добавляет поля планирования", "ADD COLUMN IF NOT EXISTS materials" in src and "ADD COLUMN IF NOT EXISTS series_id" in src)
+    check("схема БД не ниже версии 5 (планирование §2.5)", srv.SCHEMA_VERSION >= 5, srv.SCHEMA_VERSION)
+    check("миграция 5 добавляет поля планирования", "ADD COLUMN IF NOT EXISTS materials" in src and "ADD COLUMN IF NOT EXISTS series_id" in src)
 
     adm.rpc("admin.reset")
     print("\nИТОГ: %d ok, %d FAIL" % (ok, fail))
