@@ -13,10 +13,14 @@
   F. журнал установщика: единая кодировка UTF-16LE, полный вывод команд без обрезки;
   G. выбор источника PostgreSQL: офлайн-пакет имеет приоритет, радиокнопки не смешиваются;
   H. контроль целостности загруженного файла PostgreSQL по фактическому размеру;
-  I. сведения об ОС и версия в журнале, сборка установщика (makensis, ключ --nsis).
+  I. сведения об ОС и версия в журнале, сборка установщика (makensis, ключ --nsis);
+  K. обновление поверх установленной версии: служба уже существует (1073) — перенастройка
+     и запуск вместо отказа; коды возврата --health и мастера не скрывают неподнятый сервер;
+  L. журнал установки не смешивает кодировки: новый файл UTF-16LE на каждый запуск;
+  M. чтение журналов UTF-16LE/UTF-8/ANSI в M14 и при выгрузке по HTTP.
 Только стандартная библиотека Python.
 """
-import argparse, http.cookiejar, importlib.util, json, os, re, shutil, socket, subprocess, sys, tempfile, time
+import argparse, contextlib, http.cookiejar, importlib.util, io, json, os, re, shutil, socket, subprocess, sys, tempfile, time
 import urllib.error, urllib.request
 
 BASE = "http://127.0.0.1:8000"
@@ -200,7 +204,9 @@ def main():
     check("записи журнала в UTF-16LE", 'FileWriteUTF16LE $LogFile' in nsi)
     check("нет записи журнала в ANSI", 'FileWrite $LogFile' not in nsi)
     check("метка порядка байтов для нового журнала", "FileWriteWord $LogFile 0xFEFF" in nsi)
-    check("макрос метки вызывается при запуске", nsi.count("!insertmacro LOG_BOM") >= 2)
+    check("новый журнал создаётся макросом LOG_NEW", nsi.count("!insertmacro LOG_NEW") >= 2)
+    check("прежний журнал сохраняется отдельно", "SUP-IP-Setup.prev.log" in nsi and "SUP-IP-Uninstall.prev.log" in nsi)
+    check("старый журнал не дописывается в другой кодировке", 'FileOpen $LogFile "$LogPath" a\n  FileSeek $LogFile 0 END\n  !insertmacro LOG_BOM' not in nsi)
     check("позиция в конце перед каждой записью", nsi.count("FileSeek $LogFile 0 END") >= 3)
     check("вывод команды переносится в файл", 'supip-out.txt' in nsi)
     check("команда выполняется через cmd.exe", 'cmd.exe" /d /c "$TEMP\\supip-cmd.bat"' in nsi)
@@ -265,6 +271,171 @@ def main():
     check("журнал отдаётся построчно", isinstance(res.get("lines"), list) and len(res["lines"]) > 0)
     c, t = adm.req("GET", "/api/logs/supip.log?tail=3")
     check("выгрузка журнала по HTTP", c == 200 and isinstance(t, str) and len(t) > 0, c)
+
+    print("== K. Обновление поверх установленной версии: служба и коды возврата ==")
+    e1073 = Exception("(1073, 'CreateService', 'Указанная служба уже существует.')")
+    e1056 = Exception("(1056, 'StartService', 'Экземпляр службы уже запущен.')")
+    e1062 = Exception("(1062, 'ControlService', 'Служба не была запущена.')")
+    check("распознан winerror 1073 (служба уже существует)", srv._svc_exists(e1073) is True)
+    check("1073 не считается отсутствием службы", srv._svc_absent(e1073) is False)
+    check("распознан winerror 1056 (уже запущена)", srv._svc_running(e1056) is True)
+    check("распознан winerror 1062 (не запущена)", srv._svc_stopped(e1062) is True)
+    e5 = OSError(5, "CreateService"); e5.winerror = 5
+    check("код ошибки берётся из winerror", srv._svc_code(e5) == 5)
+    check("прочие ошибки не подменяются", srv._svc_exists(e5) is False and srv._svc_running(e5) is False)
+    check("состояние службы: работает", srv.service_state_text(4) == "работает")
+    check("состояние службы: остановлена", srv.service_state_text(1) == "остановлена")
+    check("состояние службы: нет службы", srv.service_state_text(None) == "не установлена")
+    check("на Linux состояние службы не выдумывается", srv.service_state() is None)
+
+    # имитация pywin32: проверяется сам путь обновления службы (создание / 1073 / отказ запуска)
+    class FakeSvc:
+        SERVICE_AUTO_START = 2; SERVICE_WIN32_OWN_PROCESS = 16; SERVICE_ERROR_NORMAL = 1
+    class FakeUtil:
+        def __init__(self, exists=False, state=4, start_err=None, install_err=None, stay_stopped=False):
+            self.exists = exists; self.state = 1 if not exists else state; self.start_err = start_err
+            self.install_err = install_err; self.calls = []; self.stay_stopped = stay_stopped
+        def InstallService(self, *a, **k):
+            self.calls.append(("install", a, k))
+            if self.install_err: raise self.install_err
+            if self.exists: raise Exception("(1073, 'CreateService', 'Указанная служба уже существует.')")
+        def StartService(self, name):
+            self.calls.append(("start", name))
+            if self.start_err: raise self.start_err
+            if not self.stay_stopped: self.state = 4
+        def StopService(self, name):
+            self.calls.append(("stop", name)); self.state = 1
+        def QueryServiceStatus(self, name): return (16, self.state)
+    class FakeDone:
+        def __init__(self, rc=0): self.returncode = rc; self.stdout = b""; self.stderr = b""
+    def run_install(fake, sc_rc=0):
+        util_mod = type(sys)("win32serviceutil"); svc_mod = type(sys)("win32service")
+        for n in ("InstallService", "StartService", "StopService", "QueryServiceStatus"):
+            setattr(util_mod, n, getattr(fake, n))
+        for n in ("SERVICE_AUTO_START", "SERVICE_WIN32_OWN_PROCESS", "SERVICE_ERROR_NORMAL"):
+            setattr(svc_mod, n, getattr(FakeSvc, n))
+        saved = (sys.modules.get("win32serviceutil"), sys.modules.get("win32service"),
+                 srv.subprocess.run, srv.service_state)
+        sys.modules["win32serviceutil"] = util_mod; sys.modules["win32service"] = svc_mod
+        sc_calls = []
+        def fake_run(args, **kw):
+            sc_calls.append(args)
+            return FakeDone(sc_rc if args[:2] == ["sc", "config"] else 0)
+        srv.subprocess.run = fake_run
+        srv.service_state = lambda name=srv.SVC_NAME: fake.state
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc, note = srv.service_install("C:\\Program Files\\SUP-IP\\SUP-IP.exe", '--service run --config "C:\\Program Files\\SUP-IP\\supip.ini"')
+        finally:
+            for mod, val in zip(("win32serviceutil", "win32service"), saved[:2]):
+                if val is None: sys.modules.pop(mod, None)
+                else: sys.modules[mod] = val
+            srv.subprocess.run, srv.service_state = saved[2], saved[3]
+        return rc, note, sc_calls, buf.getvalue()
+
+    f = FakeUtil(exists=False)
+    rc, note, sc_calls, out = run_install(f)
+    check("первая установка: код 0", rc == 0, note)
+    check("первая установка: служба создана и запущена",
+          [c[0] for c in f.calls] == ["install", "start"], f.calls)
+    check("первая установка: настроен автоперезапуск", any(c[:2] == ["sc", "failure"] for c in sc_calls))
+    check("первая установка: отчёт «установлена»", "установлена" in note and "обновлена" not in note, note)
+
+    f = FakeUtil(exists=True)
+    rc, note, sc_calls, out = run_install(f)
+    check("обновление поверх 1073: код 0 (главное исправление)", rc == 0, note)
+    check("обновление: путь службы переведён на новый EXE",
+          any(c[:2] == ["sc", "config"] and any("SUP-IP.exe" in str(x) for x in c) for c in sc_calls), sc_calls)
+    check("обновление: автозапуск сохранён", any("auto" in c for c in sc_calls if c[:2] == ["sc", "config"]))
+    check("обновление: описание службы обновлено", any(c[:2] == ["sc", "description"] for c in sc_calls))
+    check("обновление: служба перезапущена на новую версию",
+          ("stop", srv.SVC_NAME) in f.calls and ("start", srv.SVC_NAME) in f.calls, f.calls)
+    check("обновление: отчёт «обновлена»", "обновлена" in note, note)
+
+    f = FakeUtil(exists=True, start_err=Exception("(5, 'StartService', 'Отказано в доступе.')"))
+    rc, note, sc_calls, out = run_install(f)
+    check("отказ запуска службы: код 1, а не ложный успех", rc == 1, note)
+    check("отказ запуска: причина в отчёте", "не запустилась" in note, note)
+
+    f = FakeUtil(exists=True)
+    rc, note, sc_calls, out = run_install(f, sc_rc=1)
+    check("отказ перенастройки службы: код 1", rc == 1, note)
+    check("отказ перенастройки: причина в отчёте", "не обновлена" in note, note)
+
+    f = FakeUtil(install_err=e5)
+    rc, note, sc_calls, out = run_install(f)
+    check("отказ создания службы: код 1", rc == 1, note)
+    check("отказ создания: подсказка про администратора", "администратора" in out, out)
+
+    f = FakeUtil(exists=True, state=1, stay_stopped=True)
+    rc, note, sc_calls, out = run_install(f)
+    check("служба осталась остановленной: код 1", rc == 1, note)
+    check("состояние службы в отчёте", "остановлена" in note, note)
+
+    check("код --health: всё исправно → 0", srv.health_exit_code(True, True, True) == 0)
+    check("код --health: сервер не отвечает → 4", srv.health_exit_code(True, True, False) == 4)
+    check("код --health: БД неисправна → 1", srv.health_exit_code(False, True, True) == 1)
+    check("код --health: хранилище неисправно → 1", srv.health_exit_code(True, False, False) == 1)
+    check("--health использует единую функцию кода", "rc = health_exit_code(ok, ok, ready)" in src)
+    check("--health подсказывает запуск службы", "--service start (или sc start SUP-IP)" in src)
+    check("код мастера: служба не запрошена → 0", srv.setup_exit_code(False, False, False) == 0)
+    check("код мастера: служба не установлена → 4", srv.setup_exit_code(True, False, False) == 4)
+    check("код мастера: служба есть, сервер молчит → 4", srv.setup_exit_code(True, True, False) == 4)
+    check("код мастера: сервер отвечает → 0", srv.setup_exit_code(True, True, True) == 0)
+    check("мастер возвращает код проверки, а не всегда 0", "return rc" in src and "=== Настройка завершена, но сервер не отвечает" in src)
+    check("отчёт мастера показывает состояние службы", "установлена и запущена (состояние: %s)" in src)
+    check("команда --service status добавлена", "install|remove|start|stop|restart|status|run" in src)
+    check("start: уже запущена — не ошибка", '_svc_running(e) and action in ("start", "restart")' in src)
+    check("stop: не запущена — не ошибка", '_svc_stopped(e) and action == "stop"' in src)
+
+    print("== L. Установщик: обновление, журнал и итоговая проверка ==")
+    check("мастер: код 4 не прерывает установку молча", '${If} $0 == 4' in nsi and "служба не подняла сервер (код 4)" in nsi)
+    check("мастер: повторный запуск службы при коде 4", 'Повторный запуск службы СУП-ИП' in nsi)
+    check("мастер: повторная проверка работоспособности", 'Повторная проверка работоспособности' in nsi)
+    check("мастер: пользователю показана инструкция запуска", "sc start SUP-IP" in nsi)
+    check("итоговая проверка различает успех и предупреждение", "УСТАНОВКА ЗАВЕРШЕНА С ПРЕДУПРЕЖДЕНИЕМ" in nsi)
+    check("работающий PostgreSQL той же версии не переустанавливается", "повторная установка СУБД пропущена" in nsi)
+    check("пропуск установки СУБД только для своей службы", '${If} $PgService == "postgresql-x64-${PG_VER}"' in nsi)
+    check("ярлык запуска службы", "Запуск сервера (служба).lnk" in nsi)
+    check("ярлык остановки службы", "Остановка сервера (служба).lnk" in nsi)
+    check("ярлык состояния службы", "Состояние службы.lnk" in nsi and "--service status" in nsi)
+    check("ярлык проверки работоспособности", "Проверка работоспособности.lnk" in nsi)
+
+    print("== M. Чтение журналов разных кодировок (M14 и выгрузка) ==")
+    check("распознан UTF-16LE с BOM", srv.decode_log_bytes("Журнал установки".encode("utf-16")) == "Журнал установки")
+    check("распознан UTF-8 с BOM", srv.decode_log_bytes("\ufeffСервер запущен".encode("utf-8")) == "Сервер запущен")
+    check("распознан UTF-8 без BOM", srv.decode_log_bytes("Планировщик: доставлено 3".encode("utf-8")) == "Планировщик: доставлено 3")
+    check("распознан ANSI cp1251 (журнал прежней версии)", srv.decode_log_bytes("Служба установлена".encode("cp1251")) == "Служба установлена")
+    check("кириллица не теряется на неполном блоке", srv.decode_log_bytes("ОТКАЗ: код 4".encode("cp866")) != "")
+    check("кодировка выгрузки для UTF-16", srv.log_charset(b"\xff\xfe") == "utf-16")
+    check("кодировка выгрузки для UTF-8", srv.log_charset(b"20") == "utf-8")
+    ldir = srv.LOG_DIR
+    os.makedirs(ldir, exist_ok=True)
+    probe = os.path.join(ldir, "codectest.log")
+    try:
+        with open(probe, "wb") as f:
+            f.write("ШАГ: мастер настройки\r\nСлужба Windows: обновлена и запущена\r\n".encode("utf-16"))
+        c, j = adm.rpc("admin.logs", {"name": "codectest.log", "lines": 10})
+        lines = (j.get("result") or {}).get("lines") or []
+        check("M14 читает журнал установщика (UTF-16LE)", any("Служба Windows: обновлена и запущена" in l for l in lines), lines)
+        check("в журнале нет символов подмены", not any("\ufffd" in l for l in lines), lines)
+        c, t = adm.req("GET", "/api/logs/codectest.log?tail=2")
+        check("выгрузка хвоста журнала в UTF-8", c == 200 and "Служба Windows" in t, c)
+        with open(probe, "wb") as f:
+            f.write("Журнал прежней версии: служба установлена\r\n".encode("cp1251"))
+        c, j = adm.rpc("admin.logs", {"name": "codectest.log", "lines": 5})
+        lines = (j.get("result") or {}).get("lines") or []
+        check("M14 читает журнал прежней версии (cp1251)", any("служба установлена" in l for l in lines), lines)
+        big = ("строка журнала установщика номер %d\r\n" % 0)
+        with open(probe, "wb") as f:
+            f.write("".join("строка журнала %d\r\n" % i for i in range(4000)).encode("utf-16"))
+        c, j = adm.rpc("admin.logs", {"name": "codectest.log", "lines": 3})
+        lines = (j.get("result") or {}).get("lines") or []
+        check("хвост большого UTF-16 журнала читается без разрыва кодовых единиц",
+              len(lines) == 3 and all("строка журнала" in l for l in lines), lines)
+    finally:
+        if os.path.isfile(probe): os.remove(probe)
 
     if a.nsis:
         print("== J. Сборка установщика (makensis) ==")

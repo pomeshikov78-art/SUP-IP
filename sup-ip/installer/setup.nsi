@@ -9,7 +9,7 @@
 Unicode true
 ManifestDPIAware true
 !ifndef VERSION
-  !define VERSION "1.10.0"
+  !define VERSION "1.11.0"
 !endif
 !define APPNAME "SUP-IP"
 !define DISPLAY "СУП-ИП — управление проектами"
@@ -193,12 +193,23 @@ FunctionEnd
   Pop $9
 !macroend
 
+; Каждый запуск пишет новый журнал в UTF-16LE с BOM; прежний сохраняется как *.prev.log.
+; Дописывание UTF-16LE в журнал прежней версии (ANSI) делало файл нечитаемым — устранено.
+!macro LOG_NEW PATH PREV
+  Push $9
+  ${If} ${FileExists} "${PATH}"
+    Delete "${PREV}"
+    Rename "${PATH}" "${PREV}"
+  ${EndIf}
+  FileOpen $LogFile "${PATH}" w
+  FileWriteWord $LogFile 0xFEFF
+  Pop $9
+!macroend
+
 Function .onInit
   SetRegView 64
   StrCpy $LogPath "$TEMP\SUP-IP-Setup.log"
-  FileOpen $LogFile "$LogPath" a
-  FileSeek $LogFile 0 END
-  !insertmacro LOG_BOM
+  !insertmacro LOG_NEW "$TEMP\SUP-IP-Setup.log" "$TEMP\SUP-IP-Setup.prev.log"
   !insertmacro LOG "==================================================="
   !insertmacro LOG "СУП-ИП ${VERSION}: запуск установщика (сборка ${__DATE__})"
   ReadRegStr $0 HKLM "SOFTWARE\Microsoft\Windows NT\CurrentVersion" "ProductName"
@@ -555,6 +566,19 @@ Section "PostgreSQL" SEC_PG
     StrCpy $PgInstaller "$TEMP\postgresql-setup.exe"
   ${EndIf}
 
+  ; обновление СУП-ИП поверх работающего PostgreSQL той же версии: СУБД не трогаем
+  ${If} $PgService == "postgresql-x64-${PG_VER}"
+    StrCpy $R7 "try{$$c=New-Object Net.Sockets.TcpClient;$$c.Connect('$PgHost',$PgPort);$$c.Close();exit 0}catch{exit 1}"
+    nsExec::ExecToStack 'powershell -NoProfile -Command "$R7"'
+    Pop $0
+    Pop $3
+    ${If} $0 == 0
+      !insertmacro LOG "PostgreSQL ${PG_VER} уже установлен и принимает соединения на $PgHost:$PgPort — повторная установка СУБД пропущена"
+      DetailPrint "PostgreSQL ${PG_VER} уже установлен — установка СУБД пропущена"
+      Goto pg_wait_tcp
+    ${EndIf}
+  ${EndIf}
+
   DetailPrint "Тихая установка PostgreSQL (2–5 минут)…"
   !insertmacro RUN "Установка PostgreSQL из $PgInstaller" '"$PgInstaller" --mode unattended --unattendedmodeui none --superpassword "$PgPass" --serverport $PgPort --servicename postgresql-x64-${PG_VER} --disable-components stackbuilder'
   ${If} $0 != 0
@@ -606,13 +630,28 @@ Section "Настройка" SEC_CONFIG
   FileWrite $0 "service=1$\r$\n"
   FileClose $0
   !insertmacro RUN "Мастер настройки: БД · схема · HTTPS · служба · брандмауэр" '"$INSTDIR\SUP-IP.exe" --install-auto "$INSTDIR\install.ini"'
-  ${If} $0 != 0
+  ${If} $0 == 4
+    !insertmacro LOG "ВНИМАНИЕ: мастер настройки завершён, но служба не подняла сервер (код 4)"
+    !insertmacro RUN "Повторный запуск службы СУП-ИП" '"$INSTDIR\SUP-IP.exe" --service start'
+    !insertmacro RUN "Повторная проверка работоспособности" '"$INSTDIR\SUP-IP.exe" --health'
+    ${If} $0 != 0
+      MessageBox MB_ICONEXCLAMATION "Программа установлена и настроена, но сервер пока не отвечает (код $0).$\r$\n$\r$\nЗапустите службу: меню «Пуск» → СУП-ИП → «Запуск сервера»,$\r$\nили в командной строке от администратора: sc start SUP-IP$\r$\nЗатем проверьте: SUP-IP.exe --health$\r$\n$\r$\nОтчёт: $INSTDIR\data\install-report.txt$\r$\nЖурналы: $INSTDIR\data\logs\installer.log, setup.log, supip.log"
+      !insertmacro LOG "СЕРВЕР НЕ ПОДНЯТ: пользователю показана инструкция запуска"
+    ${Else}
+      !insertmacro LOG "Служба поднята повторным запуском — сервер отвечает"
+    ${EndIf}
+  ${ElseIf} $0 != 0
     !insertmacro LOG "ОТКАЗ: мастер настройки · код $0"
     MessageBox MB_ICONSTOP "Настройка не завершена (код $0).$\r$\n$\r$\nОтчёт: $INSTDIR\data\install-report.txt$\r$\nЖурнал установки: $INSTDIR\data\logs\installer.log$\r$\nЖурнал настройки: $INSTDIR\data\logs\setup.log$\r$\n$\r$\nПришлите эти файлы для разбора ошибки."
     Abort
   ${EndIf}
   Delete "$INSTDIR\install.ini" ; пароль суперпользователя не хранится на диске
   !insertmacro RUN "Проверка работоспособности" '"$INSTDIR\SUP-IP.exe" --health'
+  ${If} $0 == 0
+    !insertmacro LOG "Проверка работоспособности: сервер отвечает, установка исправна"
+  ${Else}
+    !insertmacro LOG "ВНИМАНИЕ: проверка работоспособности · код $0 (сервер не отвечает)"
+  ${EndIf}
   ; журнал установки — в каталог программы (доступен из M14)
   FileClose $LogFile
   CopyFiles /SILENT "$TEMP\SUP-IP-Setup.log" "$INSTDIR\data\logs\installer.log"
@@ -626,6 +665,10 @@ Section "Настройка" SEC_CONFIG
   CreateShortcut "$SMPROGRAMS\SUP-IP\Журнал установки.lnk" "$INSTDIR\data\logs\installer.log"
   CreateShortcut "$SMPROGRAMS\SUP-IP\Журнал настройки.lnk" "$INSTDIR\data\logs\setup.log"
   CreateShortcut "$SMPROGRAMS\SUP-IP\Журнал работы сервера.lnk" "$INSTDIR\data\logs\supip.log"
+  CreateShortcut "$SMPROGRAMS\SUP-IP\Запуск сервера (служба).lnk" "$INSTDIR\SUP-IP.exe" "--service start"
+  CreateShortcut "$SMPROGRAMS\SUP-IP\Остановка сервера (служба).lnk" "$INSTDIR\SUP-IP.exe" "--service stop"
+  CreateShortcut "$SMPROGRAMS\SUP-IP\Состояние службы.lnk" "$SYSDIR\cmd.exe" '/k ""$INSTDIR\SUP-IP.exe" --service status"'
+  CreateShortcut "$SMPROGRAMS\SUP-IP\Проверка работоспособности.lnk" "$SYSDIR\cmd.exe" '/k ""$INSTDIR\SUP-IP.exe" --health"'
   CreateShortcut "$SMPROGRAMS\SUP-IP\Удалить СУП-ИП.lnk" "$INSTDIR\uninstall.exe"
   WriteRegStr HKLM "Software\SUP-IP" "InstallDir" "$INSTDIR"
   WriteRegStr HKLM "Software\SUP-IP" "Version" "${VERSION}"
@@ -634,7 +677,11 @@ Section "Настройка" SEC_CONFIG
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\SUP-IP" "UninstallString" "$INSTDIR\uninstall.exe"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\SUP-IP" "Publisher" "SUP-IP"
   WriteUninstaller "$INSTDIR\uninstall.exe"
-  !insertmacro LOG "УСТАНОВКА ЗАВЕРШЕНА: порт $Port · служба СУП-ИП · ярлыки созданы"
+  ${If} $0 == 0
+    !insertmacro LOG "УСТАНОВКА ЗАВЕРШЕНА: порт $Port · служба СУП-ИП работает · ярлыки созданы"
+  ${Else}
+    !insertmacro LOG "УСТАНОВКА ЗАВЕРШЕНА С ПРЕДУПРЕЖДЕНИЕМ: порт $Port · служба не поднята (код $0) · ярлыки созданы"
+  ${EndIf}
 SectionEnd
 
 Function .onInstFailed
@@ -646,9 +693,7 @@ FunctionEnd
 
 Section "Uninstall"
   StrCpy $LogPath "$TEMP\SUP-IP-Uninstall.log"
-  FileOpen $LogFile "$LogPath" a
-  FileSeek $LogFile 0 END
-  !insertmacro LOG_BOM
+  !insertmacro LOG_NEW "$TEMP\SUP-IP-Uninstall.log" "$TEMP\SUP-IP-Uninstall.prev.log"
   !insertmacro LOG "Удаление СУП-ИП ${VERSION}"
   !insertmacro URUN "Остановка службы" '"$INSTDIR\SUP-IP.exe" --service stop'
   !insertmacro URUN "Удаление службы" '"$INSTDIR\SUP-IP.exe" --service remove'

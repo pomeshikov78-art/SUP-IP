@@ -39,7 +39,7 @@ except ImportError:
     docgen = None
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -4199,6 +4199,28 @@ def log_files():
         pass
     return out
 
+def decode_log_bytes(data):
+    """Журналы разных источников: UTF-16LE с BOM (установщик Windows), UTF-8 (сервер),
+       ANSI cp1251/cp866 (журналы прежних версий). Без этого M14 показывал «кракозябры»."""
+    if data[:2] == b"\xff\xfe": return data[2:].decode("utf-16-le", "replace")
+    if data[:2] == b"\xfe\xff": return data[2:].decode("utf-16-be", "replace")
+    if data[:3] == b"\xef\xbb\xbf": return data[3:].decode("utf-8", "replace")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    for enc in ("cp1251", "cp866"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+def log_charset(head):
+    """Кодировка для выгрузки журнала по HTTP (иначе браузер читает UTF-16 как UTF-8)."""
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff"): return "utf-16"
+    return "utf-8"
+
 def log_tail(name, lines=300):
     """Последние строки журнала (защита от обхода каталога и от чтения произвольных файлов)."""
     if not LOG_NAME_RE.match(name or ""): raise RpcError("Недопустимое имя журнала", "Журналы", 400, "BAD_LOG_NAME")
@@ -4206,12 +4228,20 @@ def log_tail(name, lines=300):
     if not os.path.isfile(p): raise RpcError("Журнал не найден: %s" % name, "Журналы", 404, "NO_LOG")
     n = max(1, min(int(lines or 300), 5000))
     with open(p, "rb") as f:
+        head = f.read(2)
         f.seek(0, os.SEEK_END); size = f.tell()
         block = min(size, 512 * 1024)
-        f.seek(size - block)
-        data = f.read(block)
-    text = data.decode("utf-8", "replace")
-    return text.splitlines()[-n:]
+        start = size - block
+        utf16 = head in (b"\xff\xfe", b"\xfe\xff")
+        if utf16 and start % 2: start += 1        # не разрывать кодовую единицу UTF-16
+        if start <= 2: start = 0
+        f.seek(start)
+        data = f.read()
+        if start > 0 and utf16: data = head + data
+    text = decode_log_bytes(data)
+    rows = text.splitlines()
+    if start > 0 and rows: rows = rows[1:]        # первая строка блока может быть неполной
+    return rows[-n:]
 
 class ReportList(list):
     """Отчёт мастера установки: каждая строка сразу пишется в setup.log."""
@@ -4606,7 +4636,7 @@ class App(http.server.BaseHTTPRequestHandler):
                 if not os.path.isfile(fp): raise RpcError("Журнал не найден", "Журналы", 404, "NO_LOG")
                 with open(fp, "rb") as f: body = f.read()
             LOG.info("Журнал %s выгружен пользователем %s (%d байт)", name, u.get("login"), len(body))
-            self._headers(200, "text/plain; charset=utf-8", len(body),
+            self._headers(200, "text/plain; charset=%s" % log_charset(body[:2]), len(body),
                           {"Content-Disposition": 'attachment; filename="%s"' % name})
             return self.wfile.write(body)
         if path == "/api/formats":
@@ -4708,7 +4738,7 @@ def main():
     ap.add_argument("--no-seed", action="store_true", help="не заполнять демо-данные при пустой БД")
     ap.add_argument("--install", action="store_true", help="мастер установки и настройки (ТЗ §7.3)")
     ap.add_argument("--install-auto", metavar="INI", help="автоматическая установка по параметрам из INI (для установщика)")
-    ap.add_argument("--service", metavar="ACTION", help="служба Windows: install|remove|start|stop|restart|run")
+    ap.add_argument("--service", metavar="ACTION", help="служба Windows: install|remove|start|stop|restart|status|run")
     ap.add_argument("--migrate", action="store_true", help="применить миграции БД и выйти")
     ap.add_argument("--backup-now", action="store_true", help="создать резервную копию и выйти")
     ap.add_argument("--health", action="store_true", help="диагностика: БД, файловое хранилище, порт")
@@ -4784,7 +4814,14 @@ def main():
         else:
             print("Сервер: НЕ ОТВЕЧАЕТ %s://%s:%s (%s)" % (scheme, probe_host, port, info.get("error", "нет ответа")))
         print(port_status_line(port, socket_bind_probe(host, port), ready))
-        sys.exit(0 if ok else 1)
+        rc = health_exit_code(ok, ok, ready)
+        if rc == 4:
+            print("Служба Windows: %s" % service_state_text(service_state()))
+            print("Подсказка: запустите службу командой SUP-IP.exe --service start (или sc start SUP-IP).")
+            print("Разбор: %s и %s" % (os.path.join(LOG_DIR, "setup.log"), os.path.join(LOG_DIR, "supip.log")))
+        LOG.info("Проверка работоспособности: БД=%s, хранилище=%s, сервер=%s → код %d",
+                 "OK" if ok else "ОШИБКА", "OK" if ok else "ОШИБКА", "отвечает" if ready else "нет ответа", rc)
+        sys.exit(rc)
     if args.backup_now:
         conn = db.get()
         try:
@@ -5089,6 +5126,7 @@ def run_install(auto_path=None):
     report.append("Файловые журналы: %s (уровень %s)" % (LOG_DIR, LOG_STATE["level"]))
     # 9. Брандмауэр и служба (Windows)
     service_started = False
+    service_requested = False
     if sys.platform == "win32":
         try:
             r = subprocess.run(["netsh", "advfirewall", "firewall", "add", "rule", "name=SUP-IP",
@@ -5097,9 +5135,15 @@ def run_install(auto_path=None):
         except Exception as e:
             report.append("Брандмауэр: %s" % e)
         if ask("service", "Установить службу Windows с автозапуском (1/0)", "1") in ("1", "да", "yes"):
+            service_requested = True
             rc = service_command("install", cfg)
             service_started = rc == 0
-            report.append("Служба Windows: %s" % ("установлена, команда запуска выдана" if rc == 0 else "не установлена (см. вывод выше)"))
+            state = service_state_text(service_state())
+            report.append("Служба Windows: %s" % ("установлена и запущена (состояние: %s)" % state if rc == 0
+                                                  else "НЕ ЗАПУЩЕНА (состояние: %s) — см. вывод выше и журнал %s"
+                                                       % (state, os.path.join(LOG_DIR, "supip.log"))))
+            if rc != 0:
+                SETUP_LOG.error("Служба Windows не поднята: состояние %s", state)
     else:
         report.append("Служба Windows: пропущено (не Windows); используйте systemd/run.sh")
     # 10. Проверка работоспособности
@@ -5133,9 +5177,11 @@ def run_install(auto_path=None):
     except Exception as e:
         report.append("Проверка порта: %s" % e)
     report.append("")
-    if service_started and not ready:
-        report.append("ВНИМАНИЕ: служба установлена, но сервер не ответил. Разбор: %s и %s"
-                      % (os.path.join(LOG_DIR, "setup.log"), os.path.join(LOG_DIR, "supip.log")))
+    rc = setup_exit_code(service_requested, service_started, ready)
+    if rc:
+        report.append("ВНИМАНИЕ: настройка выполнена, но сервер не поднялся (код %d). Разбор: %s и %s"
+                      % (rc, os.path.join(LOG_DIR, "setup.log"), os.path.join(LOG_DIR, "supip.log")))
+        report.append("Действия: SUP-IP.exe --service status · SUP-IP.exe --service start · SUP-IP.exe --health")
     report.append("ГОТОВО. Запуск: %s" % ("SUP-IP.exe (служба)" if sys.platform == "win32" else "python3 server.py"))
     report.append("Клиенты в ЛВС: %s://<IP-этого-ПК>:%s" % (scheme, port))
     report.append("Вход: admin / %s" % ("(пароль мастера)" if admin_pass != "demo" else "demo"))
@@ -5143,8 +5189,11 @@ def run_install(auto_path=None):
     p = install_report_write(report)
     print("\n".join(report))
     print("\nОтчёт об установке: %s" % p)
-    SETUP_LOG.info("=== Установка завершена успешно ===")
-    return 0
+    if rc:
+        SETUP_LOG.warning("=== Настройка завершена, но сервер не отвечает (код %d) ===", rc)
+    else:
+        SETUP_LOG.info("=== Установка завершена успешно ===")
+    return rc
 
 def server_health_probe(scheme, host, port, timeout=3):
     """Проверка фактического ответа сервера (/api/health). Самоподписанный сертификат мастера
@@ -5238,9 +5287,121 @@ def selftest():
     return 0 if ok else 1
 
 # ---------------- Служба Windows (ТЗ §7.4: автозапуск, контролируемый перезапуск) ----------------
+SVC_NAME = "SUP-IP"
+SVC_DISPLAY = "СУП-ИП — сервер управления проектами"
+SVC_DESC = "СУП-ИП: веб-сервер управления проектами инженерного подразделения (PostgreSQL)"
+SVC_STATES = {1: "остановлена", 2: "запускается", 3: "останавливается", 4: "работает",
+              5: "продолжает запуск", 6: "продолжает остановку", 7: "приостановлена"}
+
+def _svc_code(e):
+    """Код ошибки Windows из исключения pywin32: (1073, 'CreateService', '…') → 1073."""
+    c = getattr(e, "winerror", None)
+    if isinstance(c, int): return c
+    m = re.search(r"\((\d+),", str(e))
+    if m: return int(m.group(1))
+    m = re.search(r"\b(1056|1060|1062|1073)\b", str(e))
+    return int(m.group(1)) if m else None
+
 def _svc_absent(e):
     """Служба не установлена (winerror 1060) — для stop/remove это штатная ситуация."""
-    return getattr(e, "winerror", None) == 1060 or "1060" in str(e)
+    return _svc_code(e) == 1060
+
+def _svc_exists(e):
+    """Служба уже установлена (winerror 1073) — при обновлении её нужно перенастроить, а не падать."""
+    return _svc_code(e) == 1073
+
+def _svc_running(e):
+    """Служба уже запущена (winerror 1056) — для start это штатная ситуация."""
+    return _svc_code(e) == 1056
+
+def _svc_stopped(e):
+    """Служба не запущена (winerror 1062) — для stop это штатная ситуация."""
+    return _svc_code(e) == 1062
+
+def service_state(name=SVC_NAME):
+    """Состояние службы Windows (число win32service.SERVICE_*), None — службы нет или не Windows."""
+    if sys.platform != "win32": return None
+    try:
+        import win32serviceutil
+        return int(win32serviceutil.QueryServiceStatus(name)[1])
+    except Exception:
+        return None
+
+def service_state_text(state):
+    return SVC_STATES.get(state, "не установлена" if state is None else "состояние %s" % state)
+
+def service_install(exe, exe_args):
+    """Установка службы с автозапуском; при обновлении поверх прежней версии служба
+       уже существует (CreateService → 1073) — она перенастраивается на новый EXE и запускается.
+       Возвращает (код, пояснение для отчёта)."""
+    import win32serviceutil, win32service
+    name = SVC_NAME
+    binpath = '"%s" %s' % (exe, exe_args)
+    existed = False
+    try:
+        win32serviceutil.InstallService(None, name, SVC_DISPLAY,
+                                        startType=win32service.SERVICE_AUTO_START,
+                                        exeName=exe, exeArgs=exe_args, description=SVC_DESC)
+        LOG.info("Служба Windows: создана (%s)", binpath)
+    except Exception as e:
+        if not _svc_exists(e):
+            LOG.error("Служба Windows: установка отклонена: %s", e)
+            hint = " Запустите установщик от имени администратора." if _svc_code(e) == 5 else ""
+            print("Служба: %s.%s" % (e, hint))
+            return 1, "не установлена: %s" % e
+        existed = True
+        LOG.info("Служба Windows: уже установлена (1073) — обновляю конфигурацию на %s", binpath)
+    if existed:
+        # sc config понимает путь с пробелами и обновляет автозапуск у существующей службы
+        for args, what in ((["sc", "config", name, "binPath=", binpath, "start=", "auto"], "путь и автозапуск"),
+                           (["sc", "description", name, SVC_DESC], "описание")):
+            r = subprocess.run(args, capture_output=True)
+            if r.returncode != 0:
+                out = (r.stdout or b"").decode("cp866", "replace") + (r.stderr or b"").decode("cp866", "replace")
+                LOG.error("Служба Windows: не удалось обновить %s (код %s): %s", what, r.returncode, out.strip())
+                print("Служба: не удалось обновить %s (sc, код %s)" % (what, r.returncode))
+                return 1, "не обновлена: %s" % what
+        LOG.info("Служба Windows: конфигурация обновлена (%s)", binpath)
+    subprocess.run(["sc", "failure", name, "reset=", "86400", "actions=", "restart/5000/restart/5000/restart/5000"],
+                   capture_output=True)
+    if existed and service_state() == 4:          # служба уже работает — перезапуск на новый EXE
+        try:
+            win32serviceutil.StopService(name)
+            LOG.info("Служба Windows: остановлена для перезапуска новой версии")
+        except Exception as e:
+            if not _svc_stopped(e): LOG.warning("Служба Windows: остановка перед перезапуском: %s", e)
+    try:
+        win32serviceutil.StartService(name)
+    except Exception as e:
+        if _svc_running(e):
+            LOG.info("Служба Windows: уже запущена (1056)")
+        else:
+            LOG.error("Служба Windows: запуск отклонён: %s", e)
+            print("Служба: %s" % e)
+            return 1, "установлена, но не запустилась: %s" % e
+    deadline = time.time() + 20
+    st = service_state()
+    while st not in (4, 1) and time.time() < deadline:
+        time.sleep(1); st = service_state()
+    note = ("обновлена (уже была установлена)" if existed else "установлена") + ", состояние: " + service_state_text(st)
+    LOG.info("Служба Windows: %s", note)
+    if st != 4:
+        print("Служба: %s. Журнал: %s" % (note, os.path.join(LOG_DIR, "supip.log")))
+        return 1, note
+    print("Служба: %s." % note)
+    return 0, note
+
+def health_exit_code(db_ok, files_ok, server_ready):
+    """Код возврата --health: 0 — всё исправно, 1 — БД/хранилище неисправны,
+       4 — сервер не отвечает (служба не поднята). Ложный «успех» скрывать нельзя (ТЗ §15)."""
+    if not (db_ok and files_ok): return 1
+    return 0 if server_ready else 4
+
+def setup_exit_code(service_requested, service_started, server_ready):
+    """Код возврата мастера настройки: 4 — служба запрошена, но сервер не поднялся."""
+    if not service_requested: return 0
+    if not service_started: return 4
+    return 0 if server_ready else 4
 
 def service_command(action, cfg=None):
     if not LOG_STATE["ready"]: log_init()
@@ -5251,20 +5412,16 @@ def service_command(action, cfg=None):
         import win32serviceutil, win32service, servicemanager  # noqa
     except ImportError:
         print("Для службы нужен pywin32: python -m pip install pywin32 (входит в EXE-сборку)."); return 1
-    name = "SUP-IP"
+    name = SVC_NAME
     exe = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(sys.argv[0])
     exe_args = '--service run --config "%s"' % CONFIG_PATH
     if action == "install":
-        try:
-            win32serviceutil.InstallService(None, name, "СУП-ИП — сервер управления проектами",
-                                            startType=win32service.SERVICE_AUTO_START,
-                                            exeName=exe, exeArgs=exe_args,
-                                            description="СУП-ИП: веб-сервер управления проектами инженерного подразделения (PostgreSQL)")
-            subprocess.run(["sc", "failure", name, "reset=", "86400", "actions=", "restart/5000/restart/5000/restart/5000"], capture_output=True)
-            win32serviceutil.StartService(name)
-            return 0
-        except Exception as e:
-            print("Служба: %s" % e); return 1
+        rc, _note = service_install(exe, exe_args)
+        return rc
+    if action == "status":
+        st = service_state()
+        print("Служба Windows: %s" % service_state_text(st))
+        return 0 if st == 4 else 4
     if action == "remove":
         try:
             try: win32serviceutil.StopService(name)
@@ -5279,15 +5436,23 @@ def service_command(action, cfg=None):
         try:
             if action == "restart":
                 try: win32serviceutil.StopService(name)
-                except Exception: pass
+                except Exception as e:
+                    if not (_svc_absent(e) or _svc_stopped(e)): raise
                 win32serviceutil.StartService(name)
             elif action == "start": win32serviceutil.StartService(name)
             else: win32serviceutil.StopService(name)
+            LOG.info("Служба Windows: команда '%s' выполнена (состояние: %s)", action, service_state_text(service_state()))
             return 0
         except Exception as e:
             if _svc_absent(e) and action in ("stop", "restart"):
                 LOG.info("Служба Windows не установлена — остановка не требуется")
                 print("Служба не установлена — остановка не требуется."); return 0
+            if _svc_running(e) and action in ("start", "restart"):
+                LOG.info("Служба Windows уже запущена — повторный запуск не требуется")
+                print("Служба уже запущена."); return 0
+            if _svc_stopped(e) and action == "stop":
+                LOG.info("Служба Windows не запущена — остановка не требуется")
+                print("Служба не запущена — остановка не требуется."); return 0
             print("Служба: %s" % e); return 1
     if action == "run":
         import servicemanager, win32serviceutil
