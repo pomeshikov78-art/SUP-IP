@@ -39,7 +39,7 @@ except ImportError:
     docgen = None
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.15.0"
+VERSION = "1.16.0"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -2398,20 +2398,23 @@ def _directive_from_decision(db, cur, u, m, d, p=None):
 
 @reg("meeting.decision.add")
 def h_meeting_decision(db, cur, u, p):
+    """Регистрация решения совещания (MTG-11 §14.1): самостоятельный номер, тип, статус, срок."""
     m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
-    req(p, "text", "resp", "due"); check_date(p["due"])
-    agenda_n = p.get("agendaN")
-    if agenda_n is not None:
-        agenda_n = int(agenda_n)
-        if not any(a["n"] == agenda_n for a in m["agenda"]): raise RpcError("Пункт повестки не найден: %s" % agenda_n)
-    d = {"id": uid("md"), "text": p["text"][:1000], "resp": p["resp"], "due": p["due"],
-         "taskId": None, "taskIds": [], "agendaN": agenda_n}
-    m["decisions"].append(d)
+    d = _dec_register(db, cur, u, m, p)
     t = None
     if p.get("createTask"): t = _directive_from_decision(db, cur, u, m, d, p)
     db.save_ent(cur, "meeting", m)
-    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Зафиксировано решение", "Совещание", m["id"], {"code": m["code"]})
-    return m, msg("Поручение создано в M02" if t else "Решение зафиксировано", "Контроль срока — в M07 и на дашборде" if t else "")
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Зафиксировано решение", "Совещание", m["id"],
+             {"code": m["code"], "decision": d["code"], "type": d["type"], "status": d["status"],
+              "resp": d["resp"], "due": d["due"], "agendaN": d["agendaN"],
+              "event": "MEETING_DECISION_REGISTERED"})
+    _dec_notify(db, cur, m, d, "decision.registered", "Решение %s: %s" % (d["code"], d["type"]),
+                "%s · совещание %s · срок %s" % (d["text"][:120], m["code"], _fd(d["due"])))
+    LOG.info("Решение %s зарегистрировано на совещании %s (тип %s, срок %s)",
+             d["code"], m["code"], d["type"], d["due"])
+    return m, msg("Поручение создано в M02" if t else "Решение зарегистрировано",
+                  ("%s · контроль срока — в M07 и на дашборде" % d["code"]) if t else
+                  ("%s · реестр решений MTG-11" % d["code"]))
 
 @reg("meeting.decision.toTask")
 def h_meeting_decision_task(db, cur, u, p):
@@ -2432,22 +2435,24 @@ def h_meeting_decision_task(db, cur, u, p):
 def h_meeting_decision_update(db, cur, u, p):
     """Правка решения не создаёт поручение повторно (ТЗ §2.10): связи сохраняются."""
     m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
-    d = next((x for x in m["decisions"] if x["id"] == p["did"]), None)
+    d = dec_of(m, p.get("did") or p.get("decisionId") or "")
     if not d: raise RpcError("Решение не найдено")
-    if "text" in p: d["text"] = (p["text"] or "")[:1000]
-    if "resp" in p: d["resp"] = p["resp"]
-    if "due" in p: check_date(p["due"]); d["due"] = p["due"]
-    if "agendaN" in p:
-        n = p["agendaN"]
-        if n is not None:
-            n = int(n)
-            if not any(a["n"] == n for a in m["agenda"]): raise RpcError("Пункт повестки не найден: %s" % n)
-        d["agendaN"] = n
+    if d["status"] in ("Исполнено", "Отменено"):
+        raise RpcError("Решение в статусе «%s» не изменяется: оформите новое решение" % d["status"], "Карточка решения")
+    changed = _dec_fields(db, cur, u, m, d, p)
+    if not changed: raise RpcError("Поля решения не изменились")
+    material = [k for k in changed if k in DEC_MATERIAL_FIELDS]
+    auto = ""
+    if material and d["status"] in ("Принято", "Действует"):
+        auto = _dec_status(db, cur, u, m, d, "Изменено",
+                           reason="Изменены существенные условия: " + ", ".join(material))
     d["taskIds"] = [x for x in dec_task_ids(d) if db.get_ent(cur, "task", x)]
     d["taskId"] = d["taskIds"][0] if d["taskIds"] else None
+    _dec_hist(d, u["id"], "update", fields=changed, note="Изменены поля решения")
     db.save_ent(cur, "meeting", m)
     db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Решение изменено", "Совещание", m["id"],
-             {"code": m["code"], "decision": d["id"], "tasks": len(d["taskIds"]), "event": "MEETING_DECISION_UPDATED"})
+             {"code": m["code"], "decision": d["code"], "fields": changed, "tasks": len(d["taskIds"]),
+              "status": d["status"], "event": "MEETING_DECISION_UPDATED"})
     return m, msg("Решение изменено", "Созданные поручения сохранены, повторное создание не выполняется")
 @reg("meeting.delete")
 def h_meeting_delete(db, cur, u, p):
@@ -3942,6 +3947,8 @@ EXPORT_KINDS = {
     "calc":      ("calcs", "Протокол расчёта"),
     "meeting":   ("meetings", "Протокол совещания"),
     "directives": ("meetings", "Отчёт по поручениям"),
+    "decisions": ("meetings", "Реестр решений"),
+    "decision":  ("meetings", "Карточка решения"),
     "report":    ("reports", "Отчёт"),
     "journal":   ("journal", "Журнал событий"),
     "dashboard": ("analytics", "Панель показателей"),
@@ -4270,6 +4277,82 @@ def build_export(db, cur, u, kind, id_="", params=None):
                "статус «Выполнено» устанавливается только после приёмки результата руководителем (ТЗ §2.11).")
         d.signatures([("Составил", u["name"]), ("Проверил", "")])
         return d, "poryucheniya_%s" % rep["kind"]
+
+    if kind == "decisions":
+        rep = h_meeting_decisions_list(db, cur, u, params)[0]
+        rows = rep["rows"]
+        d = D("Реестр решений совещаний", subtitle="MTG-11 · самостоятельные идентификаторы решений, связь с повесткой и протоколом",
+              meta=_export_meta(db, cur, u, [("Решений", rep["total"]), ("Действующих", rep["stats"]["active"]),
+                                             ("Исполнено", rep["stats"]["done"]), ("Просрочено", rep["stats"]["overdue"]),
+                                             ("Поручений создано", rep["stats"]["tasks"])]))
+        d.toc = True
+        d.h1("1. Сводка по статусам")
+        d.kv([(k, v) for k, v in rep["byStatus"].items()])
+        d.h1("2. Реестр решений")
+        if rows:
+            d.table(["ID решения", "№ протокола", "Дата", "Совещание", "Вопрос", "Формулировка решения",
+                     "Тип", "Ответственный", "Срок", "Статус", "Поручений"],
+                    [[r["code"], r["protocolNumber"], _fd(r["adoptedAt"]), r["meetingCode"],
+                      ("№%s %s" % (r["agendaN"], r["itemTitle"])) if r["agendaN"] else "—",
+                      r["text"], r["type"], r["respName"], _fd(r["due"]), r["status"], r["tasksCount"]]
+                     for r in rows],
+                    widths=[1.2, 1.1, 0.9, 1.1, 1.6, 3.2, 1.2, 1.4, 0.9, 1.1, 0.7],
+                    aligns=[None, None, None, None, None, None, None, None, None, None, "right"],
+                    title="Решения", total=["Итого", "", "", "", "", "", "", "", "", "", sum(r["tasksCount"] for r in rows)])
+        else:
+            d.p("По заданному отбору решений нет.")
+        d.note("Статус «Исполнено» присваивается только при выполнении всех обязательных действий по решению "
+               "либо при наличии подтверждённого результата (MTG-11 §14.4).")
+        d.signatures([("Составил", u["name"]), ("Проверил", "")])
+        return d, "reestr_resheniy"
+
+    if kind == "decision":
+        m, dec = _dec_find(db, cur, {"decisionId": id_ or params.get("decisionId"), "id": params.get("meetingId")})
+        guard(db, cur, u, "meetings", "view", m)
+        c = dec_card(db, cur, m, dec)
+        d = D("Решение %s" % c["code"], subtitle="Карточка решения MTG-12 · совещание %s" % m["code"],
+              meta=_export_meta(db, cur, u, [("Статус", c["status"]), ("Тип", c["type"]),
+                                             ("Ответственный", c["respName"]), ("Срок", _fd(c["due"])),
+                                             ("Поручений", c["tasksCount"])]))
+        d.h1("1. Основные сведения")
+        d.kv([("ID решения", c["id"]), ("Номер", c["code"]), ("Совещание", "%s · %s" % (m["code"], m.get("title", ""))),
+              ("Протокол", "%s от %s%s" % (c["protocolNumber"], _fd(c["protocolDate"]),
+                                           " · редакция %s" % c["protocolV"] if c["protocolV"] else "")),
+              ("Вопрос повестки", ("№%s %s" % (c["agendaN"], c["itemTitle"])) if c["agendaN"] else "не привязан"),
+              ("Формулировка", c["text"]), ("Основание", c["basis"] or "—"),
+              ("Дата принятия", _fd(c["adoptedAt"])), ("Дата вступления в силу", _fd(c["effectiveFrom"]) or "—"),
+              ("Ответственный", c["respName"]), ("Участники исполнения", ", ".join(c["participantsNames"]) or "—"),
+              ("Срок", _fd(c["due"])), ("Критерии результата", c["criteria"] or "—"),
+              ("Статус", c["status"]), ("Результат", c["result"] or "—")])
+        d.h1("2. Поручения")
+        if c["taskRows"]:
+            d.table(["Поручение", "Наименование", "Исполнитель", "Срок", "Состояние", "Выполнение, %"],
+                    [[t["code"], t["title"], t["assigneeName"], _fd(t["due"]), t["dirStatus"], t["progress"]]
+                     for t in c["taskRows"]], aligns=[None, None, None, None, None, "right"])
+        else:
+            d.p("Поручения по решению не созданы.")
+        d.h1("3. Связанные объекты")
+        d.kv([("Проекты", ", ".join("%s %s" % (x["code"], x["name"]) for x in c["projectRows"]) or "—"),
+              ("Задачи", ", ".join("%s %s" % (x["code"], x["title"]) for x in c["linkRows"]) or "—"),
+              ("Риски", ", ".join("%s %s" % (x["code"], x["title"]) for x in c["riskRows"]) or "—")])
+        d.h1("4. Документы")
+        if c["docRows"]:
+            d.table(["Документ", "Вид", "Версия", "Примечание"],
+                    [[x["name"], "Документ M09" if x["kind"] == "doc" else "Ссылка: %s" % x["url"],
+                      x["docV"] or "—", x["note"] or "—"] for x in c["docRows"]])
+        else:
+            d.p("Документы к решению не приложены.")
+        d.h1("5. История")
+        if c["historyRows"]:
+            d.table(["Дата и время", "Кто", "Действие", "Сведения"],
+                    [[datetime.datetime.fromtimestamp(x["ts"] / 1000).strftime("%d.%m.%Y %H:%M"),
+                      x["byName"], x["action"],
+                      x.get("note") or ("%s → %s" % (x.get("from", ""), x.get("to", "")) if x["action"] == "status" else "")]
+                     for x in c["historyRows"]])
+        else:
+            d.p("История решения пуста.")
+        d.signatures([("Ответственный", c["respName"]), ("Проверил", "")])
+        return d, "reshenie_%s" % c["code"]
 
     if kind == "report":
         r = db.get_ent(cur, "report", id_)
@@ -6357,6 +6440,567 @@ def h_meeting_run_finish(db, cur, u, p):
     return _run_view(db, cur, m), \
         msg("Совещание завершено", "Статус «Проведено» · черновик протокола готов (MTG-09)")
 
+# ---------------- M16 MTG-11/MTG-12: реестр решений и карточка решения ----------------
+# ТТ-2, экранные требования §14 (MTG-11) и §15 (MTG-12): решение имеет самостоятельный
+# идентификатор и номер, связь с вопросом повестки и протоколом, тип, статус, ответственного,
+# срок, поручения, документы, связанные объекты, комментарии и историю.
+
+DEC_TYPES = ("Организационное", "Техническое", "Проектное", "Ресурсное", "Финансовое",
+             "Кадровое", "Контрольное", "Информационное", "Иное")
+DEC_ST = ("Проект", "На согласовании", "Принято", "Действует", "Изменено", "Отменено", "Исполнено")
+# допустимые переходы статуса решения (MTG-11 §14.4)
+DEC_TRANS = {
+    "Проект": ("На согласовании", "Принято", "Отменено"),
+    "На согласовании": ("Принято", "Проект", "Отменено"),
+    "Принято": ("Действует", "Изменено", "Отменено", "Исполнено"),
+    "Действует": ("Изменено", "Отменено", "Исполнено"),
+    "Изменено": ("Действует", "Отменено", "Исполнено"),
+    "Исполнено": (),
+    "Отменено": (),
+}
+DEC_ACTIVE = ("Проект", "На согласовании", "Принято", "Действует", "Изменено")
+DEC_LIMITS = {"text": 2000, "basis": 2000, "criteria": 2000, "result": 2000,
+              "comment": 2000, "reason": 500, "note": 300, "name": 200}
+DEC_DOCS_MAX = 20
+DEC_PROJECTS_MAX = 20
+DEC_TASKS_MAX = 20
+DEC_RISKS_MAX = 10
+DEC_PARTS_MAX = 10
+DEC_HIST_MAX = 100
+DEC_COMMENT_MAX = 200
+DEC_LINK_KINDS = {"project": ("projects", DEC_PROJECTS_MAX, "проект"),
+                  "task": ("tasks", DEC_TASKS_MAX, "задача"),
+                  "risk": ("risks", DEC_RISKS_MAX, "риск")}
+# существенные условия: их правка переводит принятое решение в статус «Изменено» (MTG-11 §14.4)
+DEC_MATERIAL_FIELDS = ("text", "due", "resp", "criteria")
+
+
+def dec_norm(m):
+    """Приводит решения совещания к структуре MTG-11/MTG-12 (записи прежних версий дополняются)."""
+    ds = m.get("decisions") if isinstance(m.get("decisions"), list) else []
+    for i, d in enumerate(ds):
+        if not d.get("id"): d["id"] = uid("md")
+        d["n"] = i + 1
+        for k, v in (("code", ""), ("text", ""), ("type", "Иное"), ("status", "Принято"),
+                     ("resp", ""), ("due", ""), ("basis", ""), ("adoptedAt", ""), ("effectiveFrom", ""),
+                     ("criteria", ""), ("result", ""), ("resultBy", ""), ("statusBy", ""),
+                     ("createdBy", ""), ("itemId", "")):
+            if not isinstance(d.get(k), str): d[k] = v
+        if d["type"] not in DEC_TYPES: d["type"] = "Иное"
+        if d["status"] not in DEC_ST: d["status"] = "Принято"
+        for k in ("taskIds", "participants", "projects", "tasks", "risks", "docs", "comments", "history"):
+            if not isinstance(d.get(k), list): d[k] = []
+        if not isinstance(d.get("agendaN"), int): d["agendaN"] = None
+        for k in ("createdAt", "statusAt", "resultAt"):
+            if not isinstance(d.get(k), int): d[k] = None
+        if not d["adoptedAt"]: d["adoptedAt"] = m.get("date") or ""
+        if not d["code"]: d["code"] = "%s-Р%d" % (m.get("code", "СОВ"), d["n"])
+        if not d["itemId"] and d["agendaN"]:
+            a = next((x for x in (m.get("agenda") or []) if x.get("n") == d["agendaN"]), None)
+            if a: d["itemId"] = a.get("id") or ""
+        if not d["taskIds"] and d.get("taskId"): d["taskIds"] = [d["taskId"]]
+        d["taskId"] = d["taskIds"][0] if d["taskIds"] else None
+    m["decisions"] = ds
+    return ds
+
+
+def dec_of(m, did):
+    return next((x for x in dec_norm(m) if x["id"] == did), None)
+
+
+def _dec_find(db, cur, p):
+    """Решение выбирается по самостоятельному идентификатору — в совещании или во всём реестре."""
+    did = p.get("decisionId") or p.get("did")
+    if not did: raise RpcError("Не указано решение (decisionId)", "Проверка входных данных")
+    if p.get("id"):
+        m = get_req(db, cur, "meeting", p["id"])
+        d = dec_of(m, did)
+        if not d: raise RpcError("Решение не найдено в совещании: %s" % did, "Решения", 404, "NOT_FOUND")
+        return m, d
+    for m in db.all_ent(cur, "meeting", order="code"):
+        d = dec_of(m, did)
+        if d: return m, d
+    raise RpcError("Решение не найдено: %s" % did, "Решения", 404, "NOT_FOUND")
+
+
+def _dec_hist(d, by, action, **kw):
+    rec = {"ts": now_ms(), "by": by, "action": action}
+    rec.update(kw)
+    d["history"] = (d["history"] + [rec])[-DEC_HIST_MAX:]
+    return rec
+
+
+def _dec_guard(db, cur, u, m, op="edit"):
+    guard(db, cur, u, "meetings", op, m)
+    return m
+
+
+def _dec_tasks(db, cur, d):
+    return [t for t in (db.get_ent(cur, "task", x) for x in dec_task_ids(d)) if t]
+
+
+def _dec_ready(db, cur, d):
+    """Готовность к статусу «Исполнено» (MTG-11 §14.4): все обязательные действия выполнены
+       либо зафиксирован подтверждённый результат."""
+    tasks = _dec_tasks(db, cur, d)
+    active = [t for t in tasks if t["status"] != "Отменена"]
+    undone = [t for t in active if t["status"] not in DONE_ST]
+    res = (d.get("result") or "").strip()
+    can = bool(active and not undone) or bool(res)
+    if can:
+        why = ("Все поручения исполнены: %d из %d" % (len(active), len(active))) if active and not undone \
+            else "Зафиксирован подтверждённый результат исполнения"
+    elif undone:
+        why = "Не исполнены поручения: %s" % ", ".join("%s (%s)" % (t["code"], t["status"]) for t in undone)
+    else:
+        why = "Поручения не созданы и результат не подтверждён — зафиксируйте результат исполнения решения"
+    return {"tasks": len(tasks), "active": len(active), "done": len(active) - len(undone),
+            "open": [{"id": t["id"], "code": t["code"], "title": t["title"], "status": t["status"],
+                      "assignee": t["assignee"], "due": t["end"]} for t in undone],
+            "result": res, "canComplete": can, "reason": why}
+
+
+def _dec_overdue(d):
+    return bool(d.get("due")) and d["due"] < dISO(today()) and d["status"] in DEC_ACTIVE
+
+
+def _dec_protocol(db, cur, m):
+    pr = prot_of(m)
+    rq = req_of(db, cur, m)
+    ver = next((v for v in reversed(pr["versions"]) if v["v"] == pr["version"]), None)
+    return {"number": rq["number"], "date": rq["date"], "version": pr["version"] or None,
+            "status": pr["status"],
+            "doc": ({"docId": ver["docId"], "docCode": ver["docCode"], "docV": ver["docV"]} if ver else None)}
+
+
+def dec_row(db, cur, m, d):
+    """Строка реестра решений со всеми столбцами MTG-11 §14.2."""
+    tasks = _dec_tasks(db, cur, d)
+    ready = _dec_ready(db, cur, d)
+    a = next((x for x in (m.get("agenda") or []) if x.get("n") == d.get("agendaN")), None)
+    pr = _dec_protocol(db, cur, m)
+    return {"id": d["id"], "code": d["code"], "n": d["n"], "text": d["text"], "type": d["type"],
+            "status": d["status"], "resp": d["resp"], "respName": _uname(db, cur, d["resp"]),
+            "due": d["due"], "adoptedAt": d["adoptedAt"], "effectiveFrom": d["effectiveFrom"],
+            "meetingId": m["id"], "meetingCode": m["code"], "meetingTitle": m.get("title", ""),
+            "meetingDate": m.get("date"), "meetingStatus": m.get("status"),
+            "protocolNumber": pr["number"], "protocolDate": pr["date"], "protocolV": pr["version"],
+            "protocolStatus": pr["status"], "protocolDoc": pr["doc"],
+            "agendaN": d["agendaN"], "itemId": d["itemId"] or (a or {}).get("id", ""),
+            "itemTitle": (a or {}).get("title", ""),
+            "tasksCount": len(tasks), "tasksDone": ready["done"], "tasksOpen": len(ready["open"]),
+            "overdue": _dec_overdue(d),
+            "overdueDays": diffD(dISO(today()), d["due"]) if _dec_overdue(d) else 0,
+            "docsCount": len(d["docs"]), "commentsCount": len(d["comments"]),
+            "projectsCount": len(d["projects"]), "linksCount": len(d["tasks"]) + len(d["risks"]),
+            "canComplete": ready["canComplete"], "readyReason": ready["reason"],
+            "statusAt": d["statusAt"], "statusBy": d["statusBy"],
+            "createdAt": d["createdAt"], "createdBy": d["createdBy"]}
+
+
+def dec_card(db, cur, m, d):
+    """Карточка решения MTG-12: все поля и данные пяти вкладок."""
+    row = dec_row(db, cur, m, d)
+    tasks = _dec_tasks(db, cur, d)
+    row.update({
+        "basis": d["basis"], "criteria": d["criteria"], "result": d["result"],
+        "resultAt": d["resultAt"], "resultBy": d["resultBy"],
+        "resultByName": _uname(db, cur, d["resultBy"]),
+        "participants": d["participants"],
+        "participantsNames": [_uname(db, cur, x) for x in d["participants"]],
+        "readiness": _dec_ready(db, cur, d),
+        "transitions": list(DEC_TRANS.get(d["status"], ())),
+        "editable": m.get("status") != MEET_CANCELLED,
+        "taskRows": [{"id": t["id"], "code": t["code"], "title": t["title"], "status": t["status"],
+                      "dirStatus": directive_status(t) if t.get("type") == "directive" else t["status"],
+                      "assignee": t["assignee"], "assigneeName": _uname(db, cur, t["assignee"]),
+                      "due": t["end"], "progress": 100 if t["status"] in DONE_ST else t["progress"],
+                      "overdue": directive_overdue(t), "projectId": t["projectId"],
+                      "criteria": dir_of(t).get("criteria", "")} for t in tasks],
+        "projectRows": [{"id": x, "code": (db.get_ent(cur, "project", x) or {}).get("code", x),
+                         "name": (db.get_ent(cur, "project", x) or {}).get("name", ""),
+                         "status": (db.get_ent(cur, "project", x) or {}).get("status", ""),
+                         "missing": db.get_ent(cur, "project", x) is None} for x in d["projects"]],
+        "linkRows": [{"id": x, "code": (db.get_ent(cur, "task", x) or {}).get("code", x),
+                      "title": (db.get_ent(cur, "task", x) or {}).get("title", ""),
+                      "status": (db.get_ent(cur, "task", x) or {}).get("status", ""),
+                      "missing": db.get_ent(cur, "task", x) is None} for x in d["tasks"]],
+        "riskRows": [{"id": x, "code": (db.get_ent(cur, "risk", x) or {}).get("code", x),
+                      "title": (db.get_ent(cur, "risk", x) or {}).get("title", ""),
+                      "level": (db.get_ent(cur, "risk", x) or {}).get("level", ""),
+                      "missing": db.get_ent(cur, "risk", x) is None} for x in d["risks"]],
+        "docRows": [dict(x, authorName=_uname(db, cur, x.get("addedBy")),
+                         docCode=(db.get_ent(cur, "doc", x["docId"]) or {}).get("code", "") if x.get("docId") else "")
+                    for x in d["docs"]],
+        "commentRows": [dict(x, byName=_uname(db, cur, x.get("by"))) for x in d["comments"]],
+        "historyRows": [dict(x, byName=_uname(db, cur, x.get("by"))) for x in reversed(d["history"])],
+    })
+    return row
+
+
+def _dec_user(db, cur, uid_, label="Ответственный"):
+    cur.execute("SELECT id FROM users WHERE id=%s AND NOT blocked", (uid_,))
+    if not cur.fetchone(): raise RpcError("%s не найден или заблокирован: %s" % (label, uid_))
+    return uid_
+
+
+def _dec_notify(db, cur, m, d, type_, title, body):
+    for uid_ in dict.fromkeys([d["resp"]] + list(d["participants"])):
+        if uid_:
+            notify(db, cur, uid_, type_, title, body, "Решение", d["id"],
+                   dedupe="%s:%s:%s:%s" % (type_, uid_, d["id"], now_ms()))
+
+
+def _dec_fields(db, cur, u, m, d, p):
+    """Правка полей карточки решения (MTG-12). Возвращает список изменённых полей."""
+    vals = {}
+    for k in ("text", "basis", "criteria", "result"):
+        if k in p:
+            v = str(p[k] if p[k] is not None else "").strip()
+            if len(v) > DEC_LIMITS[k]:
+                raise RpcError("Поле «%s» — не более %d символов" % (k, DEC_LIMITS[k]))
+            if k == "text" and not v: raise RpcError("Не заполнена формулировка решения")
+            vals[k] = v
+    if "type" in p:
+        if p["type"] not in DEC_TYPES:
+            raise RpcError("Неизвестный тип решения: %s. Допустимые: %s" % (p["type"], ", ".join(DEC_TYPES)))
+        vals["type"] = p["type"]
+    if "resp" in p: vals["resp"] = _dec_user(db, cur, p["resp"]) if p["resp"] else ""
+    if "due" in p:
+        if p["due"]: check_date(p["due"], "дата срока решения")
+        vals["due"] = p["due"] or ""
+    for k, label in (("adoptedAt", "дата принятия"), ("effectiveFrom", "дата вступления в силу")):
+        if k in p:
+            if p[k]: check_date(p[k], label)
+            vals[k] = p[k] or ""
+    if "participants" in p:
+        parts = []
+        for x in (p["participants"] or [])[:DEC_PARTS_MAX]:
+            if x and x not in parts: parts.append(_dec_user(db, cur, x, "Участник исполнения"))
+        if len(p["participants"] or []) > DEC_PARTS_MAX:
+            raise RpcError("Участников исполнения — не более %d" % DEC_PARTS_MAX)
+        vals["participants"] = parts
+    if "agendaN" in p or "itemId" in p:
+        items = m.get("agenda") or []
+        a = None
+        if p.get("itemId"):
+            a = next((x for x in items if x.get("id") == p["itemId"]), None)
+            if not a: raise RpcError("Вопрос повестки не найден: %s" % p["itemId"], "Повестка", 404, "NOT_FOUND")
+        elif p.get("agendaN") is not None:
+            a = next((x for x in items if x.get("n") == int(p["agendaN"])), None)
+            if not a: raise RpcError("Пункт повестки не найден: %s" % p["agendaN"])
+        vals["agendaN"] = a["n"] if a else None
+        vals["itemId"] = (a.get("id") or "") if a else ""
+    eff = vals.get("effectiveFrom", d["effectiveFrom"])
+    adopted = vals.get("adoptedAt", d["adoptedAt"])
+    if eff and adopted and eff < adopted:
+        raise RpcError("Дата вступления в силу не может быть раньше даты принятия решения (%s)" % _fd(adopted))
+    changed = [k for k, v in vals.items() if d.get(k) != v]
+    for k in changed: d[k] = vals[k]
+    return changed
+
+
+def _dec_status(db, cur, u, m, d, to, reason="", result=None):
+    """Переход статуса решения по правилам MTG-11 §14.4."""
+    if to not in DEC_ST:
+        raise RpcError("Неизвестный статус решения: %s. Допустимые: %s" % (to, ", ".join(DEC_ST)))
+    was = d["status"]
+    if to == was: raise RpcError("Решение уже в статусе «%s»" % to)
+    if to not in DEC_TRANS.get(was, ()):
+        raise RpcError("Переход «%s» → «%s» недопустим. Из статуса «%s» доступны: %s"
+                       % (was, to, was, ", ".join(DEC_TRANS[was]) or "переходы отсутствуют"),
+                       "Статус решения")
+    reason = str(reason or "").strip()[:DEC_LIMITS["reason"]]
+    if to in ("Отменено", "Изменено") and not reason:
+        raise RpcError("Укажите основание %s решения" % ("отмены" if to == "Отменено" else "изменения"))
+    if result is not None:
+        res = str(result).strip()
+        if len(res) > DEC_LIMITS["result"]: raise RpcError("Результат — не более %d символов" % DEC_LIMITS["result"])
+        if res:
+            d["result"] = res; d["resultAt"] = now_ms(); d["resultBy"] = u["id"]
+    if to == "Исполнено":
+        ready = _dec_ready(db, cur, d)
+        if not ready["canComplete"]:
+            raise RpcError("Статус «Исполнено» недоступен: %s" % ready["reason"], "Статус решения")
+    if to == "Принято" and not d["adoptedAt"]:
+        d["adoptedAt"] = m.get("date") or dISO(today())
+    if to == "Действует" and not d["effectiveFrom"]:
+        d["effectiveFrom"] = d["adoptedAt"] or dISO(today())
+    d["status"] = to; d["statusAt"] = now_ms(); d["statusBy"] = u["id"]
+    _dec_hist(d, u["id"], "status", **{"from": was, "to": to, "reason": reason})
+    return was
+
+
+@reg("meeting.decisions.list")
+def h_meeting_decisions_list(db, cur, u, p):
+    """Реестр решений MTG-11: все решения совещаний с фильтрами и сводкой."""
+    guard(db, cur, u, "meetings", "view")
+    f = p or {}
+    for k, vals, label in (("type", DEC_TYPES, "тип решения"), ("status", DEC_ST, "статус решения")):
+        if f.get(k) and f[k] not in vals:
+            raise RpcError("Неизвестный %s: %s. Допустимые: %s" % (label, f[k], ", ".join(vals)))
+    rows = []
+    for m in db.all_ent(cur, "meeting", order="code"):
+        for d in dec_norm(m):
+            rows.append(dec_row(db, cur, m, d))
+    total_all = len(rows)
+    if f.get("meetingId"): rows = [r for r in rows if r["meetingId"] == f["meetingId"]]
+    if f.get("type"): rows = [r for r in rows if r["type"] == f["type"]]
+    if f.get("status"): rows = [r for r in rows if r["status"] == f["status"]]
+    if f.get("resp"): rows = [r for r in rows if r["resp"] == f["resp"]]
+    if f.get("itemId"): rows = [r for r in rows if r["itemId"] == f["itemId"]]
+    if f.get("projectId"):
+        rows = [r for r in rows
+                if f["projectId"] in (dec_of(get_req(db, cur, "meeting", r["meetingId"]), r["id"]) or {}).get("projects", [])]
+    if f.get("from"): rows = [r for r in rows if (r["due"] or "") >= f["from"]]
+    if f.get("to"): rows = [r for r in rows if (r["due"] or "") <= f["to"]]
+    if f.get("adoptedFrom"): rows = [r for r in rows if (r["adoptedAt"] or "") >= f["adoptedFrom"]]
+    if f.get("adoptedTo"): rows = [r for r in rows if (r["adoptedAt"] or "") <= f["adoptedTo"]]
+    if f.get("overdue"): rows = [r for r in rows if r["overdue"]]
+    if f.get("noTasks"): rows = [r for r in rows if not r["tasksCount"]]
+    if f.get("ready"): rows = [r for r in rows if r["canComplete"] and r["status"] in DEC_ACTIVE]
+    if f.get("active"): rows = [r for r in rows if r["status"] in DEC_ACTIVE]
+    if f.get("q"):
+        q = str(f["q"]).lower()
+        rows = [r for r in rows if q in (" ".join([r["code"], r["text"], r["meetingCode"], r["meetingTitle"],
+                                                  r["itemTitle"], r["protocolNumber"]])).lower()]
+    rows.sort(key=lambda r: (r["meetingDate"] or "", r["meetingCode"], r["n"]), reverse=True)
+    return {"rows": rows, "total": len(rows), "all": total_all,
+            "types": list(DEC_TYPES), "statuses": list(DEC_ST),
+            "byStatus": {s: sum(1 for r in rows if r["status"] == s) for s in DEC_ST},
+            "byType": {t: sum(1 for r in rows if r["type"] == t) for t in DEC_TYPES},
+            "stats": {"total": len(rows), "active": sum(1 for r in rows if r["status"] in DEC_ACTIVE),
+                      "done": sum(1 for r in rows if r["status"] == "Исполнено"),
+                      "cancelled": sum(1 for r in rows if r["status"] == "Отменено"),
+                      "overdue": sum(1 for r in rows if r["overdue"]),
+                      "noTasks": sum(1 for r in rows if not r["tasksCount"]),
+                      "ready": sum(1 for r in rows if r["canComplete"] and r["status"] in DEC_ACTIVE),
+                      "tasks": sum(r["tasksCount"] for r in rows)}}, None
+
+
+@reg("meeting.decisions.get")
+def h_meeting_decisions_get(db, cur, u, p):
+    """Карточка решения MTG-12: основные сведения, поручения, связи, документы, история."""
+    m, d = _dec_find(db, cur, p)
+    guard(db, cur, u, "meetings", "view", m)
+    return dec_card(db, cur, m, d), None
+
+
+@reg("meeting.decisions.update")
+def h_meeting_decisions_update(db, cur, u, p):
+    """Правка карточки решения. Существенные условия принятого решения переводят его в «Изменено»."""
+    m, d = _dec_find(db, cur, p); _dec_guard(db, cur, u, m)
+    if d["status"] in ("Исполнено", "Отменено"):
+        raise RpcError("Решение в статусе «%s» не изменяется: оформите новое решение" % d["status"], "Карточка решения")
+    changed = _dec_fields(db, cur, u, m, d, p)
+    if not changed: raise RpcError("Поля решения не изменились")
+    material = [k for k in changed if k in DEC_MATERIAL_FIELDS]
+    auto = ""
+    if material and d["status"] in ("Принято", "Действует"):
+        auto = _dec_status(db, cur, u, m, d, "Изменено",
+                           reason="Изменены существенные условия: " + ", ".join(material))
+    _dec_hist(d, u["id"], "update", fields=changed, note="Изменены поля карточки решения")
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Изменена карточка решения", "Совещание", m["id"],
+             {"code": m["code"], "decision": d["code"], "fields": changed, "status": d["status"],
+              "event": "MEETING_DECISION_UPDATED",
+              "events": ["MEETING_DECISION_UPDATED"] + (["MEETING_DECISION_CHANGED"] if auto else [])})
+    return {"meeting": m, "decision": dec_card(db, cur, m, d)}, \
+        msg("Решение изменено", "Полей: %d%s" % (len(changed), " · статус «Изменено»" if auto else ""))
+
+
+@reg("meeting.decisions.status")
+def h_meeting_decisions_status(db, cur, u, p):
+    """Статус решения (MTG-11 §14.4). «Исполнено» — только при выполненных обязательных действиях."""
+    m, d = _dec_find(db, cur, p); _dec_guard(db, cur, u, m)
+    req(p, "to")
+    was = _dec_status(db, cur, u, m, d, p["to"], p.get("reason"), p.get("result"))
+    db.save_ent(cur, "meeting", m)
+    ev = {"Исполнено": "MEETING_DECISION_COMPLETED", "Отменено": "MEETING_DECISION_CANCELLED",
+          "Изменено": "MEETING_DECISION_CHANGED"}.get(d["status"], "MEETING_DECISION_STATUS")
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Статус решения изменён", "Совещание", m["id"],
+             {"code": m["code"], "decision": d["code"], "from": was, "to": d["status"],
+              "reason": p.get("reason") or "", "event": ev,
+              "events": [ev, "MEETING_DECISION_UPDATED"]})
+    _dec_notify(db, cur, m, d, "decision.status", "Решение %s: %s" % (d["code"], d["status"]),
+                "%s · совещание %s%s" % (d["text"][:120], m["code"],
+                                         " · основание: " + p["reason"] if p.get("reason") else ""))
+    LOG.info("Решение %s совещания %s: статус %s → %s", d["code"], m["code"], was, d["status"])
+    return {"meeting": m, "decision": dec_card(db, cur, m, d)}, \
+        msg("Статус решения: %s" % d["status"], "%s · было «%s»" % (d["code"], was))
+
+
+@reg("meeting.decisions.check")
+def h_meeting_decisions_check(db, cur, u, p):
+    """Проверка готовности решения к статусу «Исполнено» (обязательные действия и результат)."""
+    m, d = _dec_find(db, cur, p)
+    guard(db, cur, u, "meetings", "view", m)
+    r = _dec_ready(db, cur, d)
+    r.update({"decisionId": d["id"], "code": d["code"], "status": d["status"],
+              "transitions": list(DEC_TRANS.get(d["status"], ()))})
+    return r, None
+
+
+@reg("meeting.decisions.comment")
+def h_meeting_decisions_comment(db, cur, u, p):
+    """Комментарий к решению (MTG-12)."""
+    m, d = _dec_find(db, cur, p); _dec_guard(db, cur, u, m)
+    text = str(p.get("text") or "").strip()
+    if not text: raise RpcError("Не заполнен текст комментария")
+    if len(text) > DEC_LIMITS["comment"]: raise RpcError("Комментарий — не более %d символов" % DEC_LIMITS["comment"])
+    c = {"id": uid("dc"), "ts": now_ms(), "by": u["id"], "text": text}
+    d["comments"] = (d["comments"] + [c])[-DEC_COMMENT_MAX:]
+    _dec_hist(d, u["id"], "comment", note=text[:120])
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Комментарий к решению", "Совещание", m["id"],
+             {"code": m["code"], "decision": d["code"], "event": "MEETING_DECISION_COMMENT"})
+    return {"meeting": m, "decision": dec_card(db, cur, m, d), "comment": c}, \
+        msg("Комментарий добавлен", d["code"])
+
+
+@reg("meeting.decisions.link")
+def h_meeting_decisions_link(db, cur, u, p):
+    """Связанные объекты решения (MTG-12): проекты, задачи, риски."""
+    m, d = _dec_find(db, cur, p); _dec_guard(db, cur, u, m)
+    kind = p.get("kind")
+    if kind not in DEC_LINK_KINDS:
+        raise RpcError("Неизвестный вид связи: %s. Допустимые: %s" % (kind, ", ".join(DEC_LINK_KINDS)))
+    field, limit, label = DEC_LINK_KINDS[kind]
+    tid = p.get("targetId") or p.get("target")
+    if not tid: raise RpcError("Не указан объект связи (targetId)")
+    get_req(db, cur, kind, tid)
+    if tid in d[field]: raise RpcError("Этот %s уже связан с решением" % label)
+    if len(d[field]) >= limit: raise RpcError("Связанных объектов вида «%s» — не более %d" % (label, limit))
+    d[field].append(tid)
+    _dec_hist(d, u["id"], "link", kind=kind, target=tid, note="Добавлена связь: %s" % label)
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Решение связано с объектом", "Совещание", m["id"],
+             {"code": m["code"], "decision": d["code"], "kind": kind, "target": tid,
+              "event": "MEETING_DECISION_LINKED"})
+    return {"meeting": m, "decision": dec_card(db, cur, m, d)}, msg("Связь добавлена", label.capitalize())
+
+
+@reg("meeting.decisions.unlink")
+def h_meeting_decisions_unlink(db, cur, u, p):
+    m, d = _dec_find(db, cur, p); _dec_guard(db, cur, u, m)
+    kind = p.get("kind")
+    if kind not in DEC_LINK_KINDS: raise RpcError("Неизвестный вид связи: %s" % kind)
+    field, limit, label = DEC_LINK_KINDS[kind]
+    tid = p.get("targetId") or p.get("target")
+    if tid not in d[field]: raise RpcError("Связь не найдена: %s" % tid, "Решения", 404, "NOT_FOUND")
+    d[field].remove(tid)
+    _dec_hist(d, u["id"], "unlink", kind=kind, target=tid, note="Снята связь: %s" % label)
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Связь решения снята", "Совещание", m["id"],
+             {"code": m["code"], "decision": d["code"], "kind": kind, "target": tid,
+              "event": "MEETING_DECISION_UNLINKED"})
+    return {"meeting": m, "decision": dec_card(db, cur, m, d)}, msg("Связь снята", label.capitalize())
+
+
+@reg("meeting.decisions.attach")
+def h_meeting_decisions_attach(db, cur, u, p):
+    """Документы решения (MTG-12): документ M09 с фиксацией версии либо ссылка ЛВС."""
+    m, d = _dec_find(db, cur, p); _dec_guard(db, cur, u, m)
+    if len(d["docs"]) >= DEC_DOCS_MAX: raise RpcError("Документов решения — не более %d" % DEC_DOCS_MAX)
+    note = str(p.get("note") or "").strip()[:DEC_LIMITS["note"]]
+    if p.get("docId"):
+        doc = get_req(db, cur, "doc", p["docId"])
+        vs = [v["v"] for v in (doc.get("versions") or [])] or [1]
+        dv = p.get("docV")
+        if dv is not None:
+            try: dv = int(dv)
+            except (TypeError, ValueError): raise RpcError("Версия документа — целое число")
+            if dv not in vs: raise RpcError("Версия документа не найдена: %s" % dv, "Документы", 404, "NOT_FOUND")
+        else:
+            dv = max(vs)
+        if any(x.get("docId") == doc["id"] and x.get("docV") == dv for x in d["docs"]):
+            raise RpcError("Документ %s версии %d уже приложен к решению" % (doc["code"], dv))
+        name = (p.get("name") or "%s · %s" % (doc["code"], doc["title"]))[:DEC_LIMITS["name"]]
+        item = {"id": uid("dd"), "kind": "doc", "docId": doc["id"], "docV": dv, "name": name,
+                "url": "", "note": note, "addedAt": now_ms(), "addedBy": u["id"]}
+    else:
+        req(p, "name", "url")
+        url = str(p["url"]).strip()[:500]
+        if re.match(r"^\s*(javascript|data|vbscript):", url, re.I): raise RpcError("Недопустимая схема ссылки")
+        if any(x.get("url") == url for x in d["docs"]): raise RpcError("Эта ссылка уже приложена к решению")
+        item = {"id": uid("dd"), "kind": "link", "docId": None, "docV": None,
+                "name": str(p["name"]).strip()[:DEC_LIMITS["name"]], "url": url, "note": note,
+                "addedAt": now_ms(), "addedBy": u["id"]}
+    d["docs"].append(item)
+    _dec_hist(d, u["id"], "attach", note="Приложен документ: %s" % item["name"])
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "К решению приложен документ", "Совещание", m["id"],
+             {"code": m["code"], "decision": d["code"], "doc": item["name"], "docV": item["docV"],
+              "event": "MEETING_DECISION_DOC_ATTACHED"})
+    return {"meeting": m, "decision": dec_card(db, cur, m, d), "doc": item}, \
+        msg("Документ приложен", item["name"])
+
+
+@reg("meeting.decisions.detach")
+def h_meeting_decisions_detach(db, cur, u, p):
+    m, d = _dec_find(db, cur, p); _dec_guard(db, cur, u, m)
+    aid = p.get("attachId") or p.get("docRowId")
+    x = next((y for y in d["docs"] if y["id"] == aid), None)
+    if not x: raise RpcError("Приложение решения не найдено: %s" % aid, "Решения", 404, "NOT_FOUND")
+    d["docs"].remove(x)
+    _dec_hist(d, u["id"], "detach", note="Откреплён документ: %s" % x["name"])
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Документ решения откреплён", "Совещание", m["id"],
+             {"code": m["code"], "decision": d["code"], "doc": x["name"],
+              "event": "MEETING_DECISION_DOC_DETACHED"})
+    return {"meeting": m, "decision": dec_card(db, cur, m, d)}, msg("Документ откреплён", x["name"])
+
+
+def _dec_register(db, cur, u, m, p):
+    """Регистрация решения совещания со сквозным номером (MTG-11 §14.1)."""
+    req(p, "text", "resp", "due"); check_date(p["due"], "дата срока решения")
+    agenda_n = p.get("agendaN")
+    item_id = ""
+    if p.get("itemId"):
+        a = next((x for x in (m.get("agenda") or []) if x.get("id") == p["itemId"]), None)
+        if not a: raise RpcError("Вопрос повестки не найден: %s" % p["itemId"], "Повестка", 404, "NOT_FOUND")
+        agenda_n, item_id = a["n"], a["id"]
+    if agenda_n is not None:
+        agenda_n = int(agenda_n)
+        a = next((x for x in (m.get("agenda") or []) if x.get("n") == agenda_n), None)
+        if not a: raise RpcError("Пункт повестки не найден: %s" % agenda_n)
+        item_id = a.get("id") or ""
+    dtype = p.get("type") or "Иное"
+    if dtype not in DEC_TYPES:
+        raise RpcError("Неизвестный тип решения: %s. Допустимые: %s" % (dtype, ", ".join(DEC_TYPES)))
+    status = p.get("status") or "Принято"
+    if status not in DEC_ST:
+        raise RpcError("Неизвестный статус решения: %s. Допустимые: %s" % (status, ", ".join(DEC_ST)))
+    _dec_user(db, cur, p["resp"])
+    n = next_seq(db, cur, "decision")
+    adopted = p.get("adoptedAt") or m.get("date") or dISO(today())
+    check_date(adopted, "дата принятия решения")
+    eff = p.get("effectiveFrom") or ""
+    if eff:
+        check_date(eff, "дата вступления в силу")
+        if eff < adopted: raise RpcError("Дата вступления в силу не может быть раньше даты принятия решения")
+    parts = []
+    for x in (p.get("participants") or [])[:DEC_PARTS_MAX]:
+        if x and x not in parts: parts.append(_dec_user(db, cur, x, "Участник исполнения"))
+    d = {"id": uid("md"), "code": "Р-%s-%03d" % (datetime.date.today().year, n),
+         "text": str(p["text"]).strip()[:DEC_LIMITS["text"]], "type": dtype, "status": status,
+         "resp": p["resp"], "due": p["due"], "taskId": None, "taskIds": [],
+         "agendaN": agenda_n, "itemId": item_id,
+         "basis": str(p.get("basis") or "").strip()[:DEC_LIMITS["basis"]],
+         "criteria": str(p.get("criteria") or "").strip()[:DEC_LIMITS["criteria"]],
+         "adoptedAt": adopted, "effectiveFrom": eff, "participants": parts,
+         "projects": [], "tasks": [], "risks": [], "docs": [], "comments": [], "history": [],
+         "result": "", "resultAt": None, "resultBy": "",
+         "createdAt": now_ms(), "createdBy": u["id"], "statusAt": now_ms(), "statusBy": u["id"]}
+    if not d["text"]: raise RpcError("Не заполнена формулировка решения")
+    m["decisions"].append(d)
+    dec_norm(m)
+    _dec_hist(d, u["id"], "register", note="Решение зарегистрировано: %s" % d["code"], status=status)
+    for pid in (p.get("projects") or [])[:DEC_PROJECTS_MAX]:
+        get_req(db, cur, "project", pid)
+        if pid not in d["projects"]: d["projects"].append(pid)
+    return d
+
 # ---------------- Центр уведомлений и напоминаний (ТЗ M12 §8, M16 §2.11.1) ----------------
 # Единый контур доставки: уведомления хранятся на сервере (кому, тип, дата, канал, статус,
 # ошибка, дата прочтения), повторная доставка одного и того же события исключается ключом
@@ -6384,6 +7028,8 @@ NOTIF_TYPES = {
     "meeting.cancelled":  ("Отмена совещания", "meetings"),
     "meeting.materials":  ("Материалы к совещанию", "meetings"),
     "meeting.agenda":     ("Перенос вопросов повестки", "meetings"),
+    "decision.registered": ("Зарегистрировано решение совещания", "meetings"),
+    "decision.status":    ("Изменён статус решения", "meetings"),
     "protocol.review":    ("Протокол направлен на согласование", "meetings"),
     "protocol.approved":  ("Протокол утверждён", "meetings"),
     "protocol.rework":    ("Протокол возвращён на доработку", "meetings"),

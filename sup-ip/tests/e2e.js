@@ -8,8 +8,15 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  if(v)return true; if(Date.now()-t0>=ms)return false; await sleep(step);}};
 
 (async()=>{
- const browser = await puppeteer.launch({headless:'new',args:['--no-sandbox','--disable-dev-shm-usage']});
+ const browser = await puppeteer.launch({headless:'new',protocolTimeout:300000,
+  args:['--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--disable-software-rasterizer',
+   '--disable-extensions','--mute-audio','--renderer-process-limit=1','--disable-background-networking',
+   '--disable-background-timer-throttling','--disable-renderer-backgrounding','--disable-backgrounding-occluded-windows',
+   '--disable-features=Translate,BackForwardCache,MediaRouter,OptimizationHints,CalculateNativeWinOcclusion',
+   '--no-first-run','--no-default-browser-check','--disable-default-apps','--js-flags=--max-old-space-size=384']});
  const page = await browser.newPage();
+ // скриншоты — отладочные артефакты; в стеснённой по памяти среде их сбой не должен прерывать испытания
+ const shot = async name => { try{ await page.screenshot({path:'/tmp/e2e/'+name}); }catch(e){ console.log('  (скриншот пропущен: '+name+')'); } };
  await page.setViewport({width:1440,height:900});
  const errors=[];
  page.on('pageerror',e=>errors.push('pageerror: '+e.message));
@@ -36,7 +43,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  await sleep(400);
  ok('дашборд: KPI виджеты', (await page.$$('.kpi')).length>=4);
  ok('роль РП видна', (await page.evaluate(()=>App.user.role))==='pm');
- await page.screenshot({path:'/tmp/e2e/shot_dash.png'});
+ await shot('shot_dash.png');
 
  console.log('== Модули: рендер ==');
  for(const [key,sel] of [['portfolio','.tbl'],['tasks','.tbl'],['kanban','.kb-col'],['gantt','svg'],['resources','.card'],['time','.tbl'],['control','.card'],['risks','.tbl'],['docs','.tbl'],['calcs','.tbl'],['analytics','svg'],['calendar','.cal-cell'],['reports','.card'],['meetings','.tbl'],['journal','.tbl'],['builder','.scenario']]){
@@ -75,7 +82,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  await page.evaluate(t=>App.kbApply(t,KB_COLS.find(c=>c.key==='work'),['В работе']),tid);
  await sleep(600);
  ok('канбан: карточка В работе', (await page.evaluate(t=>T_(t).status,tid))==='В работе');
- await page.screenshot({path:'/tmp/e2e/shot_kanban.png'});
+ await shot('shot_kanban.png');
  await page.evaluate(()=>nav('gantt'));
  await sleep(300);
  ok('гант отрисован', await page.$('svg')!==null);
@@ -155,7 +162,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  ok('попап центра уведомлений открыт', await page.$('.notif-pop')!==null);
  ok('приглашение доставлено сервером', (await page.evaluate(()=>document.getElementById('notif-pop').textContent)).includes('Приглашение: E2E совещание уведомлений'));
  ok('есть раздел подсказок из состояния', (await page.evaluate(()=>document.getElementById('notif-pop').textContent)).includes('Требует внимания'));
- await page.screenshot({path:'/tmp/e2e/shot_notifs.png'});
+ await shot('shot_notifs.png');
  const unreadBefore = await page.evaluate(()=>DB.notifUnread);
  await page.evaluate(()=>{ const i=App._notifs.findIndex(n=>n.title.includes('Приглашение')); App.notifGo(i,'srv'); });
  await sleep(600);
@@ -510,7 +517,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  });
  page.on('dialog',dlgPt);
  await page.evaluate(()=>document.getElementById('pb-save').click());
- await sleep(1400);
+ await waitFor(async()=>(await txtOf('#mpa-att'))==='4 / 0 / 0', 15000);
  page.off('dialog',dlgPt);
  ok('массовая операция выполнена после подтверждения', (await txtOf('#mpa-att'))==='4 / 0 / 0', await txtOf('#mpa-att'));
  ok('комментарий массовой операции применён', (await page.$eval('#mpa-row-u5',e=>e.textContent)).includes('Вернулся с объекта'));
@@ -827,7 +834,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  ok('статус «Направлен на согласование»', (await protTxt()).includes('Направлен на согласование'));
  ok('дата направления зарегистрирована', await page.evaluate(m=>{const x=DB.meetings.find(y=>y.id===m);return !!x.protocol.sentAt;},pmid));
  ok('кнопки результата согласования доступны', await page.evaluate(()=>!!document.getElementById('pr-agree')&&!!document.getElementById('pr-rework')));
- await page.screenshot({path:'/tmp/e2e/shot_protocol_route.png'});
+ await shot('shot_protocol_route.png');
  await page.evaluate(()=>document.getElementById('pr-rework').click());
  await sleep(250);
  await page.evaluate(()=>document.getElementById('pr-rework-go').click());
@@ -885,7 +892,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  await page.evaluate(()=>{App.closeDrawer();nav('meetings');App.f.mt.tab='prot';renderView();});
  await sleep(350);
  ok('режим «Протоколы» в реестре совещаний', (await page.evaluate(()=>document.getElementById('view').textContent)).includes('E2E протокол согласования'));
- await page.screenshot({path:'/tmp/e2e/shot_protocol_versions.png'});
+ await shot('shot_protocol_versions.png');
 
  console.log('== M16 §2.10: поручения из решений совещаний ==');
  const drRes = await rpcAs(admCookie,'meeting.create',{title:'E2E поручения из решений',type:'Оперативное',
@@ -923,7 +930,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  ok('соисполнитель сохранён', dt&&dt.dr.coassignees.join(',')==='u6', dt&&dt.dr.coassignees);
  ok('критерии завершения сохранены', dt&&dt.dr.criteria==='Отчёт подписан испытательной группой');
  ok('ссылки на совещание, решение и пункт повестки', dt&&dt.dr.meetingId===dmid&&dt.dr.decisionN===1&&dt.dr.agendaN===1);
- await page.screenshot({path:'/tmp/e2e/shot_directive_form.png'});
+ await shot('shot_directive_form.png');
  await page.evaluate(t=>openTask(t),dt.id);
  await sleep(400);
  ok('карточка задачи: блок «Основание поручения»', await page.$('#dir-basis')!==null);
@@ -938,13 +945,13 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  const dlg2 = async d=>{ await d.accept(); };
  page.on('dialog',dlg2);
  await page.evaluate(()=>document.getElementById('dr-save').click());
- await sleep(1100);
+ await waitFor(async()=>await page.evaluate(m=>DB.meetings.find(x=>x.id===m).decisions[0].taskIds.length===2,dmid), 15000);
  page.off('dialog',dlg2);
  ok('второе поручение создано после подтверждения', await page.evaluate(m=>DB.meetings.find(x=>x.id===m).decisions[0].taskIds.length===2,dmid));
  await page.evaluate((m,d)=>App.decisionEdit(m,d),dmid,ddid);
  await sleep(300);
- await page.evaluate(()=>{document.getElementById('de-text').value='E2E решение изменено без нового поручения';});
- await page.evaluate((m,d)=>App.decisionEditSave(m,d),dmid,ddid);
+ await page.evaluate(()=>{document.getElementById('de2-text').value='E2E решение изменено без нового поручения';App.markDirty();});
+ await page.evaluate(d=>App.decSaveEdit(d),ddid);
  await sleep(800);
  ok('правка решения не создаёт поручение повторно', await page.evaluate(m=>{
   const d=DB.meetings.find(x=>x.id===m).decisions[0];
@@ -953,7 +960,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  await page.evaluate(m=>{App.f.meetTab='dir';openMeeting(m);},dmid);
  await sleep(350);
  ok('вкладка «Поручения» показывает соисполнителей', (await page.evaluate(()=>document.getElementById('drawer-root').textContent)).includes('соисполнители'));
- await page.screenshot({path:'/tmp/e2e/shot_directive_list.png'});
+ await shot('shot_directive_list.png');
  await page.evaluate(()=>App.closeDrawer());
 
  console.log('== M16 §2.11: реестр поручений и приёмка результата ==');
@@ -963,7 +970,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  const regHead = await page.evaluate(()=>(document.querySelector('#dir-registry thead')||{}).textContent||'');
  ok('колонки реестра по ТЗ §2.11', ['Совещание','Протокол','Решение','Исполнитель','Соисполнители','Срок','Статус','Дата факта','Результат','Документы'].every(x=>regHead.includes(x)));
  ok('созданное поручение видно в реестре', (await page.evaluate(()=>document.getElementById('dir-registry').textContent)).includes('E2E поручение браузера'));
- await page.screenshot({path:'/tmp/e2e/shot_directive_registry.png'});
+ await shot('shot_directive_registry.png');
  await page.evaluate(()=>{const el=document.getElementById('drf-s');el.value='Не начато';el.dispatchEvent(new Event('change'));});
  await sleep(400);
  ok('фильтр реестра по статусу применён', await page.evaluate(()=>App.f.mt.df.s==='Не начато'));
@@ -995,7 +1002,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  await page.evaluate(()=>document.getElementById('dir-save').click());
  await sleep(900);
  ok('результат поручения сохранён', await page.evaluate(t=>DB.tasks.find(x=>x.id===t).result==='E2E результат поручения',rtid));
- await page.screenshot({path:'/tmp/e2e/shot_directive_card.png'});
+ await shot('shot_directive_card.png');
  // приёмка результата — руководитель подразделения
  await page.evaluate(()=>{App.closeDrawer();App.closeModal(true);App.logout();});
  await page.waitForSelector('.login-box',{timeout:10000});
@@ -1033,7 +1040,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  ok('шесть категорий отклонений на экране', ckCards===6, ckCards);
  ok('пороги контроля показаны', ctlTxt.includes('Порог приближения срока')&&ctlTxt.includes('без обновления состояния'));
  ok('состав получателей показан', ctlTxt.includes('получатели:'));
- await page.screenshot({path:'/tmp/e2e/shot_dir_control.png'});
+ await shot('shot_dir_control.png');
  // поручение без исполнителя и без срока — выявляется автоматически
  const ctlTid = await page.evaluate(async()=>{
   const t=DB.tasks.find(x=>x.type==='directive'&&x.code==='З-027')||DB.tasks.find(x=>x.type==='directive');
@@ -1080,7 +1087,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  ok('реестр всех поручений сформирован', await page.$('#dir-rep-table')!==null);
  const repTxt = await page.evaluate(()=>document.getElementById('view').textContent);
  ok('сводные показатели отчёта показаны', repTxt.includes('Сводные показатели')&&repTxt.includes('Всего поручений'));
- await page.screenshot({path:'/tmp/e2e/shot_dir_report.png'});
+ await shot('shot_dir_report.png');
  await page.evaluate(()=>{const el=document.getElementById('drp-kind');el.value='overdue';el.dispatchEvent(new Event('change'));});
  await sleep(400);
  await page.evaluate(()=>document.getElementById('drp-go').click());
@@ -1196,7 +1203,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  await page.evaluate(()=>App.notifTick());
  await sleep(800);
  ok('третий цикл также без дублей', (await page.evaluate(()=>document.getElementById('toasts').textContent)).includes('Доставлено уведомлений: 0'));
- await page.screenshot({path:'/tmp/e2e/shot_notif_admin.png'});
+ await shot('shot_notif_admin.png');
 
  console.log('== M14: файловые журналы ==');
  ok('карточка файловых журналов', (await page.evaluate(()=>document.getElementById('view').textContent)).includes('Файловые журналы'));
@@ -1206,7 +1213,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  ok('журнал работы открыт в окне', logTxt.includes('Файловые журналы') && logTxt.includes('supip.log'));
  ok('строки журнала отображаются', /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(logTxt));
  ok('есть ссылка скачивания журнала', await page.$('a[href="/api/logs/supip.log"]')!==null);
- await page.screenshot({path:'/tmp/e2e/shot_logs.png'});
+ await shot('shot_logs.png');
  await page.evaluate(()=>App.logs('setup.log'));
  await sleep(600);
  ok('переключение на журнал настройки', (await page.evaluate(()=>document.getElementById('modal-root').textContent)).includes('setup.log'));
@@ -1280,7 +1287,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  await page.evaluate(()=>document.querySelector('#tpl-hist .tpl-rb').click());
  await sleep(1000);
  ok('версия шаблона восстановлена', (await page.evaluate(id=>(DB.templates.find(t=>t.id===id)||{}).version, tpl28Id))===3);
- await page.screenshot({path:'/tmp/e2e/shot_templates.png'});
+ await shot('shot_templates.png');
 
  console.log('== M16 §2.8: редактор протокола (MTG-09) ==');
  const p28mid = await page.evaluate(async()=>{
@@ -1352,7 +1359,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  await page.evaluate(()=>App.pdPreviewTab('doc'));
  await sleep(400);
  ok('предпросмотр документа (HTML)', await page.$eval('#pv-html',e=>e.style.display!=='none'));
- await page.screenshot({path:'/tmp/e2e/shot_protocol.png'});
+ await shot('shot_protocol.png');
  await page.evaluate(()=>App.closeModal(true));
  const dlg28b = d=>{d.accept().catch(()=>{});};
  page.on('dialog', dlg28b);
@@ -1475,7 +1482,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  await sleep(1000);
  const mat29link2 = await page.evaluate((id,xid)=>matsOf(MEET(id)).find(y=>y.id===xid), m29id, mat29link.id);
  ok('реквизиты материала изменены', mat29link2.type==='Справка' && mat29link2.status==='Требует обновления', JSON.stringify(mat29link2).slice(0,140));
- await page.screenshot({path:'/tmp/e2e/shot_materials.png'});
+ await shot('shot_materials.png');
  const dlg29b = d=>{d.accept().catch(()=>{});};
  page.on('dialog', dlg29b);
  await page.evaluate(xid=>document.querySelector('#mat-row-'+xid+' .mat-del').click(), mat29link.id);
@@ -1527,7 +1534,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  const dlg29c = d=>{confirmMsg29=d.message();d.dismiss().catch(()=>{});};
  page.on('dialog', dlg29c);
  await page.evaluate(()=>document.getElementById('run-finish').click());
- await sleep(1200);
+ await waitFor(()=>confirmMsg29.length>0, 15000);
  page.off('dialog', dlg29c);
  ok('завершение требует подтверждения', confirmMsg29.includes('Не рассмотрены'), confirmMsg29.slice(0,120));
  ok('после отказа совещание продолжается', (await page.evaluate(id=>runOf(MEET(id)).status, m29id))==='Идёт');
@@ -1551,7 +1558,7 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  await page.evaluate(()=>document.getElementById('dr-save').click());
  await waitFor(async()=>await page.evaluate(id=>{const m=MEET(id);return (m.decisions[0].taskIds||[]).length>0;}, m29id), 10000);
  ok('поручение отображается справа', (await page.$eval('#run-tasks',e=>e.textContent)).includes('Новиков'));
- await page.screenshot({path:'/tmp/e2e/shot_run.png'});
+ await shot('shot_run.png');
  await page.evaluate(()=>document.getElementById('run-done').click());
  await waitFor(async()=>await page.evaluate(id=>MEET(id).agenda[1].status==='Рассмотрен', m29id));
  ok('вопрос с решением рассмотрен без текста', (await page.evaluate(id=>MEET(id).agenda[1].fact.length>0, m29id))===true);
@@ -1563,6 +1570,146 @@ const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=fal
  ok('время рассмотрения обоих вопросов сохранено', (await page.evaluate(id=>MEET(id).agenda.every(a=>a.startedAt&&a.finishedAt), m29id))===true);
  await page.evaluate(()=>App.closeDrawer());
  await sleep(300);
+ console.log('== M16 §14–15 / MTG-11/12: реестр решений и карточка решения ==');
+ const m30id = await page.evaluate(async()=>{
+  const r=await rpc('meeting.create',{title:'E2E реестр решений',type:'Оперативное',date:dISO(TODAY),
+   time:'12:00',chair:'u2',secretary:'u3',attendees:['u2','u3','u5','u6']});
+  if(!r)return null;
+  await rpc('meeting.agenda.add',{id:r.id,title:'Испытания стенда',reporter:'u5',durationMin:20});
+  await rpc('meeting.agenda.add',{id:r.id,title:'Ресурсы проекта',reporter:'u3',durationMin:15});
+  return r.id;
+ });
+ ok('совещание для MTG-11/12 создано', !!m30id, m30id);
+ await page.evaluate(id=>{App.f.meetTab='dec';openMeeting(id);}, m30id);
+ await sleep(600);
+ ok('вкладка «Решения» в карточке совещания', await page.$('#drawer-root #mt-tab-dec')!==null);
+ await page.evaluate(()=>document.querySelector('#drawer-root .btn.pri').click());
+ await sleep(350);
+ ok('форма регистрации: тип, статус, основание, критерии, даты, участники',
+  await page.evaluate(()=>['de-text','de-type','de-status','de-basis','de-crit','de-adopted','de-eff']
+   .every(k=>!!document.getElementById(k)) && document.querySelectorAll('.de-part').length===8));
+ await page.evaluate(id=>{
+  document.getElementById('de-text').value='Провести повторные испытания стенда (E2E)';
+  document.getElementById('de-type').value='Техническое';
+  document.getElementById('de-status').value='Проект';
+  document.getElementById('de-resp').value='u5';
+  document.getElementById('de-basis').value='Замечания испытательной группы';
+  document.getElementById('de-crit').value='Отчёт подписан испытательной группой';
+  document.getElementById('de-ag').value='1';
+  document.getElementById('de-task').checked=false;
+  document.querySelector('.de-part[value="u6"]').checked=true;
+ }, m30id);
+ await page.evaluate(()=>document.querySelector('#modal-root .btn.pri').click());
+ await waitFor(async()=>await page.evaluate(id=>(MEET(id).decisions||[]).length===1, m30id), 10000);
+ const d30 = await page.evaluate(id=>{const d=MEET(id).decisions[0];return {id:d.id,code:d.code,type:d.type,status:d.status,parts:d.participants};}, m30id);
+ ok('решение зарегистрировано со сквозным номером', /^Р-\d{4}-\d{3}$/.test(d30.code), d30.code);
+ ok('тип и статус при регистрации сохранены', d30.type==='Техническое' && d30.status==='Проект');
+ ok('участник исполнения сохранён', JSON.stringify(d30.parts)==='["u6"]', JSON.stringify(d30.parts));
+ ok('строка решения с номером и бейджем статуса', (await page.$eval('#mdec-row-'+d30.id,e=>e.textContent)).includes(d30.code)
+   && (await page.$eval('#mdec-row-'+d30.id,e=>e.textContent)).includes('Проект'));
+ await page.evaluate(id=>document.querySelector('#mdec-row-'+id+' .mdec-open').click(), d30.id);
+ await sleep(500);
+ ok('карточка решения MTG-12 открыта', await page.$('#dc-info')!==null);
+ ok('пять вкладок карточки решения', await page.evaluate(()=>['info','tasks','links','docs','hist']
+   .every(k=>!!document.getElementById('dc-tab-'+k))));
+ ok('основные сведения: номер, протокол, вопрос, участники', (await page.$eval('#dc-info',e=>e.textContent)).includes(d30.code)
+   && (await page.$eval('#dc-info',e=>e.textContent)).includes('Козлова'));
+ ok('формулировка, основание и критерии видны', (await page.$eval('#dc-text',e=>e.textContent)).includes('повторные испытания')
+   && (await page.$eval('#dc-criteria',e=>e.textContent)).includes('Отчёт подписан'));
+ ok('блок готовности к «Исполнено»', (await page.$eval('#dc-ready',e=>e.textContent)).includes('обязательные действия не выполнены'));
+ await page.evaluate(()=>document.getElementById('dc-check').click());
+ await waitFor(async()=>await page.evaluate(()=>document.getElementById('toasts').textContent.includes('Готовность решения')));
+ ok('проверка готовности с сервера', (await page.evaluate(()=>document.getElementById('toasts').textContent)).includes('результат'));
+ // статус: Проект -> На согласовании -> Принято
+ await page.evaluate(()=>document.getElementById('dc-status').click());
+ await sleep(300);
+ ok('модалка статуса: только допустимые переходы', await page.evaluate(()=>[...document.getElementById('ds-to').options].map(o=>o.value).join(',')==='На согласовании,Принято,Отменено'));
+ await page.evaluate(()=>{document.getElementById('ds-to').value='Принято';});
+ await page.evaluate(()=>document.getElementById('ds-save').click());
+ await waitFor(async()=>await page.evaluate(id=>decFind(id).d.status==='Принято', d30.id), 10000);
+ ok('переход «Проект»→«Принято» выполнен', (await page.evaluate(id=>decFind(id).d.status, d30.id))==='Принято');
+ // правка существенного условия -> авто «Изменено»
+ await page.evaluate(()=>document.getElementById('dc-edit').click());
+ await sleep(300);
+ ok('модалка правки MTG-12 со всеми полями', await page.evaluate(()=>['de2-text','de2-type','de2-item','de2-basis','de2-resp','de2-due','de2-adopted','de2-eff','de2-crit']
+   .every(k=>!!document.getElementById(k)) && document.querySelectorAll('.de2-part').length===8));
+ await page.evaluate(()=>{const el=document.getElementById('de2-due');el.value=D(12);App.markDirty();});
+ await page.evaluate(()=>document.getElementById('de2-save').click());
+ await waitFor(async()=>await page.evaluate(id=>decFind(id).d.status==='Изменено', d30.id), 10000);
+ ok('правка срока перевела решение в «Изменено»', (await page.evaluate(id=>decFind(id).d.status, d30.id))==='Изменено');
+ // комментарий
+ await page.evaluate(()=>document.getElementById('dc-comment').click());
+ await sleep(250);
+ await page.evaluate(()=>{document.getElementById('dcm-text').value='Уточнить график испытаний (E2E)';});
+ await page.evaluate(()=>document.getElementById('dcm-save').click());
+ await waitFor(async()=>await page.evaluate(id=>(decFind(id).d.comments||[]).length===1, d30.id), 10000);
+ ok('комментарий добавлен и виден', (await page.$eval('#dc-comments',e=>e.textContent)).includes('Уточнить график'));
+ // поручение из карточки решения
+ await page.evaluate(()=>document.getElementById('dc-tab-tasks').click());
+ await sleep(400);
+ ok('вкладка поручений пуста', (await page.$eval('#dc-tasks-card',e=>e.textContent)).includes('Поручений нет'));
+ await page.evaluate(()=>document.getElementById('dc-task-new').click());
+ await sleep(350);
+ ok('форма поручения из карточки решения', await page.$('#dr-title')!==null);
+ await page.evaluate(()=>{document.getElementById('dr-crit').value='Отчёт подписан (E2E)';});
+ await page.evaluate(()=>document.getElementById('dr-save').click());
+ await waitFor(async()=>await page.evaluate(id=>(decFind(id).d.taskIds||[]).length===1, d30.id), 10000);
+ await page.evaluate(id=>{App.f.decTab='tasks';openDecision(id);}, d30.id);
+ await sleep(400);
+ ok('поручение видно в карточке решения', await page.$('#dc-tasks')!==null
+   && (await page.$eval('#dc-tasks',e=>e.textContent)).includes('Новиков'));
+ // связи
+ await page.evaluate(()=>document.getElementById('dc-tab-links').click());
+ await sleep(400);
+ await page.evaluate(()=>document.getElementById('dc-link').click());
+ await sleep(250);
+ ok('модалка связи: проект/задача/риск', await page.evaluate(()=>[...document.getElementById('dl-kind').options].map(o=>o.value).join(',')==='project,task,risk'));
+ await page.evaluate(()=>{document.getElementById('dl-kind').value='risk';App.decLinkKind('risk');document.getElementById('dl-target').value=DB.risks[0].id;});
+ await page.evaluate(()=>document.getElementById('dl-save').click());
+ await waitFor(async()=>await page.evaluate(id=>(decFind(id).d.risks||[]).length===1, d30.id), 10000);
+ ok('риск связан и виден', (await page.$eval('#dc-risks',e=>e.textContent)).includes(await page.evaluate(()=>DB.risks[0].code)));
+ // документы
+ await page.evaluate(()=>document.getElementById('dc-tab-docs').click());
+ await sleep(400);
+ await page.evaluate(()=>document.getElementById('dc-attach').click());
+ await sleep(250);
+ ok('модалка документа: M09 или ссылка ЛВС', await page.$('#da-kind')!==null && await page.$('#da-docv')!==null);
+ await page.evaluate(()=>{document.getElementById('da-doc').value=DB.docs[0].id;document.getElementById('da-docv').value='1';document.getElementById('da-note').value='Основание (E2E)';});
+ await page.evaluate(()=>document.getElementById('da-save').click());
+ await waitFor(async()=>await page.evaluate(id=>(decFind(id).d.docs||[]).length===1, d30.id), 10000);
+ ok('документ M09 приложен с версией', (await page.$eval('#dc-docs',e=>e.textContent)).includes('v1'));
+ // история
+ await page.evaluate(()=>document.getElementById('dc-tab-hist').click());
+ await sleep(400);
+ const hist30 = await page.$eval('#dc-hist',e=>e.textContent);
+ ok('история: регистрация, статусы, изменение, комментарий, связь, документ',
+  ['Регистрация','Статус','Изменение','Комментарий','Связь добавлена','Документ приложен'].every(x=>hist30.includes(x)), hist30.slice(0,120));
+ await shot('shot_decision.png');
+ await page.evaluate(()=>App.closeDrawer());
+ // реестр решений
+ await page.evaluate(()=>{nav('meetings');App.f.mt.tab='dec';App.f.mt.dc={};renderView();});
+ await sleep(500);
+ ok('реестр решений MTG-11 открыт', await page.$('#dec-card')!==null && await page.$('#dec-table')!==null);
+ ok('сводка реестра: всего/действующих/исполнено/просрочено/без поручений',
+  await page.evaluate(()=>['total','active','done','overdue','notasks'].every(k=>!!document.getElementById('dec-stat-'+k))));
+ ok('строка реестра содержит номер, тип и статус', (await page.$eval('#dec-row-'+d30.id,e=>e.textContent)).includes(d30.code)
+   && (await page.$eval('#dec-row-'+d30.id,e=>e.textContent)).includes('Техническое'));
+ await page.evaluate(()=>{const el=document.getElementById('decf-type');el.value='Техническое';el.dispatchEvent(new Event('change'));});
+ await sleep(400);
+ ok('фильтр по типу работает', await page.evaluate(()=>[...document.querySelectorAll('#dec-table tbody tr')]
+   .every(tr=>tr.textContent.includes('Техническое'))));
+ await page.evaluate(()=>{const el=document.getElementById('decf-status');el.value='Изменено';el.dispatchEvent(new Event('change'));});
+ await sleep(400);
+ ok('комбинация фильтров тип+статус', await page.$('#dec-row-'+d30.id)!==null
+   && (await page.$$('#dec-table tbody tr')).length>=1);
+ await page.evaluate(()=>document.getElementById('dec-reset').click());
+ await sleep(400);
+ ok('сброс фильтров возвращает все решения', (await page.$eval('#dec-stat-total',e=>e.textContent)).includes('всего '+await page.evaluate(()=>decAll().length)));
+ await page.evaluate(id=>{App.f.decTab='info';document.querySelector('#dec-row-'+id+' .dec-open').click();}, d30.id);
+ await sleep(500);
+ ok('переход из реестра в карточку решения', await page.$('#dc-info')!==null);
+ await page.evaluate(()=>App.closeDrawer());
+ await sleep(200);
  console.log('== Сессия и выход ==');
  await page.evaluate(()=>App.logout());
  await sleep(300);

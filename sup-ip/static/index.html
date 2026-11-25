@@ -934,7 +934,7 @@ function exportCSV(name, rows){
 }
 /* Выгрузка документов DOCX/XLSX/PDF: формирует СЕРВЕР (ТЗ §25), право export проверяется сервером,
    событие BUSINESS пишется в M15. Клиент только скачивает готовый файл. */
-const EXP_MOD={portfolio:'portfolio',project:'portfolio',tasks:'tasks',gantt:'gantt',resources:'resources',time:'time',risks:'risks',calc:'calcs',meeting:'meetings',directives:'meetings',report:'reports',journal:'journal',dashboard:'analytics'};
+const EXP_MOD={portfolio:'portfolio',project:'portfolio',tasks:'tasks',gantt:'gantt',resources:'resources',time:'time',risks:'risks',calc:'calcs',meeting:'meetings',directives:'meetings',decisions:'meetings',decision:'meetings',report:'reports',journal:'journal',dashboard:'analytics'};
 function docBtns(kind,id,fmts){
  const mod=EXP_MOD[kind]||'reports';
  if(!can(mod,'export'))return '';
@@ -2872,6 +2872,7 @@ Views.meetings=function(){
  if(f.tab==='prot')rows=rows.filter(m=>protOf(m).status!=='Подготовка');
  if(f.tab==='canc')rows=rows.filter(m=>m.status===MEET_CANC);
  if(f.tab==='series')rows=rows.filter(m=>recOf(m).seriesId);
+ if(f.tab==='dec')return meetingsDecisions(f);
  if(['dir','over','ctl','rep'].includes(f.tab))return meetingsDirectives(f);
  if(f.tab==='tpl')return meetingsTemplates(f);
  if(f.st)rows=rows.filter(m=>m.status===f.st);
@@ -2886,7 +2887,7 @@ Views.meetings=function(){
   kpiHTML(dirs.length,'Поручений активно','создано из решений','tasks','info',"nav('control')")+
   kpiHTML(dirs.filter(taskOverdue).length,'Поручений просрочено','требуют эскалации','alert',dirs.filter(taskOverdue).length?'err':'ok',"nav('control')")+
  '</div>'+
- '<div class="tabs"><button class="'+(f.tab==='next'?'on':'')+'" onclick="App.f.mt.tab=\'next\';renderView()">Предстоящие и текущие</button><button class="'+(f.tab==='past'?'on':'')+'" onclick="App.f.mt.tab=\'past\';renderView()">Проведённые</button><button class="'+(f.tab==='prot'?'on':'')+'" onclick="App.f.mt.tab=\'prot\';renderView()">Протоколы</button><button class="'+(f.tab==='dir'?'on':'')+'" onclick="App.f.mt.tab=\'dir\';renderView()">Поручения</button><button class="'+(f.tab==='over'?'on':'')+'" onclick="App.f.mt.tab=\'over\';renderView()">Просроченные поручения</button><button onclick="App.f.mt.tab=\'ctl\';renderView()">Контроль сроков</button><button onclick="App.f.mt.tab=\'rep\';renderView()">Отчётность</button>'+ '<button class="'+(f.tab==='series'?'on':'')+'" id="mt-tab-series" onclick="App.f.mt.tab=\'series\';renderView()">Регулярные</button><button class="'+(f.tab==='canc'?'on':'')+'" id="mt-tab-canc" onclick="App.f.mt.tab=\'canc\';renderView()">Отменённые</button>' +'<button class="'+(f.tab==='tpl'?'on':'')+'" id="mt-tab-tpl" onclick="App.f.mt.tab=\'tpl\';renderView()">Шаблоны протокола</button><button class="'+(f.tab==='all'?'on':'')+'" onclick="App.f.mt.tab=\'all\';renderView()">Все</button></div>'+
+ '<div class="tabs"><button class="'+(f.tab==='next'?'on':'')+'" onclick="App.f.mt.tab=\'next\';renderView()">Предстоящие и текущие</button><button class="'+(f.tab==='past'?'on':'')+'" onclick="App.f.mt.tab=\'past\';renderView()">Проведённые</button><button class="'+(f.tab==='prot'?'on':'')+'" onclick="App.f.mt.tab=\'prot\';renderView()">Протоколы</button><button class="'+(f.tab==='dec'?'on':'')+'" id="mt-tab-dec" onclick="App.f.mt.tab=\'dec\';renderView()">Решения</button><button class="'+(f.tab==='dir'?'on':'')+'" onclick="App.f.mt.tab=\'dir\';renderView()">Поручения</button><button class="'+(f.tab==='over'?'on':'')+'" onclick="App.f.mt.tab=\'over\';renderView()">Просроченные поручения</button><button onclick="App.f.mt.tab=\'ctl\';renderView()">Контроль сроков</button><button onclick="App.f.mt.tab=\'rep\';renderView()">Отчётность</button>'+ '<button class="'+(f.tab==='series'?'on':'')+'" id="mt-tab-series" onclick="App.f.mt.tab=\'series\';renderView()">Регулярные</button><button class="'+(f.tab==='canc'?'on':'')+'" id="mt-tab-canc" onclick="App.f.mt.tab=\'canc\';renderView()">Отменённые</button>' +'<button class="'+(f.tab==='tpl'?'on':'')+'" id="mt-tab-tpl" onclick="App.f.mt.tab=\'tpl\';renderView()">Шаблоны протокола</button><button class="'+(f.tab==='all'?'on':'')+'" onclick="App.f.mt.tab=\'all\';renderView()">Все</button></div>'+
  '<div class="flexw mb8">'+
   sel('mtf-status',[['','Все статусы'],['Запланировано','Запланировано'],['Проведено','Проведено'],['Протокол утверждён','Протокол утверждён'],[MEET_CANC,MEET_CANC]],f.st||'','onchange="App.f.mt.st=this.value;renderView()"')+
   sel('mtf-proj',[['','Все проекты'],...DB.projects.map(p=>[p.id,p.code+' · '+p.name.slice(0,30)])],f.pj||'','onchange="App.f.mt.pj=this.value;renderView()"')+
@@ -3325,25 +3326,8 @@ App.directiveSave=function(mid,did,confirmed){
    App.directiveSave(mid,did,true);
  });
 };
-App.decisionEdit=function(mid,did){
- const m=MEET(mid); if(!m||!guard('meetings','edit',m))return;
- const d=(m.decisions||[]).find(x=>x.id===did); if(!d)return;
- openModal(mh('Решение совещания','check')+'<div class="mb form">'+
-  '<div class="small mut mb8">Правка решения не создаёт поручение повторно: созданные задачи сохраняются (ТЗ §2.10).</div>'+
-  field('Формулировка решения',ta('de-text',d.text,3),true)+
-  '<div class="row">'+field('Ответственный',sel('de-resp',DB.users.map(u=>[u.id,u.name]),d.resp),true)+
-   field('Срок исполнения',inp('de-due',d.due,'date'),true)+'</div>'+
-  field('Пункт повестки',sel('de-ag',[['','не привязан'],...m.agenda.map(a=>[a.n,'№'+a.n+' · '+a.title])],d.agendaN||''))+
-  (decTasks(d).length?'<div class="small mut">Созданные поручения: '+decTasks(d).map(t=>t.code).join(', ')+'</div>':'')+
-  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button>'+
-  '<button class="btn pri" onclick="App.decisionEditSave(\''+mid+'\',\''+did+'\')">Сохранить</button></div>');
-};
-App.decisionEditSave=function(mid,did){
- if(!requireFields(['de-text','de-due']))return;
- const ag=val('de-ag');
- rpc('meeting.decision.update',{id:mid,did,text:val('de-text'),resp:val('de-resp'),due:val('de-due'),
-  agendaN:ag?parseInt(ag,10):null}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
-};
+/* правка решения из карточки совещания — единая модалка MTG-12 (App.decEdit) */
+App.decisionEdit=function(mid,did){ App.decEdit(did); };
 /* ---------- M16 §2.9: маршрут согласования и версии протокола ---------- */
 const PR_ST={'Подготовка':['#64748b','#f1f5f9'],'Черновик':['#2563eb','#dbeafe'],
  'Направлен на согласование':['#d97706','#fef3c7'],'На доработке':['#dc2626','#fee2e2'],
@@ -4282,6 +4266,380 @@ App.runTask=function(mid){
  App.directiveModal(mid,d.id);
 };
 
+/* ---------- MTG-11/MTG-12. Реестр решений и карточка решения (ТТ-2 §14–15) ---------- */
+const DEC_TYPES=['Организационное','Техническое','Проектное','Ресурсное','Финансовое','Кадровое',
+ 'Контрольное','Информационное','Иное'];
+const DEC_ST=['Проект','На согласовании','Принято','Действует','Изменено','Отменено','Исполнено'];
+const DEC_TRANS={'Проект':['На согласовании','Принято','Отменено'],
+ 'На согласовании':['Принято','Проект','Отменено'],
+ 'Принято':['Действует','Изменено','Отменено','Исполнено'],
+ 'Действует':['Изменено','Отменено','Исполнено'],
+ 'Изменено':['Действует','Отменено','Исполнено'],'Исполнено':[],'Отменено':[]};
+const DEC_ACTIVE=['Проект','На согласовании','Принято','Действует','Изменено'];
+function decBadge(s){
+ const c={'Проект':['#64748b','#f1f5f9'],'На согласовании':['#d97706','#fef3c7'],
+  'Принято':['#2563eb','#dbeafe'],'Действует':['#0891b2','#cffafe'],'Изменено':['#c026d3','#fae8ff'],
+  'Отменено':['#dc2626','#fee2e2'],'Исполнено':['#16a34a','#dcfce7']}[s]||['#64748b','#f1f5f9'];
+ return badge(s,c[0],c[1]);
+}
+function decNorm(m,d,i){
+ const x=Object.assign({code:'',type:'Иное',status:'Принято',basis:'',adoptedAt:'',effectiveFrom:'',
+  criteria:'',result:'',participants:[],projects:[],tasks:[],risks:[],docs:[],comments:[],history:[],
+  taskIds:[],itemId:'',resp:'',due:''},d||{});
+ x.n=i+1;
+ if(!DEC_TYPES.includes(x.type))x.type='Иное';
+ if(!DEC_ST.includes(x.status))x.status='Принято';
+ if(!x.code)x.code=m.code+'-Р'+x.n;
+ if(!x.adoptedAt)x.adoptedAt=m.date;
+ if(!x.taskIds.length&&x.taskId)x.taskIds=[x.taskId];
+ if(!x.itemId&&x.agendaN){const a=(m.agenda||[]).find(y=>y.n===x.agendaN); if(a)x.itemId=a.id||'';}
+ return x;
+}
+function decsOf(m){ return ((m&&m.decisions)||[]).map((d,i)=>decNorm(m,d,i)); }
+function decAll(){ const out=[]; DB.meetings.forEach(m=>decsOf(m).forEach(d=>out.push(Object.assign(d,{meeting:m})))); return out; }
+function decFind(id){
+ for(const m of DB.meetings){ const d=decsOf(m).find(x=>x.id===id); if(d)return {m:m,d:d}; }
+ return null;
+}
+function decItem(d,m){ return (m.agenda||[]).find(a=>a.n===d.agendaN)||null; }
+function decOverdue(d){ return !!d.due&&d.due<dISO(TODAY)&&DEC_ACTIVE.includes(d.status); }
+function decReady(d){
+ const ts=decTasks(d), act=ts.filter(t=>t.status!=='Отменена'), open=act.filter(t=>!DONE_ST.includes(t.status));
+ const res=(d.result||'').trim();
+ const can=(act.length&&!open.length)||!!res;
+ return {tasks:ts.length,active:act.length,done:act.length-open.length,open:open,result:res,can:can,
+  reason:can?(act.length&&!open.length?('Все поручения исполнены: '+act.length):'Зафиксирован подтверждённый результат'):
+   (open.length?('Не исполнены поручения: '+open.map(t=>t.code).join(', ')):'Поручения не созданы и результат не подтверждён')};
+}
+function decProtNumber(m){ return ((m.requisites||{}).number)||('П-'+String(m.code||'').replace('СОВ-','')); }
+function decFilters(){ return App.f.mt.dc=App.f.mt.dc||{type:'',st:'',resp:'',meet:'',proj:'',from:'',to:'',q:'',od:false,no:false,ready:false}; }
+function decFiltered(){
+ const f=decFilters(); let rows=decAll();
+ if(f.type)rows=rows.filter(d=>d.type===f.type);
+ if(f.st)rows=rows.filter(d=>d.status===f.st);
+ if(f.resp)rows=rows.filter(d=>d.resp===f.resp);
+ if(f.meet)rows=rows.filter(d=>d.meeting.id===f.meet);
+ if(f.proj)rows=rows.filter(d=>(d.projects||[]).includes(f.proj));
+ if(f.from)rows=rows.filter(d=>(d.due||'')>=f.from);
+ if(f.to)rows=rows.filter(d=>(d.due||'')<=f.to);
+ if(f.od)rows=rows.filter(decOverdue);
+ if(f.no)rows=rows.filter(d=>!decTasks(d).length);
+ if(f.ready)rows=rows.filter(d=>decReady(d).can&&DEC_ACTIVE.includes(d.status));
+ if(f.q){const q=f.q.toLowerCase();
+  rows=rows.filter(d=>((d.code||'')+' '+(d.text||'')+' '+d.meeting.code+' '+(d.meeting.title||'')+' '+
+   ((decItem(d,d.meeting)||{}).title||'')+' '+decProtNumber(d.meeting)).toLowerCase().includes(q));}
+ return rows.sort((a,b)=>(a.meeting.date<b.meeting.date?1:a.meeting.date>b.meeting.date?-1:a.n-b.n));
+}
+function meetingsDecisions(f){
+ const dc=decFilters(), all=decAll(), rows=decFiltered();
+ const overdue=all.filter(decOverdue).length, done=all.filter(d=>d.status==='Исполнено').length;
+ const active=all.filter(d=>DEC_ACTIVE.includes(d.status)).length, noTask=all.filter(d=>!decTasks(d).length).length;
+ return '<div class="page-head"><div><h2>Реестр решений</h2>'+
+  '<div class="desc">Все решения совещаний (MTG-11): самостоятельный номер, связь с вопросом повестки и протоколом, тип, статус и поручения.</div></div>'+
+  '<div class="acts"><button class="btn" onclick="App.f.mt.tab=\'next\';renderView()">'+ic('meeting')+' К совещаниям</button>'+
+   '<button class="btn" id="dec-export-xlsx" onclick="App.decExport(\'xlsx\')">'+ic('excel')+' XLSX</button>'+
+   '<button class="btn" id="dec-export-docx" onclick="App.decExport(\'docx\')">'+ic('download')+' DOCX</button>'+
+   '<button class="btn" id="dec-export-pdf" onclick="App.decExport(\'pdf\')">'+ic('print')+' PDF</button></div></div>'+
+ '<div class="grid g4 mb14">'+
+  kpiHTML(all.length,'Всего решений','зарегистрировано на совещаниях','check','acc',"App.f.mt.dc={};renderView()")+
+  kpiHTML(active,'Действующих','проекты, согласование, принятые и действующие','play','info',"App.f.mt.dc=Object.assign(App.f.mt.dc||{},{st:'Действует'});renderView()")+
+  kpiHTML(done,'Исполнено','обязательные действия выполнены','check','ok',"App.f.mt.dc=Object.assign(App.f.mt.dc||{},{st:'Исполнено'});renderView()")+
+  kpiHTML(overdue,'Просрочено','срок прошёл, решение не исполнено','alert',overdue?'err':'ok',"App.f.mt.dc=Object.assign(App.f.mt.dc||{},{od:true});renderView()")+
+ '</div>'+
+ '<div class="tabs"><button onclick="App.f.mt.tab=\'next\';renderView()">Предстоящие и текущие</button>'+
+  '<button onclick="App.f.mt.tab=\'past\';renderView()">Проведённые</button>'+
+  '<button class="on" id="mt-tab-dec" onclick="App.f.mt.tab=\'dec\';renderView()">Решения</button>'+
+  '<button onclick="App.f.mt.tab=\'dir\';renderView()">Поручения</button>'+
+  '<button onclick="App.f.mt.tab=\'ctl\';renderView()">Контроль сроков</button>'+
+  '<button onclick="App.f.mt.tab=\'rep\';renderView()">Отчётность</button>'+
+  '<button onclick="App.f.mt.tab=\'all\';renderView()">Все совещания</button></div>'+
+ '<div class="card mb14" id="dec-card"><div class="ch">'+ic('check')+'Решения совещаний (MTG-11)'+
+  '<span class="r small mut">показано: '+rows.length+' из '+all.length+'</span></div><div class="cb">'+
+  '<div class="flexw mb8">'+
+   '<span class="chip" id="dec-stat-total">всего '+rows.length+'</span>'+
+   '<span class="chip" id="dec-stat-active">действующих '+active+'</span>'+
+   '<span class="chip" id="dec-stat-done">исполнено '+done+'</span>'+
+   '<span class="chip" id="dec-stat-overdue">просрочено '+overdue+'</span>'+
+   '<span class="chip" id="dec-stat-notasks">без поручений '+noTask+'</span>'+
+   '<span class="spacer"></span>'+
+   '<button class="btn sm" id="dec-reset" onclick="App.f.mt.dc={};renderView()">'+ic('refresh')+' Сбросить</button>'+
+  '</div>'+
+  '<div class="filters mb8">'+
+   sel('decf-type',[['','Все типы'],...DEC_TYPES.map(t=>[t,t])],dc.type,'onchange="App.f.mt.dc.type=this.value;renderView()"')+
+   sel('decf-status',[['','Все статусы'],...DEC_ST.map(t=>[t,t])],dc.st,'onchange="App.f.mt.dc.st=this.value;renderView()"')+
+   sel('decf-resp',[['','Все ответственные'],...DB.users.map(u=>[u.id,u.name])],dc.resp,'onchange="App.f.mt.dc.resp=this.value;renderView()"')+
+   sel('decf-meet',[['','Все совещания'],...DB.meetings.map(m=>[m.id,m.code+' · '+m.title.slice(0,28)])],dc.meet,'onchange="App.f.mt.dc.meet=this.value;renderView()"')+
+   sel('decf-proj',[['','Все проекты'],...DB.projects.map(p=>[p.id,p.code+' · '+p.name.slice(0,24)])],dc.proj,'onchange="App.f.mt.dc.proj=this.value;renderView()"')+
+   inp('decf-from',dc.from,'date','title="срок с" onchange="App.f.mt.dc.from=this.value;renderView()"')+
+   inp('decf-to',dc.to,'date','title="срок по" onchange="App.f.mt.dc.to=this.value;renderView()"')+
+   inp('decf-q',dc.q,'text','placeholder="поиск по формулировке, номеру, совещанию" oninput="App.decSearch(this.value)"')+
+  '</div>'+
+  '<div class="flexw mb8">'+
+   '<label class="checkline"><input type="checkbox" id="decf-od" '+(dc.od?'checked':'')+' onchange="App.f.mt.dc.od=this.checked;renderView()"> только просроченные</label>'+
+   '<label class="checkline"><input type="checkbox" id="decf-no" '+(dc.no?'checked':'')+' onchange="App.f.mt.dc.no=this.checked;renderView()"> без поручений</label>'+
+   '<label class="checkline"><input type="checkbox" id="decf-ready" '+(dc.ready?'checked':'')+' onchange="App.f.mt.dc.ready=this.checked;renderView()"> готовы к исполнению</label>'+
+  '</div>'+
+  (rows.length?'<div class="tbl-wrap"><table class="tbl" id="dec-table"><thead><tr>'+
+   '<th>ID решения</th><th>№ протокола</th><th>Дата</th><th>Совещание</th><th>Вопрос</th>'+
+   '<th>Формулировка решения</th><th>Тип</th><th>Ответственный</th><th>Срок</th><th>Статус</th><th>Поручений</th><th></th>'+
+   '</tr></thead><tbody>'+rows.map(d=>{
+    const a=decItem(d,d.meeting), ts=decTasks(d), rd=decReady(d);
+    return '<tr id="dec-row-'+d.id+'" onclick="openDecision(\''+d.id+'\')">'+
+     '<td class="small b nowrap">'+esc(d.code)+'</td>'+
+     '<td class="small nowrap">'+esc(decProtNumber(d.meeting))+(protOf(d.meeting).version?(' <span class="chip">ред. '+protOf(d.meeting).version+'</span>'):'')+'</td>'+
+     '<td class="small nowrap">'+fmtD(d.adoptedAt)+'</td>'+
+     '<td class="small">'+esc(d.meeting.code)+'<div class="small mut">'+esc((d.meeting.title||'').slice(0,34))+'</div></td>'+
+     '<td class="small">'+(a?('№'+a.n+' · '+esc(a.title.slice(0,30))):'<span class="mut">не привязан</span>')+'</td>'+
+     '<td><b class="small">'+esc((d.text||'').slice(0,110))+'</b>'+(d.criteria?'<div class="small mut">критерии: '+esc(d.criteria.slice(0,60))+'</div>':'')+'</td>'+
+     '<td class="small">'+esc(d.type)+'</td>'+
+     '<td class="small">'+esc(U(d.resp).name)+'</td>'+
+     '<td class="small nowrap">'+fmtD(d.due)+(decOverdue(d)?' <span class="chip">просрочено</span>':'')+'</td>'+
+     '<td>'+decBadge(d.status)+'</td>'+
+     '<td class="num">'+ts.length+(ts.length?(' <span class="small mut">('+rd.done+' исп.)</span>'):'')+'</td>'+
+     '<td class="nowrap"><button class="btn sm dec-open" title="Карточка решения" onclick="event.stopPropagation();openDecision(\''+d.id+'\')">'+ic('eye')+'</button></td></tr>';
+   }).join('')+'</tbody></table></div>':
+   emptyBlock(all?'Решения не найдены':'Решений нет',all?'Измените фильтры':'Решения регистрируются в карточке совещания на вкладке «Решения»','check'))+
+  '<div class="small mut mt8">Статус «Исполнено» присваивается только при выполнении всех обязательных действий по решению либо при наличии подтверждённого результата (MTG-11 §14.4).</div>'+
+ '</div></div>';
+}
+App.decSearch=function(v){ App.f.mt.dc.q=v; clearTimeout(App._decT); App._decT=setTimeout(()=>{renderView();
+ const el=document.getElementById('decf-q'); if(el){el.focus(); el.setSelectionRange(el.value.length,el.value.length);}},350); };
+App.decExport=function(fmt){
+ const f=decFilters(), p={};
+ ['type','st','resp','meet','proj','from','to','q'].forEach(k=>{if(f[k])p[{st:'status',meet:'meetingId',proj:'projectId'}[k]||k]=f[k];});
+ if(f.od)p.overdue=true; if(f.no)p.noTasks=true; if(f.ready)p.ready=true;
+ App.expDocPost('decisions',fmt,p);
+};
+/* ---------- MTG-12. Карточка решения ---------- */
+function openDecision(did){
+ const f=decFind(did); if(!f){toast('err','Решение не найдено','Обновите реестр');return;}
+ if(!can('meetings','view')){deny('meetings','view');return;}
+ const m=f.m, d=f.d, tab=App.f.decTab||'info', editable=can('meetings','edit',m)&&m.status!==MEET_CANC&&
+  !['Исполнено','Отменено'].includes(d.status);
+ const ts=decTasks(d), rd=decReady(d), a=decItem(d,m);
+ App._decOpen=did;
+ let body='';
+ if(tab==='info'){
+  body='<div class="card" id="dc-info"><div class="cb">'+
+   '<div class="stat-line"><span>ID решения</span><b class="small">'+esc(d.id)+'</b></div>'+
+   '<div class="stat-line"><span>Номер</span><b>'+esc(d.code)+'</b></div>'+
+   '<div class="stat-line"><span>Исходное совещание</span><b class="link" onclick="App.closeDrawer();openMeeting(\''+m.id+'\')">'+esc(m.code)+' · '+esc(m.title)+'</b></div>'+
+   '<div class="stat-line"><span>Протокол</span><b>'+esc(decProtNumber(m))+' от '+fmtD(m.date)+(protOf(m).version?(' · редакция '+protOf(m).version):' · не утверждён')+'</b></div>'+
+   '<div class="stat-line"><span>Вопрос повестки</span><b>'+(a?('№'+a.n+' · '+esc(a.title)):'не привязан')+'</b></div>'+
+   '<div class="stat-line"><span>Тип решения</span><b>'+esc(d.type)+'</b></div>'+
+   '<div class="stat-line"><span>Статус</span>'+decBadge(d.status)+'</div>'+
+   '<div class="stat-line"><span>Дата принятия</span><b>'+fmtD(d.adoptedAt)+'</b></div>'+
+   '<div class="stat-line"><span>Дата вступления в силу</span><b>'+(d.effectiveFrom?fmtD(d.effectiveFrom):'—')+'</b></div>'+
+   '<div class="stat-line"><span>Ответственный</span><b>'+esc(U(d.resp).name)+'</b></div>'+
+   '<div class="stat-line"><span>Участники исполнения</span><b>'+((d.participants||[]).map(x=>esc(U(x).name)).join(', ')||'—')+'</b></div>'+
+   '<div class="stat-line"><span>Срок</span><b>'+fmtD(d.due)+(decOverdue(d)?' <span class="chip">просрочено</span>':'')+'</b></div>'+
+   '<div class="stat-line"><span>Поручений</span><b>'+ts.length+' · исполнено '+rd.done+'</b></div>'+
+  '</div></div>'+
+  '<div class="card mt8"><div class="ch">'+ic('file')+'Формулировка и основание</div><div class="cb">'+
+   '<p class="small" id="dc-text">'+esc(d.text)+'</p>'+
+   '<div class="small mut mt8"><b>Основание:</b> '+esc(d.basis||'—')+'</div>'+
+   '<div class="small mut mt8" id="dc-criteria"><b>Критерии результата:</b> '+esc(d.criteria||'—')+'</div>'+
+   '<div class="small mut mt8" id="dc-result"><b>Подтверждённый результат:</b> '+esc(d.result||'—')+'</div>'+
+  '</div></div>'+
+  '<div class="card mt8" id="dc-ready"><div class="ch">'+ic('target')+'Готовность к статусу «Исполнено»</div><div class="cb">'+
+   '<div class="small">'+esc(rd.reason)+'</div>'+
+   (rd.open.length?'<div class="list-rows mt8">'+rd.open.map(t=>'<div class="lr" onclick="openTask(\''+t.id+'\')"><div class="lt"><b class="small">'+esc(t.code)+' · '+esc(t.title)+'</b><small>'+esc(U(t.assignee).name)+' · срок '+fmtD(t.end)+'</small></div>'+stBadge(t.status)+'</div>').join('')+'</div>':'')+
+   '<div class="flexw mt8"><button class="btn sm" id="dc-check" onclick="App.decCheck(\''+d.id+'\')">'+ic('refresh')+' Проверить готовность</button>'+
+   (rd.can?'<span class="chip">можно переводить в «Исполнено»</span>':'<span class="chip">обязательные действия не выполнены</span>')+'</div>'+
+  '</div></div>'+
+  '<div class="card mt8"><div class="ch">'+ic('journal')+'Комментарии ('+(d.comments||[]).length+')</div><div class="cb" id="dc-comments">'+
+   ((d.comments||[]).length?(d.comments||[]).slice().reverse().map(c=>'<div class="small mb8"><b>'+esc(U(c.by).name)+'</b> <span class="mut">'+fmtDT(c.ts)+'</span><div>'+esc(c.text)+'</div></div>').join(''):'<div class="small mut">Комментариев нет</div>')+
+  '</div></div>';
+ }
+ if(tab==='tasks'){
+  body='<div class="card" id="dc-tasks-card"><div class="ch">'+ic('tasks')+'Поручения по решению ('+ts.length+')'+
+   '<span class="r small mut">поручения ведутся как задачи M02 (§2.10)</span></div><div class="cb">'+
+   (can('tasks','create')&&m.status!==MEET_CANC?'<div class="flexw mb8"><button class="btn sm pri" id="dc-task-new" onclick="App.directiveModal(\''+m.id+'\',\''+d.id+'\')">'+ic('plus')+' Создать поручение</button></div>':'')+
+   (ts.length?'<table class="tbl" id="dc-tasks"><thead><tr><th>Поручение</th><th>Наименование</th><th>Исполнитель</th><th>Срок</th><th>Состояние</th><th>%</th></tr></thead><tbody>'+
+    ts.map(t=>'<tr onclick="openTask(\''+t.id+'\')"><td class="b small">'+esc(t.code)+'</td><td class="small">'+esc(t.title)+'</td>'+
+     '<td class="small">'+esc(U(t.assignee).name)+'</td><td class="small nowrap">'+fmtD(t.end)+(taskOverdue(t)?' <span class="chip">просрочено</span>':'')+'</td>'+
+     '<td>'+(t.type==='directive'?dirBadge(dirStatus(t)):stBadge(t.status))+'</td><td class="num">'+(DONE_ST.includes(t.status)?100:t.progress)+'</td></tr>').join('')+
+    '</tbody></table>':emptyBlock('Поручений нет','Создайте поручение из решения — задача появится в M02 и в реестре поручений','tasks'))+
+  '</div></div>';
+ }
+ if(tab==='links'){
+  const prj=(d.projects||[]), tsk=(d.tasks||[]), rsk=(d.risks||[]);
+  const row=(kind,x,title,sub)=>'<div class="lr"><div class="lt"><b class="small">'+esc(title)+'</b><small>'+esc(sub)+'</small></div>'+
+   (editable?'<button class="btn sm danger dc-unlink" title="Снять связь" onclick="App.decUnlink(\''+d.id+'\',\''+kind+'\',\''+x+'\')">'+ic('x')+'</button>':'')+'</div>';
+  body='<div class="card" id="dc-links-card"><div class="ch">'+ic('link')+'Связанные объекты'+
+   '<span class="r small mut">проекты · задачи · риски</span></div><div class="cb">'+
+   (editable?'<div class="flexw mb8"><button class="btn sm pri" id="dc-link" onclick="App.decLink(\''+d.id+'\')">'+ic('plus')+' Связать объект</button></div>':'')+
+   '<div class="small mut mb8">Связанные проекты ('+prj.length+')</div><div class="list-rows mb8" id="dc-projects">'+
+    (prj.length?prj.map(id=>{const p=P(id);return row('project',id,p?(p.code+' · '+p.name):id,p?p.status:'объект не найден');}).join(''):'<div class="small mut">Проекты не связаны</div>')+'</div>'+
+   '<div class="small mut mb8">Связанные задачи ('+tsk.length+')</div><div class="list-rows mb8" id="dc-links">'+
+    (tsk.length?tsk.map(id=>{const t=T_(id);return row('task',id,t?(t.code+' · '+t.title):id,t?t.status:'объект не найден');}).join(''):'<div class="small mut">Задачи не связаны</div>')+'</div>'+
+   '<div class="small mut mb8">Риски ('+rsk.length+')</div><div class="list-rows" id="dc-risks">'+
+    (rsk.length?rsk.map(id=>{const r=DB.risks.find(x=>x.id===id);return row('risk',id,r?(r.code+' · '+r.title):id,r?r.level:'объект не найден');}).join(''):'<div class="small mut">Риски не связаны</div>')+'</div>'+
+  '</div></div>';
+ }
+ if(tab==='docs'){
+  const docs=d.docs||[];
+  body='<div class="card" id="dc-docs-card"><div class="ch">'+ic('file')+'Документы решения ('+docs.length+')</div><div class="cb">'+
+   (editable?'<div class="flexw mb8"><button class="btn sm pri" id="dc-attach" onclick="App.decAttach(\''+d.id+'\')">'+ic('plus')+' Приложить документ</button></div>':'')+
+   (docs.length?'<table class="tbl" id="dc-docs"><thead><tr><th>Документ</th><th>Вид</th><th>Версия</th><th>Примечание</th><th>Добавлен</th><th></th></tr></thead><tbody>'+
+    docs.map(x=>'<tr id="dc-doc-'+x.id+'"><td><b class="small">'+esc(x.name)+'</b></td>'+
+     '<td class="small">'+(x.kind==='doc'?'Документ M09':'Ссылка ЛВС')+'</td>'+
+     '<td class="small">'+(x.docV!=null?('v'+x.docV):'—')+'</td>'+
+     '<td class="small">'+esc(x.note||'—')+'</td><td class="small nowrap">'+fmtDT(x.addedAt)+'</td>'+
+     '<td class="nowrap">'+(x.kind==='doc'?'<button class="btn sm" title="Открыть документ" onclick="openDoc(\''+x.docId+'\')">'+ic('eye')+'</button> ':'')+
+      (editable?'<button class="btn sm danger dc-detach" title="Открепить" onclick="App.decDetach(\''+d.id+'\',\''+x.id+'\')">'+ic('trash')+'</button>':'')+'</td></tr>').join('')+
+    '</tbody></table>':emptyBlock('Документов нет','Приложите документ M09 с фиксацией версии или ссылку на ресурс ЛВС','file'))+
+  '</div></div>';
+ }
+ if(tab==='hist'){
+  const h=(d.history||[]).slice().reverse();
+  body='<div class="card" id="dc-hist-card"><div class="ch">'+ic('journal')+'История решения ('+h.length+')</div><div class="cb">'+
+   (h.length?'<div class="list-rows" id="dc-hist">'+h.map(x=>'<div class="lr" style="cursor:default"><span class="chip">'+esc(DEC_ACT[x.action]||x.action)+'</span>'+
+    '<div class="lt"><b class="small">'+esc(x.note||(x.from?(x.from+' → '+x.to):''))+'</b>'+
+    '<small>'+fmtDT(x.ts)+' · '+esc(U(x.by).name)+(x.reason?(' · основание: '+esc(x.reason)):'')+'</small></div></div>').join('')+'</div>':
+    emptyBlock('История пуста','Изменения решения фиксируются автоматически','journal'))+
+  '</div></div>';
+ }
+ const tabs=[['info','Основные сведения'],['tasks','Поручения ('+ts.length+')'],['links','Связанные объекты'],
+  ['docs','Документы ('+(d.docs||[]).length+')'],['hist','История ('+(d.history||[]).length+')']];
+ openDrawer(dh(d.code+' · '+d.type,d.text.slice(0,140),
+  decBadge(d.status)+' <span class="chip">'+esc(m.code)+'</span> <span class="chip">срок '+fmtD(d.due)+'</span>'+
+  (decOverdue(d)?'<span class="chip">просрочено</span>':''))+
+  '<div class="db"><div class="tabs">'+tabs.map(([k,n])=>'<button id="dc-tab-'+k+'" class="'+(tab===k?'on':'')+'" onclick="App.f.decTab=\''+k+'\';openDecision(\''+d.id+'\')">'+n+'</button>').join('')+'</div>'+body+'</div>'+
+  '<div class="df">'+
+   (editable?'<button class="btn" id="dc-edit" onclick="App.decEdit(\''+d.id+'\')">'+ic('edit')+' Изменить</button>':'')+
+   (can('meetings','edit',m)&&DEC_TRANS[d.status].length?'<button class="btn pri" id="dc-status" onclick="App.decStatus(\''+d.id+'\')">'+ic('flag')+' Статус</button>':'')+
+   (can('meetings','edit',m)?'<button class="btn" id="dc-comment" onclick="App.decComment(\''+d.id+'\')">'+ic('journal')+' Комментарий</button>':'')+
+   docBtns('decision',d.id,['docx','pdf'])+
+   '<span class="spacer"></span>'+
+   '<button class="btn" onclick="App.closeDrawer();openMeeting(\''+m.id+'\')">'+ic('meeting')+' К совещанию</button>'+
+  '</div>',true);
+}
+const DEC_ACT={register:'Регистрация',update:'Изменение',status:'Статус',comment:'Комментарий',
+ link:'Связь добавлена',unlink:'Связь снята',attach:'Документ приложен',detach:'Документ откреплён',
+ task:'Создано поручение'};
+App.decCheck=function(did){
+ rpc('meeting.decisions.check',{decisionId:did}).then(r=>{
+  if(r)toast(r.canComplete?'ok':'warn','Готовность решения '+r.code,r.reason);
+ });
+};
+App.decEdit=function(did){
+ if(!guard('meetings','edit'))return;
+ const f=decFind(did); if(!f)return; const m=f.m,d=f.d;
+ openModal(mh('Решение '+esc(d.code),'edit')+'<div class="mb form">'+
+  field('Формулировка решения',ta('de2-text',d.text,3),true)+
+  '<div class="row">'+field('Тип решения',sel('de2-type',DEC_TYPES,d.type),true)+
+   field('Вопрос повестки',sel('de2-item',[['','не привязан'],...(m.agenda||[]).map(a=>[a.id,'№'+a.n+' · '+a.title])],d.itemId||''))+'</div>'+
+  field('Основание',ta('de2-basis',d.basis||'',2))+
+  '<div class="row">'+field('Ответственный',sel('de2-resp',DB.users.filter(u=>!u.blocked).map(u=>[u.id,u.name]),d.resp),true)+
+   field('Срок исполнения',inp('de2-due',d.due,'date'),true)+'</div>'+
+  '<div class="row">'+field('Дата принятия',inp('de2-adopted',d.adoptedAt,'date'))+
+   field('Дата вступления в силу',inp('de2-eff',d.effectiveFrom||'','date'))+'</div>'+
+  field('Критерии результата',ta('de2-crit',d.criteria||'',2))+
+  field('Участники исполнения','<div class="flexw" style="border:1.5px solid var(--line2);border-radius:8px;padding:9px 11px">'+
+   DB.users.filter(u=>!u.blocked).map(u=>'<label class="checkline"><input type="checkbox" class="de2-part" value="'+u.id+'" '+((d.participants||[]).includes(u.id)?'checked':'')+' onchange="App.markDirty()">'+esc(u.name)+'</label>').join('')+'</div>')+
+  '<div class="small mut">Правка формулировки, срока, ответственного или критериев переводит принятое решение в статус «Изменено» (MTG-11 §14.4).</div>'+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button>'+
+  '<button class="btn pri" id="de2-save" onclick="App.decSaveEdit(\''+did+'\')">'+ic('save')+' Сохранить</button></div>');
+};
+App.decSaveEdit=function(did){
+ if(!requireFields(['de2-text','de2-due']))return;
+ rpc('meeting.decisions.update',{decisionId:did,text:val('de2-text'),type:val('de2-type'),
+  itemId:val('de2-item'),basis:val('de2-basis'),resp:val('de2-resp'),due:val('de2-due'),
+  adoptedAt:val('de2-adopted'),effectiveFrom:val('de2-eff'),criteria:val('de2-crit'),
+  participants:[...document.querySelectorAll('.de2-part:checked')].map(x=>x.value)})
+  .then(r=>{if(r){App.closeModal(true);openDecision(did);}});
+};
+App.decStatus=function(did){
+ if(!guard('meetings','edit'))return;
+ const f=decFind(did); if(!f)return; const d=f.d, to=DEC_TRANS[d.status]||[];
+ if(!to.length){toast('warn','Переходов нет','Решение в статусе «'+d.status+'»');return;}
+ openModal(mh('Статус решения '+esc(d.code),'flag')+'<div class="mb form">'+
+  '<div class="stat-line"><span>Текущий статус</span>'+decBadge(d.status)+'</div>'+
+  field('Новый статус',sel('ds-to',to,to[0]),true)+
+  field('Основание (обязательно для «Изменено» и «Отменено»)',ta('ds-reason','',2))+
+  '<div id="ds-result-box">'+field('Подтверждённый результат (для «Исполнено» без поручений)',ta('ds-result','',2),false,
+   'статус «Исполнено» доступен, когда выполнены все поручения либо подтверждён результат')+'</div>'+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button>'+
+  '<button class="btn pri" id="ds-save" onclick="App.decSaveStatus(\''+did+'\')">'+ic('save')+' Применить</button></div>');
+};
+App.decSaveStatus=function(did){
+ rpc('meeting.decisions.status',{decisionId:did,to:val('ds-to'),reason:val('ds-reason'),result:val('ds-result')})
+  .then(r=>{if(r){App.closeModal(true);openDecision(did);}});
+};
+App.decComment=function(did){
+ if(!guard('meetings','edit'))return;
+ openModal(mh('Комментарий к решению','journal')+'<div class="mb form">'+
+  field('Текст комментария',ta('dcm-text','',4),true,'до 2000 символов')+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button>'+
+  '<button class="btn pri" id="dcm-save" onclick="App.decSaveComment(\''+did+'\')">'+ic('save')+' Добавить</button></div>');
+};
+App.decSaveComment=function(did){
+ if(!requireFields(['dcm-text']))return;
+ rpc('meeting.decisions.comment',{decisionId:did,text:val('dcm-text')})
+  .then(r=>{if(r){App.closeModal(true);openDecision(did);}});
+};
+App.decLink=function(did){
+ if(!guard('meetings','edit'))return;
+ App._decLinkKind='project';
+ openModal(mh('Связать решение с объектом','link')+'<div class="mb form">'+
+  field('Вид объекта',sel('dl-kind',[['project','Проект'],['task','Задача'],['risk','Риск']],'project','onchange="App.decLinkKind(this.value)"'),true)+
+  '<div id="dl-target-box">'+field('Объект',sel('dl-target',DB.projects.map(p=>[p.id,p.code+' · '+p.name])),true)+'</div>'+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button>'+
+  '<button class="btn pri" id="dl-save" onclick="App.decSaveLink(\''+did+'\')">'+ic('link')+' Связать</button></div>');
+};
+App.decLinkKind=function(k){
+ App._decLinkKind=k;
+ const opts=k==='project'?DB.projects.map(p=>[p.id,p.code+' · '+p.name]):
+  k==='task'?DB.tasks.map(t=>[t.id,t.code+' · '+t.title.slice(0,40)]):
+  DB.risks.map(r=>[r.id,r.code+' · '+r.title.slice(0,40)]);
+ const box=document.getElementById('dl-target-box');
+ if(box)box.innerHTML=field('Объект',sel('dl-target',opts),true);
+};
+App.decSaveLink=function(did){
+ if(!requireFields(['dl-target']))return;
+ rpc('meeting.decisions.link',{decisionId:did,kind:val('dl-kind'),targetId:val('dl-target')})
+  .then(r=>{if(r){App.closeModal(true);App.f.decTab='links';openDecision(did);}});
+};
+App.decUnlink=function(did,kind,tid){
+ if(!guard('meetings','edit'))return;
+ if(!confirm('Снять связь решения с объектом?'))return;
+ rpc('meeting.decisions.unlink',{decisionId:did,kind:kind,targetId:tid})
+  .then(r=>{if(r)openDecision(did);});
+};
+App.decAttach=function(did){
+ if(!guard('meetings','edit'))return;
+ App._decAttKind='doc';
+ openModal(mh('Документ решения','file')+'<div class="mb form">'+
+  field('Вид документа',sel('da-kind',[['doc','Документ M09'],['link','Ссылка ЛВС']],'doc','onchange="App.decAttKind(this.value)"'),true)+
+  '<div id="da-box-doc">'+field('Документ M09',sel('da-doc',DB.docs.map(x=>[x.id,x.code+' · '+x.title])),true)+
+   field('Фиксируемая версия',inp('da-docv','','number','min="1"'),false,'пусто — последняя версия')+'</div>'+
+  '<div id="da-box-link" style="display:none">'+field('Название',inp('da-name',''),true)+field('Ссылка (URL ЛВС)',inp('da-url',''),true)+'</div>'+
+  field('Примечание',ta('da-note','',2))+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button>'+
+  '<button class="btn pri" id="da-save" onclick="App.decSaveAttach(\''+did+'\')">'+ic('save')+' Приложить</button></div>');
+};
+App.decAttKind=function(k){
+ App._decAttKind=k;
+ ['doc','link'].forEach(x=>{const el=document.getElementById('da-box-'+x); if(el)el.style.display=(x===k?'':'none');});
+};
+App.decSaveAttach=function(did){
+ const k=val('da-kind'), base={decisionId:did,note:val('da-note')};
+ if(k==='doc'){
+  const dv=val('da-docv');
+  rpc('meeting.decisions.attach',Object.assign(base,{docId:val('da-doc'),docV:dv?parseInt(dv,10):null}))
+   .then(r=>{if(r){App.closeModal(true);App.f.decTab='docs';openDecision(did);}});
+  return;
+ }
+ if(!requireFields(['da-name','da-url']))return;
+ rpc('meeting.decisions.attach',Object.assign(base,{name:val('da-name'),url:val('da-url')}))
+  .then(r=>{if(r){App.closeModal(true);App.f.decTab='docs';openDecision(did);}});
+};
+App.decDetach=function(did,aid){
+ if(!guard('meetings','edit'))return;
+ if(!confirm('Открепить документ от решения?'))return;
+ rpc('meeting.decisions.detach',{decisionId:did,attachId:aid}).then(r=>{if(r)openDecision(did);});
+};
 /* ---------- MTG-05. Участники совещания (ТЗ §2.7, экранные требования 8.1–8.4) ---------- */
 const PART_ROLES=['Председатель','Секретарь','Докладчик','Участник','Эксперт','Наблюдатель','Контролирующее лицо'];
 const PART_FIXED=['Председатель','Секретарь'];
@@ -5033,10 +5391,11 @@ function openMeeting(mid){
  if(tab==='run'){ body=meetRunBlock(m); }
  if(tab==='dec'){
   body=(editable?'<div class="flexw mb8"><span class="small mut">Решение фиксируется с ответственным и сроком; поручение создаётся в M02.</span><span class="spacer"></span><button class="btn sm pri" onclick="App.decisionAdd(\''+mid+'\')">'+ic('plus')+' Решение</button></div>':'')+
-  (m.decisions.length?m.decisions.map((d,i)=>{
+  (m.decisions.length?decsOf(m).map((d,i)=>{
    const ts=decTasks(d);
-   return '<div class="card mb8"><div class="cb"><div class="flex" style="align-items:flex-start"><span class="chip">№'+(i+1)+'</span><div style="flex:1"><b class="small">'+esc(d.text)+'</b>'+
-    '<div class="small mut mt8">Ответственный: '+esc(U(d.resp).name)+' · срок '+fmtD(d.due)+(d.agendaN?' · пункт повестки №'+d.agendaN:'')+'</div></div>'+
+   return '<div class="card mb8" id="mdec-row-'+d.id+'"><div class="cb"><div class="flex" style="align-items:flex-start"><span class="chip">№'+(i+1)+'</span><div style="flex:1"><b class="small">'+esc(d.text)+'</b>'+
+    '<div class="small mut mt8">'+esc(d.code)+' · '+esc(d.type)+' · ответственный: '+esc(U(d.resp).name)+' · срок '+fmtD(d.due)+(d.agendaN?' · пункт повестки №'+d.agendaN:'')+'</div>'+
+    '<div class="flexw mt8">'+decBadge(d.status)+(decOverdue(d)?'<span class="chip">просрочено</span>':'')+'<button class="btn sm mdec-open" onclick="openDecision(\''+d.id+'\')">'+ic('eye')+' Карточка решения</button></div></div>'+
     '<div class="flexw" style="justify-content:flex-end">'+
     (can('tasks','create')?'<button class="btn sm '+(ts.length?'':'pri')+'" onclick="App.directiveModal(\''+mid+'\',\''+d.id+'\')">'+ic('tasks')+' '+(ts.length?'Ещё поручение':'В поручение')+'</button>':'')+
     (editable?'<button class="btn sm" title="Изменить решение" onclick="App.decisionEdit(\''+mid+'\',\''+d.id+'\')">'+ic('edit')+'</button>':'')+'</div></div>'+
@@ -5082,15 +5441,27 @@ App.decisionAdd=function(mid,agN){
  const m=MEET(mid)||{agenda:[]};
  const agPre=(agN==null?'':String(agN));
  openModal(mh('Решение совещания','check')+'<div class="mb form">'+field('Формулировка решения',ta('de-text','',3),true)+
+ '<div class="row">'+field('Тип решения (MTG-11)',sel('de-type',DEC_TYPES,'Организационное'),true)+
+  field('Статус при регистрации',sel('de-status',['Принято','Проект','На согласовании'],'Принято'),true)+'</div>'+
  '<div class="row">'+field('Ответственный',sel('de-resp',DB.users.map(u=>[u.id,u.name]),'u5'),true)+field('Срок исполнения',inp('de-due',D(7),'date'),true)+'</div>'+
  field('Пункт повестки',sel('de-ag',[['','не привязан'],...m.agenda.map(a=>[a.n,'№'+a.n+' · '+a.title])],agPre))+
+ field('Основание',ta('de-basis','',2),false,'протокол, документ, поручение руководителя')+
+ field('Критерии результата',ta('de-crit','',2),false,'что считается исполнением решения')+
+ '<div class="row">'+field('Дата принятия',inp('de-adopted',m.date||dISO(TODAY),'date'))+
+  field('Дата вступления в силу',inp('de-eff','','date'))+'</div>'+
+ field('Участники исполнения','<div class="flexw" style="border:1.5px solid var(--line2);border-radius:8px;padding:9px 11px">'+
+  DB.users.filter(u=>!u.blocked).map(u=>'<label class="checkline"><input type="checkbox" class="de-part" value="'+u.id+'" onchange="App.markDirty()">'+esc(u.name)+'</label>').join('')+'</div>')+
  '<label class="checkline"><input type="checkbox" id="de-task" checked> Сразу создать поручение (задачу M02)</label>'+
  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button><button class="btn pri" onclick="App.decisionSave(\''+mid+'\')">Зафиксировать</button></div>');
 };
 App.decisionSave=function(mid){
  if(!requireFields(['de-text','de-due']))return;
  const mkTask=document.getElementById('de-task').checked, ag=val('de-ag');
- rpc('meeting.decision.add',{id:mid,text:val('de-text'),resp:val('de-resp'),due:val('de-due'),createTask:mkTask,agendaN:ag?parseInt(ag,10):null}).then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+ rpc('meeting.decision.add',{id:mid,text:val('de-text'),resp:val('de-resp'),due:val('de-due'),createTask:mkTask,
+  agendaN:ag?parseInt(ag,10):null,type:val('de-type'),status:val('de-status'),basis:val('de-basis'),
+  criteria:val('de-crit'),adoptedAt:val('de-adopted'),effectiveFrom:val('de-eff'),
+  participants:[...document.querySelectorAll('.de-part:checked')].map(x=>x.value)})
+  .then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
 };
 App.decisionToTask=function(mid,did){ App.directiveModal(mid,did); };
 App.meetProtocol=function(mid){

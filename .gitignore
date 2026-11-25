@@ -14,3 +14,7 @@ node_modules/
 *.pem
 *.key
 supip.ini
+# core-dumps от падений
+sup-ip/core
+core
+*.core
