@@ -9,7 +9,7 @@
 Запуск:  python server.py --host 0.0.0.0 --port 80
 БД:      параметры подключения — аргументы --pg-* или переменные SUPIP_PG* / стандартные PG*.
 """
-import argparse, base64, configparser, datetime, hashlib, hmac, json, logging, logging.handlers, math, os, platform, re, secrets, shutil, ssl, subprocess, sys, threading, time, traceback, urllib.parse
+import argparse, base64, configparser, datetime, hashlib, hmac, json, logging, logging.handlers, math, os, platform, re, secrets, shutil, ssl, subprocess, sys, threading, time, traceback, urllib.parse, urllib.request
 import http.server, socketserver
 from http.cookies import SimpleCookie
 
@@ -39,7 +39,7 @@ except ImportError:
     docgen = None
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -3492,13 +3492,13 @@ def notification_cycle_cur(db, cur):
     for t in cur.fetchall():
         if t["end"] < today_s:
             days = diffD(today_s, t["end"])
-            notify(db, cur, t["assignee"], "task.overdue", "Просрочено: %s" % t["title"],
-                   "%s · просрочка %d дн" % (t["code"], days), "Задача", t["id"])
-            delivered += 1
+            if notify(db, cur, t["assignee"], "task.overdue", "Просрочено: %s" % t["title"],
+                      "%s · просрочка %d дн" % (t["code"], days), "Задача", t["id"]):
+                delivered += 1
         elif t["end"] <= tomorrow:
-            notify(db, cur, t["assignee"], "task.due", "Срок истекает: %s" % t["title"],
-                   "%s · срок %s" % (t["code"], _fd(t["end"])), "Задача", t["id"])
-            delivered += 1
+            if notify(db, cur, t["assignee"], "task.due", "Срок истекает: %s" % t["title"],
+                      "%s · срок %s" % (t["code"], _fd(t["end"])), "Задача", t["id"]):
+                delivered += 1
     # 3. Контроль сроков поручений: шесть проверок и настраиваемый состав получателей (ТЗ §2.11.1)
     delivered += directive_control_cycle(db, cur)["delivered"]
     # 4. Пересмотр рисков
@@ -4206,6 +4206,12 @@ def main():
     try:
         db = DB(dsn)
     except Exception as e:
+        if args.backup_now:
+            LOG.warning("Резервная копия не создана: PostgreSQL недоступен (%s)", e)
+            print("Резервная копия не создана: PostgreSQL недоступен.\n"
+                  "При первой установке это нормально — данных ещё нет; при обновлении проверьте службу PostgreSQL.")
+            print("Журнал: %s" % os.path.join(LOG_DIR, "supip.log"))
+            sys.exit(3)
         LOG.critical("PostgreSQL недоступен: %s\n%s", e, traceback.format_exc())
         print("Не удалось подключиться к PostgreSQL: %s\nЗапустите мастер установки: SUP-IP.exe --install (или run.bat)." % e)
         print("Журнал: %s" % os.path.join(LOG_DIR, "supip.log"))
@@ -4231,7 +4237,15 @@ def main():
             print("Файловое хранилище: OK (%s)" % FILES_DIR)
         except Exception as e:
             print("Файловое хранилище: ОШИБКА %s" % e); ok = False
-        print("Порт %s: %s" % (port, "свободен" if socket_bind_probe(host, port) else "занят (возможно, сервер уже запущен)"))
+        scheme = "https" if (cert and key) else "http"
+        probe_host = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
+        ready, info = server_health_probe(scheme, probe_host, port)
+        if ready:
+            print("Сервер: ОТВЕЧАЕТ %s://%s:%s/api/health (версия %s, БД %s)"
+                  % (scheme, probe_host, port, info.get("version", "?"), info.get("db", "?")))
+        else:
+            print("Сервер: НЕ ОТВЕЧАЕТ %s://%s:%s (%s)" % (scheme, probe_host, port, info.get("error", "нет ответа")))
+        print(port_status_line(port, socket_bind_probe(host, port), ready))
         sys.exit(0 if ok else 1)
     if args.backup_now:
         conn = db.get()
@@ -4527,6 +4541,7 @@ def run_install(auto_path=None):
     report.append("Конфигурация сохранена: %s" % CONFIG_PATH)
     report.append("Файловые журналы: %s (уровень %s)" % (LOG_DIR, LOG_STATE["level"]))
     # 9. Брандмауэр и служба (Windows)
+    service_started = False
     if sys.platform == "win32":
         try:
             r = subprocess.run(["netsh", "advfirewall", "firewall", "add", "rule", "name=SUP-IP",
@@ -4536,7 +4551,8 @@ def run_install(auto_path=None):
             report.append("Брандмауэр: %s" % e)
         if ask("service", "Установить службу Windows с автозапуском (1/0)", "1") in ("1", "да", "yes"):
             rc = service_command("install", cfg)
-            report.append("Служба Windows: %s" % ("установлена и запущена" if rc == 0 else "не установлена (см. вывод выше)"))
+            service_started = rc == 0
+            report.append("Служба Windows: %s" % ("установлена, команда запуска выдана" if rc == 0 else "не установлена (см. вывод выше)"))
     else:
         report.append("Служба Windows: пропущено (не Windows); используйте systemd/run.sh")
     # 10. Проверка работоспособности
@@ -4547,13 +4563,32 @@ def run_install(auto_path=None):
         conn.commit(); report.append("Проверка БД: соединение OK")
     finally:
         db.put(conn)
+    scheme = "https" if cert else "http"
+    probe_host = "127.0.0.1" if bind in ("0.0.0.0", "", "::") else bind
+    if service_started:
+        ready, info = wait_server_ready(scheme, probe_host, int(port), wait_s=40)
+        if ready:
+            report.append("Проверка запуска сервера: отвечает %s://%s:%s/api/health · версия %s · БД %s"
+                          % (scheme, probe_host, port, info.get("version", "?"), info.get("db", "?")))
+            SETUP_LOG.info("Служба поднята: сервер отвечает на %s://%s:%s", scheme, probe_host, port)
+        else:
+            report.append("Проверка запуска сервера: НЕТ ОТВЕТА за 40 с (%s). Проверьте службу командой "
+                          "sc query SUP-IP и журнал %s" % (info.get("error", "нет ответа"), os.path.join(LOG_DIR, "supip.log")))
+            SETUP_LOG.warning("Служба установлена, но сервер не ответил за 40 с: %s", info.get("error"))
+    else:
+        ready, info = server_health_probe(scheme, probe_host, int(port))
+        report.append("Проверка запуска сервера: %s" % (
+            "сервер уже отвечает (%s://%s:%s)" % (scheme, probe_host, port) if ready
+            else "пропущено — служба не устанавливалась; запустите сервер и проверьте: SUP-IP.exe --health"))
     try:
         probe = socket_bind_probe(bind, int(port))
-        report.append("Проверка порта %s: %s" % (port, "свободен" if probe else "ЗАНЯТ (освободите порт или измените настройку)"))
+        report.append(port_status_line(port, probe, ready))
     except Exception as e:
         report.append("Проверка порта: %s" % e)
-    scheme = "https" if cert else "http"
     report.append("")
+    if service_started and not ready:
+        report.append("ВНИМАНИЕ: служба установлена, но сервер не ответил. Разбор: %s и %s"
+                      % (os.path.join(LOG_DIR, "setup.log"), os.path.join(LOG_DIR, "supip.log")))
     report.append("ГОТОВО. Запуск: %s" % ("SUP-IP.exe (служба)" if sys.platform == "win32" else "python3 server.py"))
     report.append("Клиенты в ЛВС: %s://<IP-этого-ПК>:%s" % (scheme, port))
     report.append("Вход: admin / %s" % ("(пароль мастера)" if admin_pass != "demo" else "demo"))
@@ -4564,10 +4599,48 @@ def run_install(auto_path=None):
     SETUP_LOG.info("=== Установка завершена успешно ===")
     return 0
 
+def server_health_probe(scheme, host, port, timeout=3):
+    """Проверка фактического ответа сервера (/api/health). Самоподписанный сертификат мастера
+       не проверяется по доверию — важен сам факт ответа службы."""
+    url = "%s://%s:%s/api/health" % (scheme, host or "127.0.0.1", port)
+    try:
+        if scheme == "https":
+            ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+            r = urllib.request.urlopen(url, timeout=timeout, context=ctx)
+        else:
+            r = urllib.request.urlopen(url, timeout=timeout)
+        j = json.loads(r.read().decode("utf-8"))
+        if j.get("ok"): return True, j
+        return False, {"error": "сервер ответил, но состояние не OK", "url": url}
+    except Exception as e:
+        return False, {"error": str(e), "url": url}
+
+def wait_server_ready(scheme, host, port, wait_s=40, interval=1.0):
+    """Служба Windows поднимается асинхронно: ждём фактического ответа сервера (ТЗ §7, §15)."""
+    deadline = time.time() + max(1, wait_s)
+    okk, info = server_health_probe(scheme, host, port)
+    while not okk and time.time() < deadline:
+        time.sleep(interval)
+        okk, info = server_health_probe(scheme, host, port)
+    return okk, info
+
+def port_status_line(port, free, ready):
+    """Однозначная трактовка состояния порта: занят своей службой — это норма, а не ошибка."""
+    if ready:
+        return ("Проверка порта %s: занят службой СУП-ИП (ожидаемо)" % port if not free
+                else "Проверка порта %s: сервер отвечает (состояние порта подтверждено ответом)" % port)
+    return ("Проверка порта %s: свободен — сервер НЕ запущен (служба не подняла порт)" % port if free
+            else "Проверка порта %s: ЗАНЯТ другим процессом — освободите порт или измените supip.ini" % port)
+
 def socket_bind_probe(bind, port):
+    """Проверка занятости порта. На Windows SO_REUSEADDR разрешает связывание уже занятого
+       порта, поэтому проба всегда сообщала «свободен» — используем исключительный режим."""
     import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         s.bind((bind if bind != "0.0.0.0" else "", port)); return True
     except OSError:
@@ -4618,6 +4691,10 @@ def selftest():
     return 0 if ok else 1
 
 # ---------------- Служба Windows (ТЗ §7.4: автозапуск, контролируемый перезапуск) ----------------
+def _svc_absent(e):
+    """Служба не установлена (winerror 1060) — для stop/remove это штатная ситуация."""
+    return getattr(e, "winerror", None) == 1060 or "1060" in str(e)
+
 def service_command(action, cfg=None):
     if not LOG_STATE["ready"]: log_init()
     LOG.info("Служба Windows: команда '%s'", action)
@@ -4647,6 +4724,9 @@ def service_command(action, cfg=None):
             except Exception: pass
             win32serviceutil.RemoveService(name); return 0
         except Exception as e:
+            if _svc_absent(e):
+                LOG.info("Служба Windows не установлена — удаление не требуется")
+                print("Служба не установлена — удаление не требуется."); return 0
             print("Служба: %s" % e); return 1
     if action in ("start", "stop", "restart"):
         try:
@@ -4658,6 +4738,9 @@ def service_command(action, cfg=None):
             else: win32serviceutil.StopService(name)
             return 0
         except Exception as e:
+            if _svc_absent(e) and action in ("stop", "restart"):
+                LOG.info("Служба Windows не установлена — остановка не требуется")
+                print("Служба не установлена — остановка не требуется."); return 0
             print("Служба: %s" % e); return 1
     if action == "run":
         import servicemanager, win32serviceutil

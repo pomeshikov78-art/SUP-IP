@@ -1,9 +1,12 @@
 name: Сборка и испытания СУП-ИП
 
 # ТЗ §7 (развёртывание одним EXE) и §15 (приёмочные испытания).
-# jobs.tests  — интеграционные испытания API на PostgreSQL (Linux).
-# jobs.windows — сборка SUP-IP.exe (PyInstaller) и SUP-IP-Setup-x.y.z.exe (NSIS),
-#                публикация артефактов и Release с готовыми EXE.
+#   tests    — интеграционные испытания API, генератора документов и центра уведомлений
+#              на PostgreSQL (Linux);
+#   windows  — сборка SUP-IP.exe (PyInstaller, one-file) и самотестирование поставки;
+#   installer— сборка SUP-IP-Setup-x.y.z.exe (NSIS; makensis собирает Windows-установщик
+#              и на Linux, что исключает зависимость от Chocolatey на раннере),
+#              публикация артефактов и Release с готовыми EXE по тегу версии.
 
 on:
   push:
@@ -53,15 +56,44 @@ jobs:
             sleep 1
           done
           cat server.log; exit 1
+      - name: Испытания генератора документов (без БД)
+        working-directory: sup-ip
+        run: python tests/docgen_test.py
       - name: Испытания API
         working-directory: sup-ip
         run: python tests/api_test.py --base http://127.0.0.1:8000
+      - name: Испытания выгрузки DOCX/XLSX/PDF
+        working-directory: sup-ip
+        run: python tests/export_test.py --base http://127.0.0.1:8000
+      - name: Испытания центра уведомлений и напоминаний
+        working-directory: sup-ip
+        run: python tests/notif_test.py --base http://127.0.0.1:8000
+      - name: Испытания файлового журналирования
+        working-directory: sup-ip
+        run: python tests/log_test.py --base http://127.0.0.1:8000
+      - name: Испытания маршрута согласования и версий протокола
+        working-directory: sup-ip
+        run: python tests/protocol_test.py --base http://127.0.0.1:8000
+      - name: Испытания поручений из решений совещаний
+        working-directory: sup-ip
+        run: python tests/directive_test.py --base http://127.0.0.1:8000
+      - name: Испытания реестра поручений и приёмки результата
+        working-directory: sup-ip
+        run: python tests/registry_test.py --base http://127.0.0.1:8000
+      - name: Испытания контроля сроков и отчётности по поручениям
+        working-directory: sup-ip
+        run: python tests/control_test.py --base http://127.0.0.1:8000
+      - name: Испытания установки, запуска и журналов (со сборкой сценария NSIS)
+        working-directory: sup-ip
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends nsis
+          python tests/setup_test.py --base http://127.0.0.1:8000 --nsis
       - name: Журнал сервера (при сбое)
         if: failure()
         run: cat sup-ip/server.log
 
   windows:
-    name: Сборка EXE и установщика (Windows x64)
+    name: Сборка SUP-IP.exe (Windows x64)
     runs-on: windows-latest
     needs: tests
     steps:
@@ -72,14 +104,6 @@ jobs:
           architecture: 'x64'
       - name: Зависимости сборки
         run: python -m pip install --upgrade pip pyinstaller psycopg2-binary pywin32 cryptography
-      - name: Определение версии
-        id: ver
-        shell: pwsh
-        run: |
-          $m = Select-String -Path sup-ip/server.py -Pattern '^VERSION = "([0-9.]+)"'
-          $v = $m.Matches.Groups[1].Value
-          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "Версия: $v"
       - name: Сборка SUP-IP.exe (PyInstaller, one-file)
         working-directory: sup-ip
         shell: pwsh
@@ -97,23 +121,64 @@ jobs:
         run: |
           .\sup-ip\dist\SUP-IP.exe --version
           .\sup-ip\dist\SUP-IP.exe --selftest
-      - name: Офлайн-пакет PostgreSQL (опционально)
-        if: github.event_name == 'workflow_dispatch' && inputs.bundle_postgres
-        shell: pwsh
+      - name: Артефакт SUP-IP.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: SUP-IP-exe
+          path: sup-ip/dist/SUP-IP.exe
+          if-no-files-found: error
+
+  installer:
+    name: Установщик SUP-IP-Setup.exe (NSIS)
+    runs-on: ubuntu-latest
+    needs: windows
+    steps:
+      - uses: actions/checkout@v4
+      - name: Установка NSIS
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends nsis
+      - name: Версия
+        id: ver
         run: |
-          $url = 'https://get.enterprisedb.com/postgresql/postgresql-16.4-1-windows-x64.exe'
-          Invoke-WebRequest -Uri $url -OutFile sup-ip/installer/postgresql-setup.exe
-          Write-Host ("PostgreSQL: {0:N0} МБ" -f ((Get-Item sup-ip/installer/postgresql-setup.exe).Length/1MB))
-      - name: Сборка установщика (NSIS)
-        shell: pwsh
+          v=$(grep -oP '^VERSION = "\K[0-9.]+' sup-ip/server.py)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Версия: $v"
+      - name: Получение SUP-IP.exe
+        uses: actions/download-artifact@v4
+        with:
+          name: SUP-IP-exe
+          path: sup-ip/dist
+      - name: Офлайн-пакет PostgreSQL (для полного установщика)
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.bundle_postgres)
+        run: |
+          curl -L --retry 3 --connect-timeout 30 -o sup-ip/installer/postgresql-setup.exe \
+            https://get.enterprisedb.com/postgresql/postgresql-16.4-1-windows-x64.exe
+          ls -lh sup-ip/installer/postgresql-setup.exe
+      - name: Сборка полного установщика (PostgreSQL внутри, без интернета)
+        if: hashFiles('sup-ip/installer/postgresql-setup.exe') != ''
         working-directory: sup-ip
         run: |
-          $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
-          if (-not (Test-Path $nsis)) { choco install nsis -y --no-progress; $nsis = "makensis" }
-          & $nsis /DVERSION=${{ steps.ver.outputs.version }} installer\setup.nsi
-          if ($LASTEXITCODE -ne 0) { throw "NSIS завершился с кодом $LASTEXITCODE" }
-          Get-ChildItem dist | Format-Table Name,Length
-      - name: Артефакты
+          makensis -V2 -DVERSION=${{ steps.ver.outputs.version }} installer/setup.nsi
+          rm -f installer/postgresql-setup.exe
+      - name: Сборка компактного установщика
+        working-directory: sup-ip
+        run: |
+          makensis -V2 -DVERSION=${{ steps.ver.outputs.version }} installer/setup.nsi
+          ls -lh dist
+          python3 - <<'EOF'
+          import glob
+          for f in sorted(glob.glob('dist/*.exe')):
+              sig = open(f,'rb').read(2)
+              print(f, 'Windows PE' if sig == b'MZ' else 'ОШИБКА СИГНАТУРЫ', sig)
+              assert sig == b'MZ', f
+          EOF
+      - name: Стабильные имена файлов для постоянных ссылок
+        working-directory: sup-ip
+        run: |
+          cp "dist/SUP-IP-Setup-${{ steps.ver.outputs.version }}.exe" dist/SUP-IP-Setup.exe
+          if [ -f "dist/SUP-IP-Setup-full-${{ steps.ver.outputs.version }}.exe" ]; then
+            cp "dist/SUP-IP-Setup-full-${{ steps.ver.outputs.version }}.exe" dist/SUP-IP-Setup-full.exe
+          fi
+      - name: Артефакты поставки
         uses: actions/upload-artifact@v4
         with:
           name: SUP-IP-windows-x64
@@ -123,13 +188,13 @@ jobs:
           if-no-files-found: error
       - name: Публикация Release (по тегу версии)
         if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $v = "${{ steps.ver.outputs.version }}"
-          gh release create "v$v" --title "СУП-ИП v$v" --notes-file CHANGELOG.md `
-            "sup-ip/dist/SUP-IP.exe" `
-            "sup-ip/dist/SUP-IP-Setup-$v.exe" `
-            "SUP-IP_server.zip"
-          if ($LASTEXITCODE -ne 0) { gh release upload "v$v" "sup-ip/dist/SUP-IP.exe" "sup-ip/dist/SUP-IP-Setup-$v.exe" --clobber }
+          v=${{ steps.ver.outputs.version }}
+          files=("sup-ip/dist/SUP-IP.exe" "sup-ip/dist/SUP-IP-Setup-$v.exe" "sup-ip/dist/SUP-IP-Setup.exe" "SUP-IP_server.zip")
+          if [ -f "sup-ip/dist/SUP-IP-Setup-full-$v.exe" ]; then
+            files+=("sup-ip/dist/SUP-IP-Setup-full-$v.exe" "sup-ip/dist/SUP-IP-Setup-full.exe")
+          fi
+          gh release create "v$v" --title "СУП-ИП v$v" --notes-file CHANGELOG.md "${files[@]}" \
+          || gh release upload "v$v" "${files[@]}" --clobber

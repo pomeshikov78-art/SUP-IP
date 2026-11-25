@@ -2,6 +2,7 @@
 sup-ip/data/
 data/
 # сборки и кеши
+.arena/
 __pycache__/
 *.pyc
 build/

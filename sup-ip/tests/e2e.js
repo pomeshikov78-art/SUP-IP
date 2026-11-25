@@ -618,6 +618,18 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
  await page.evaluate(()=>App.notifTick());
  await sleep(800);
  ok('внеочередной цикл планировщика отработал', (await page.evaluate(()=>document.getElementById('toasts').textContent)).includes('Планировщик отработал'));
+ // v1.9.0: счётчик доставленных учитывает только реально созданные уведомления (без повторов)
+ const nl1 = await rpcAs(admCookie,'notif.list');
+ const cnt1 = ((nl1.result||{}).items||[]).length;
+ await page.evaluate(()=>App.notifTick());
+ await sleep(800);
+ const t2 = await page.evaluate(()=>document.getElementById('toasts').textContent);
+ ok('повторный цикл планировщика: доставлено 0', t2.includes('Доставлено уведомлений: 0'), t2.slice(-160));
+ const nl2 = await rpcAs(admCookie,'notif.list');
+ ok('число уведомлений не выросло от повторного цикла', ((nl2.result||{}).items||[]).length===cnt1, cnt1+' → '+((nl2.result||{}).items||[]).length);
+ await page.evaluate(()=>App.notifTick());
+ await sleep(800);
+ ok('третий цикл также без дублей', (await page.evaluate(()=>document.getElementById('toasts').textContent)).includes('Доставлено уведомлений: 0'));
  await page.screenshot({path:'/tmp/e2e/shot_notif_admin.png'});
 
  console.log('== M14: файловые журналы ==');

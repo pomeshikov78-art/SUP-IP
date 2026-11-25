@@ -9,7 +9,7 @@
 Unicode true
 ManifestDPIAware true
 !ifndef VERSION
-  !define VERSION "1.8.0"
+  !define VERSION "1.9.0"
 !endif
 !define APPNAME "SUP-IP"
 !define DISPLAY "СУП-ИП — управление проектами"
@@ -38,7 +38,6 @@ SetCompressor /SOLID lzma
 !include "x64.nsh"
 !include "FileFunc.nsh"
 !insertmacro GetTime
-!insertmacro GetSize
 !define MUI_ABORTWARNING
 !insertmacro MUI_PAGE_DIRECTORY
 Page custom PgPage PgPageLeave
@@ -61,6 +60,7 @@ Var PgHost
 Var PgPort
 Var PgFound          ; что обнаружено на ПК (для надписи)
 Var LogFile
+Var LogPath          ; путь журнала (в $LogFile — дескриптор, не путь)
 Var PgDlg
 Var RbAuto
 Var RbFile
@@ -80,7 +80,8 @@ Var Bundled
   Push $R5
   Push $R6
   ${GetTime} "" "L" $R0 $R1 $R2 $R3 $R4 $R5 $R6
-  FileWrite $LogFile "$R2-$R1-$R0 $R4:$R5:$R6  ${MSG}$\r$\n"
+  FileSeek $LogFile 0 END
+  FileWriteUTF16LE $LogFile "$R2-$R1-$R0 $R4:$R5:$R6  ${MSG}$\r$\n"
   Pop $R6
   Pop $R5
   Pop $R4
@@ -90,28 +91,119 @@ Var Bundled
   Pop $R0
 !macroend
 
-; Выполнение команды с записью в журнал: результат (код возврата) остаётся в $0
+; Выполнение команды с записью в журнал: результат (код возврата) остаётся в $0.
+; Вывод команды пишется в файл и перекодируется в UTF-16LE: nsExec обрезает длинные
+; строки и смешивает кодировки (CP1251 + UTF-8) — журнал становился нечитаемым.
 !macro RUN MSG CMD
   DetailPrint "${MSG}"
   !insertmacro LOG "ШАГ: ${MSG}"
   Push $R9
+  Push $R8
   StrCpy $R9 '${CMD}'
   !insertmacro LOG "  CMD: $R9"
-  nsExec::ExecToStack '${CMD}'
+  FileOpen $R8 "$TEMP\supip-cmd.bat" w
+  ; bat пишется в системной кодовой странице: chcp 65001 сломал бы кириллические пути
+  FileWrite $R8 "@echo off$\r$\nset PYTHONIOENCODING=utf-8$\r$\n"
+  FileWrite $R8 "$R9 > $\"$TEMP\supip-out.txt$\" 2>&1$\r$\nexit /b %ERRORLEVEL%$\r$\n"
+  FileClose $R8
+  Delete "$TEMP\supip-out.txt"
+  nsExec::ExecToStack '"$SYSDIR\cmd.exe" /d /c "$TEMP\supip-cmd.bat"'
   Pop $0
   Pop $R9
   !insertmacro LOG "  КОД: $0"
-  !insertmacro LOG "  ВЫВОД: $R9"
+  !insertmacro LOG "  ВЫВОД:"
+  Call AppendCmdOutput
+  Pop $R8
   Pop $R9
+!macroend
+
+; Дописывание вывода команды в журнал в единой кодировке (UTF-8 либо OEM → UTF-16LE)
+!macro APPEND_OUT UN
+Function ${UN}AppendCmdOutput
+  Push $R7
+  Push $R5
+  Push $R4
+  Push $0
+  ${If} ${FileExists} "$TEMP\supip-out.txt"
+    ; журнал закрывается на время дописывания внешним процессом и открывается заново
+    FileClose $LogFile
+    StrCpy $R7 "$$b=[IO.File]::ReadAllBytes('$TEMP\supip-out.txt');try{$$t=(New-Object System.Text.UTF8Encoding($$false,$$true)).GetString($$b)}catch{$$t=[Text.Encoding]::GetEncoding(866).GetString($$b)};[IO.File]::AppendAllText('$LogPath',$$t,[Text.Encoding]::Unicode)"
+    nsExec::ExecToStack 'powershell -NoProfile -ExecutionPolicy Bypass -Command "$R7"'
+    Pop $0
+    Pop $R5
+    FileOpen $LogFile "$LogPath" a
+    ${If} $0 != 0
+      ; резервный путь: построчное чтение средствами NSIS (без перекодировки)
+      FileOpen $R4 "$TEMP\supip-out.txt" r
+      read_out:
+        FileRead $R4 $R5
+        ${If} $R5 == ""
+          Goto read_done
+        ${EndIf}
+        FileSeek $LogFile 0 END
+        FileWriteUTF16LE $LogFile "    $R5"
+        Goto read_out
+      read_done:
+      FileClose $R4
+    ${EndIf}
+  ${Else}
+    FileSeek $LogFile 0 END
+    FileWriteUTF16LE $LogFile "    (вывод отсутствует)$\r$\n"
+  ${EndIf}
+  Pop $0
+  Pop $R4
+  Pop $R5
+  Pop $R7
+FunctionEnd
+!macroend
+!insertmacro APPEND_OUT ""
+!insertmacro APPEND_OUT "un."
+
+; То же для деинсталлятора
+!macro URUN MSG CMD
+  DetailPrint "${MSG}"
+  !insertmacro LOG "ШАГ: ${MSG}"
+  Push $R9
+  Push $R8
+  StrCpy $R9 '${CMD}'
+  !insertmacro LOG "  CMD: $R9"
+  FileOpen $R8 "$TEMP\supip-cmd.bat" w
+  ; bat пишется в системной кодовой странице: chcp 65001 сломал бы кириллические пути
+  FileWrite $R8 "@echo off$\r$\nset PYTHONIOENCODING=utf-8$\r$\n"
+  FileWrite $R8 "$R9 > $\"$TEMP\supip-out.txt$\" 2>&1$\r$\nexit /b %ERRORLEVEL%$\r$\n"
+  FileClose $R8
+  Delete "$TEMP\supip-out.txt"
+  nsExec::ExecToStack '"$SYSDIR\cmd.exe" /d /c "$TEMP\supip-cmd.bat"'
+  Pop $0
+  Pop $R9
+  !insertmacro LOG "  КОД: $0"
+  !insertmacro LOG "  ВЫВОД:"
+  Call un.AppendCmdOutput
+  Pop $R8
+  Pop $R9
+!macroend
+
+; Метка порядка байтов для нового журнала UTF-16LE
+!macro LOG_BOM
+  Push $9
+  FileSeek $LogFile 0 END $9
+  ${If} $9 == 0
+    FileWriteWord $LogFile 0xFEFF
+  ${EndIf}
+  Pop $9
 !macroend
 
 Function .onInit
   SetRegView 64
-  FileOpen $LogFile "$TEMP\SUP-IP-Setup.log" a
+  StrCpy $LogPath "$TEMP\SUP-IP-Setup.log"
+  FileOpen $LogFile "$LogPath" a
   FileSeek $LogFile 0 END
+  !insertmacro LOG_BOM
   !insertmacro LOG "==================================================="
-  !insertmacro LOG "СУП-ИП ${VERSION}: запуск установщика"
-  !insertmacro LOG "ОС: ${__DATE__} сборка установщика; каталог: $EXEDIR"
+  !insertmacro LOG "СУП-ИП ${VERSION}: запуск установщика (сборка ${__DATE__})"
+  ReadRegStr $0 HKLM "SOFTWARE\Microsoft\Windows NT\CurrentVersion" "ProductName"
+  ReadRegStr $1 HKLM "SOFTWARE\Microsoft\Windows NT\CurrentVersion" "CurrentBuild"
+  !insertmacro LOG "ОС: $0 сборка $1; каталог запуска: $EXEDIR"
   StrCpy $PgMode "auto"
   StrCpy $PgHost "127.0.0.1"
   StrCpy $PgPort "5432"
@@ -227,11 +319,11 @@ Function PgPage
   ${NSD_CreateLabel} 0 122u 100% 26u "Журнал установки ведётся всегда: $TEMP\SUP-IP-Setup.log$\r$\nПосле установки он копируется в каталог программы (data\logs\installer.log)."
   Pop $0
   ${If} $PgMode == "exist"
-    ${NSD_Check} $RbExist
+    Call PgPickExist
   ${ElseIf} $PgMode == "file"
-    ${NSD_Check} $RbFile
+    Call PgPickFile
   ${Else}
-    ${NSD_Check} $RbAuto
+    Call PgPickAuto
   ${EndIf}
   nsDialogs::Show
 FunctionEnd
@@ -293,6 +385,13 @@ Function PgPageLeave
     ${If} $PgHost == ""
       MessageBox MB_ICONEXCLAMATION "Укажите адрес сервера PostgreSQL."
       Abort
+    ${EndIf}
+  ${EndIf}
+  ${If} $PgMode == "auto"
+    ${If} $Bundled == "1"
+      ${AndIf} ${FileExists} "$PgInstaller"
+      StrCpy $PgMode "file"
+      !insertmacro LOG "Режим изменён на офлайн: установщик PostgreSQL включён в пакет — загрузка из сети не требуется"
     ${EndIf}
   ${EndIf}
   !insertmacro LOG "Выбран режим PostgreSQL: $PgMode (файл: $PgInstaller · сервер: $PgHost:$PgPort)"
@@ -383,6 +482,11 @@ Section "Файлы программы" SEC_FILES
   CreateDirectory "$INSTDIR\data\logs"
   IfFileExists "$INSTDIR\SUP-IP.exe" 0 fresh
     !insertmacro RUN "Обновление: резервная копия БД" '"$INSTDIR\SUP-IP.exe" --backup-now'
+    ${If} $0 == 3
+      !insertmacro LOG "Резервная копия пропущена: БД недоступна (первая установка либо PostgreSQL не запущен)"
+    ${ElseIf} $0 != 0
+      !insertmacro LOG "ВНИМАНИЕ: резервная копия не создана (код $0) — установка продолжается"
+    ${EndIf}
     !insertmacro RUN "Обновление: остановка службы" '"$INSTDIR\SUP-IP.exe" --service stop'
     Sleep 2000
   fresh:
@@ -414,6 +518,13 @@ Section "PostgreSQL" SEC_PG
   ${EndIf}
 
   ${If} $PgMode == "auto"
+    ${If} $Bundled == "1"
+      ${AndIf} ${FileExists} "$PgInstaller"
+      StrCpy $PgMode "file"
+      !insertmacro LOG "Используется офлайн-пакет из установщика: $PgInstaller"
+    ${EndIf}
+  ${EndIf}
+  ${If} $PgMode == "auto"
     DetailPrint "Загрузка PostgreSQL ${PG_VER} (~350 МБ)…"
     !insertmacro LOG "Загрузка PostgreSQL: ${PG_URL}"
     !insertmacro RUN "Загрузка установщика PostgreSQL (curl)" 'curl.exe -L --retry 3 --connect-timeout 30 -o "$TEMP\postgresql-setup.exe" "${PG_URL}"'
@@ -425,11 +536,21 @@ Section "PostgreSQL" SEC_PG
       MessageBox MB_ICONSTOP "Не удалось скачать PostgreSQL (нет интернета или доступ запрещён).$\r$\n$\r$\nСкачайте на любом ПК с интернетом файл$\r$\npostgresql-16.x-windows-x64.exe (enterprisedb.com/downloads/postgres-postgresql-downloads),$\r$\nперенесите на этот ПК и в установщике выберите «Установить из офлайн-файла».$\r$\n$\r$\nЖурнал: $TEMP\SUP-IP-Setup.log"
       Abort
     ${EndIf}
-    ${GetSize} "$TEMP" "/F=postgresql-setup.exe /S=1M" $1 $2 $3
-    !insertmacro LOG "Загружено: $1 МБ"
+    FileOpen $4 "$TEMP\postgresql-setup.exe" r
+    FileSeek $4 0 END $5
+    FileClose $4
+    IntOp $1 $5 / 1048576
+    !insertmacro LOG "Загружено: $1 МБ ($5 байт)"
     ${If} $1 < 100
-      MessageBox MB_ICONSTOP "Загруженный файл PostgreSQL повреждён или неполон ($1 МБ).$\r$\nПовторите установку или используйте офлайн-файл.$\r$\nЖурнал: $TEMP\SUP-IP-Setup.log"
-      Abort
+      ${If} $Bundled == "1"
+        ${AndIf} ${FileExists} "$PgInstaller"
+        !insertmacro LOG "Загрузка неполна — используется офлайн-пакет из установщика"
+        StrCpy $PgMode "file"
+      ${Else}
+        !insertmacro LOG "ОТКАЗ: загруженный файл неполон ($1 МБ)"
+        MessageBox MB_ICONSTOP "Загруженный файл PostgreSQL повреждён или неполон ($1 МБ).$\r$\nПовторите установку или используйте офлайн-файл (SUP-IP-Setup-full.exe).$\r$\nЖурнал: $TEMP\SUP-IP-Setup.log"
+        Abort
+      ${EndIf}
     ${EndIf}
     StrCpy $PgInstaller "$TEMP\postgresql-setup.exe"
   ${EndIf}
@@ -495,7 +616,7 @@ Section "Настройка" SEC_CONFIG
   ; журнал установки — в каталог программы (доступен из M14)
   FileClose $LogFile
   CopyFiles /SILENT "$TEMP\SUP-IP-Setup.log" "$INSTDIR\data\logs\installer.log"
-  FileOpen $LogFile "$TEMP\SUP-IP-Setup.log" a
+  FileOpen $LogFile "$LogPath" a
   FileSeek $LogFile 0 END
   !insertmacro LOG "Журнал установки скопирован в $INSTDIR\data\logs\installer.log"
   ; Ярлыки и регистрация
@@ -524,12 +645,14 @@ Function .onInstFailed
 FunctionEnd
 
 Section "Uninstall"
-  FileOpen $LogFile "$TEMP\SUP-IP-Uninstall.log" a
+  StrCpy $LogPath "$TEMP\SUP-IP-Uninstall.log"
+  FileOpen $LogFile "$LogPath" a
   FileSeek $LogFile 0 END
+  !insertmacro LOG_BOM
   !insertmacro LOG "Удаление СУП-ИП ${VERSION}"
-  nsExec::ExecToLog '"$INSTDIR\SUP-IP.exe" --service stop'
-  nsExec::ExecToLog '"$INSTDIR\SUP-IP.exe" --service remove'
-  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name=SUP-IP'
+  !insertmacro URUN "Остановка службы" '"$INSTDIR\SUP-IP.exe" --service stop'
+  !insertmacro URUN "Удаление службы" '"$INSTDIR\SUP-IP.exe" --service remove'
+  !insertmacro URUN "Удаление правила брандмауэра" 'netsh advfirewall firewall delete rule name=SUP-IP'
   Delete "$INSTDIR\SUP-IP.exe"
   Delete "$INSTDIR\README.md"
   Delete "$INSTDIR\CHANGELOG.md"
