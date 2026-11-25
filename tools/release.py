@@ -25,6 +25,12 @@ def main():
     assert s2 != s or ('VERSION = "%s"' % ver) in s
     io.open(p, "w", encoding="utf-8").write(s2)
 
+    # 1б. версия сценария установщика NSIS — всегда совпадает с версией программы
+    np = os.path.join(ROOT, "sup-ip", "installer", "setup.nsi")
+    n = io.open(np, encoding="utf-8").read()
+    n2 = re.sub(r'!define VERSION "\d+\.\d+\.\d+"', '!define VERSION "%s"' % ver, n, count=1)
+    io.open(np, "w", encoding="utf-8").write(n2)
+
     # 2. README (корневой — канонический) + копия в sup-ip/
     rp = os.path.join(ROOT, "README.md")
     r = io.open(rp, encoding="utf-8").read()
@@ -53,10 +59,14 @@ def main():
                 fp = os.path.join(root, f)
                 z.write(fp, os.path.relpath(fp, ROOT))
 
+    # 5б. эксплуатационные руководства под новую версию
+    subprocess.run([sys.executable, os.path.join(ROOT, "tools", "make_docs.py")], cwd=ROOT, check=True)
+
     # 6. git: commit + push (+tag)
     run("git", "add", "-A")
     run("git", "commit", "-m", "v%s: %s" % (ver, desc))
-    run("git", "push", "origin", "main")
+    run("git", "push", "origin", "master")
+    run("git", "push", "origin", "master:main")
     if not no_tag:
         run("git", "tag", "-a", "v" + ver, "-m", desc)
         run("git", "push", "origin", "v" + ver)

@@ -39,7 +39,7 @@ except ImportError:
     docgen = None
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.14.0"
+VERSION = "1.14.1"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -288,7 +288,18 @@ CREATE TABLE IF NOT EXISTS meetings(
   protocol JSONB NOT NULL DEFAULT '{}', materials JSONB NOT NULL DEFAULT '[]',
   projects JSONB NOT NULL DEFAULT '[]', recurrence JSONB NOT NULL DEFAULT '{}',
   plan_log JSONB NOT NULL DEFAULT '[]', series_id TEXT NOT NULL DEFAULT '',
-  participants JSONB NOT NULL DEFAULT '[]', actual_composition JSONB NOT NULL DEFAULT '{}');
+  participants JSONB NOT NULL DEFAULT '[]', actual_composition JSONB NOT NULL DEFAULT '{}',
+  requisites JSONB NOT NULL DEFAULT '{}', protocol_draft JSONB NOT NULL DEFAULT '{}');
+CREATE INDEX IF NOT EXISTS ix_meetings_series ON meetings(series_id) WHERE series_id <> '';
+CREATE INDEX IF NOT EXISTS ix_meetings_date ON meetings(date);
+CREATE TABLE IF NOT EXISTS templates(
+  id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'Пользовательский',
+  meet_types JSONB NOT NULL DEFAULT '[]', version INT NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'Действует', is_default BOOLEAN NOT NULL DEFAULT FALSE,
+  org TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
+  blocks JSONB NOT NULL DEFAULT '[]', history JSONB NOT NULL DEFAULT '[]',
+  author TEXT, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, updated_by TEXT);
+CREATE INDEX IF NOT EXISTS ix_templates_status ON templates(status);
 CREATE TABLE IF NOT EXISTS risks(
   id TEXT PRIMARY KEY, code TEXT UNIQUE NOT NULL, title TEXT NOT NULL, cat TEXT NOT NULL,
   project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, p INT NOT NULL, i INT NOT NULL,
@@ -405,6 +416,13 @@ class DB:
         try:
             with conn.cursor() as cur:
                 cur.execute(SCHEMA)
+                # Сходимость схемы: все DDL миграций идемпотентны (IF NOT EXISTS) и применяются
+                # независимо от записанной версии — это чинит базы, где версия схемы опережала
+                # фактический состав таблиц/колонок (ТТ-2 §7.6: обновление не должно ломать установку).
+                for ver in sorted(MIGRATIONS):
+                    for sql in MIGRATIONS[ver]:
+                        if sql.lstrip().upper().startswith(("CREATE", "ALTER")):
+                            cur.execute(sql)
                 cur.execute("INSERT INTO meta(k,v) VALUES('rev','1') ON CONFLICT DO NOTHING")
                 cur.execute("INSERT INTO meta(k,v) VALUES('schema',%s) ON CONFLICT DO NOTHING", (str(SCHEMA_VERSION),))
             conn.commit()

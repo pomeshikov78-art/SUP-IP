@@ -3,6 +3,9 @@ const BASE = 'http://127.0.0.1:8000';
 let PASS=0, FAIL=0;
 const ok=(name,cond,extra='')=>{ if(cond){PASS++;console.log('  ok  '+name);} else {FAIL++;console.log('FAIL  '+name+'  '+extra);} };
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+// ожидание условия вместо фиксированной паузы: одиночный RPC может занять больше секунды
+const waitFor=async(fn,ms=8000,step=150)=>{const t0=Date.now();for(;;){let v=false;try{v=await fn();}catch(e){v=false;}
+ if(v)return true; if(Date.now()-t0>=ms)return false; await sleep(step);}};
 
 (async()=>{
  const browser = await puppeteer.launch({headless:'new',args:['--no-sandbox','--disable-dev-shm-usage']});
@@ -349,11 +352,13 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
  ok('окно расписания: периодичность и интервал', (await page.$eval('#rec-freq',e=>e.value))==='weekly' && (await page.$('#rec-save'))!==null);
  await page.evaluate(()=>{document.getElementById('rec-int').value='2';});
  await page.evaluate(()=>document.getElementById('rec-save').click());
- await sleep(800);
+ await waitFor(()=>page.evaluate(m=>(((DB.meetings.find(x=>x.id===m)||{}).recurrence)||{}).interval===2,planMid));
+ await sleep(200);
  ok('расписание серии изменено', (await txtOf('#mp-rec')).includes('Каждые 2 нед'));
  const serBefore = await serCount(planMid);
  await page.evaluate(()=>document.getElementById('mp-series-gen').click());
- await sleep(900);
+ await waitFor(async()=>(await serCount(planMid))>serBefore);
+ await sleep(200);
  const serAfter = await serCount(planMid);
  ok('генерация ближайших дат не создаёт дублей', serAfter>=serBefore && serAfter<=serBefore+8, serBefore+'→'+serAfter);
  await page.evaluate(()=>document.getElementById('mp-series-view').click());
