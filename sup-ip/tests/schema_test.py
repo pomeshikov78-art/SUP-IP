@@ -259,23 +259,39 @@ def main():
         check("сходимость: сохранение совещания работает", _save_meeting(srv, db) is True)
         check("сходимость: эталонный набор не дублируется", srv.seed(db) is False)
 
-        print("== F. Обновление прежней версии (метка 6 → 7) ==")
+        print("== F. Обновление прежней версии (метка 6 → 8) ==")
         exec_sql(db, "ALTER TABLE meetings DROP COLUMN requisites",
                  "ALTER TABLE meetings DROP COLUMN protocol_draft",
+                 "ALTER TABLE meetings DROP COLUMN run",
                  "DROP TABLE templates",
                  "UPDATE meta SET v='6' WHERE k='schema'")
         db.pool.closeall()
         db = srv.DB(tmp_dsn)
         applied = srv.migrate(db)
-        check("обновление: миграция 7 применена", applied == [7], applied)
+        check("обновление: миграции 7 и 8 применены по порядку", applied == [7, 8], applied)
         check("обновление: метка версии схемы обновлена",
               str(scalar(db, "SELECT v FROM meta WHERE k='schema'")) == str(srv.SCHEMA_VERSION))
         mc = cols_of(db, "meetings")
         check("обновление: колонки реквизитов и черновика", "requisites" in mc and "protocol_draft" in mc)
+        check("обновление: колонка хода проведения (миграция 8)", "run" in mc, sorted(mc))
         check("обновление: журнал TECH о миграциях",
               scalar(db, "SELECT COUNT(*) FROM events WHERE cat='TECH' AND action LIKE '%Миграции%'") >= 1)
         check("обновление: повторный запуск без миграций", srv.migrate(db) == [])
         check("обновление: данные сохранены", scalar(db, "SELECT COUNT(*) FROM users") >= 8)
+
+        print("== G. Обновление с версии 1.14.x (метка 7 → 8) ==")
+        exec_sql(db, "ALTER TABLE meetings DROP COLUMN run", "UPDATE meta SET v='7' WHERE k='schema'")
+        db.pool.closeall()
+        db = srv.DB(tmp_dsn)
+        applied = srv.migrate(db)
+        check("обновление: применена только миграция 8", applied == [8], applied)
+        check("обновление: ход проведения восстановлен", "run" in cols_of(db, "meetings"))
+        check("обновление: таблица шаблонов протокола не затронута",
+              scalar(db, "SELECT COUNT(*) FROM information_schema.tables WHERE table_name='templates'") == 1)
+        check("обновление: сохранение хода проведения работает",
+              scalar(db, "SELECT COUNT(*) FROM meetings WHERE run IS NOT NULL") >= 1)
+        check("обновление: метка версии схемы — 8",
+              str(scalar(db, "SELECT v FROM meta WHERE k='schema'")) == "8")
     finally:
         try:
             if db is not None: db.pool.closeall()

@@ -100,6 +100,12 @@ jobs:
       - name: Испытания протокола и библиотеки шаблонов (ТЗ §2.8, MTG-09/MTG-10)
         working-directory: sup-ip
         run: python tests/templates_test.py --base http://127.0.0.1:8000
+      - name: Испытания материалов совещания (ТЗ §10, MTG-07)
+        working-directory: sup-ip
+        run: python tests/materials_test.py --base http://127.0.0.1:8000
+      - name: Испытания рабочей формы проведения (ТЗ §11, MTG-08)
+        working-directory: sup-ip
+        run: python tests/conduct_test.py --base http://127.0.0.1:8000
       - name: Формирование эксплуатационных руководств (DOCX/DOC)
         run: python tools/make_docs.py
       - name: Испытания установки, запуска и журналов (со сборкой сценария NSIS)

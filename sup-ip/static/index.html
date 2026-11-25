@@ -902,7 +902,13 @@ const progressBar=(v,cls)=>'<div class="prow"><div class="progress '+(cls||'')+'
 const emptyBlock=(title,hint,icon)=>'<div class="empty">'+ic(icon||'search')+'<b>'+esc(title)+'</b><p>'+esc(hint||'')+'</p></div>';
 function overdueMark(t){ return taskOverdue(t)?'<span class="overdue">'+ic('alert')+'просрочка '+overDays(t)+' дн</span>':''; }
 function field(label, inner, req, hint){ return '<div class="field"><label>'+label+(req?' <span class="req">*</span>':'')+'</label>'+inner+(hint?'<div class="fh">'+hint+'</div>':'')+'</div>'; }
-const inp=(id,val,type,attrs)=>'<input id="'+id+'" type="'+(type||'text')+'" value="'+esc(val==null?'':val)+'" oninput="App.markDirty()" '+(attrs||'')+'>';
+const inp=(id,val,type,attrs)=>{
+ // обработчик из attrs объединяется с отметкой изменения: повторный атрибут oninput браузером игнорируется
+ let a=attrs||'', h='App.markDirty()';
+ const mm=a.match(/oninput="([^"]*)"/);
+ if(mm){ h+=';'+mm[1]; a=a.replace(mm[0],''); }
+ return '<input id="'+id+'" type="'+(type||'text')+'" value="'+esc(val==null?'':val)+'" oninput="'+h+'" '+a+'>';
+};
 const sel=(id,opts,val,attrs)=>{
  // обработчик из attrs объединяется с отметкой изменения: повторный атрибут onchange браузером игнорируется
  let a=attrs||'', h='App.markDirty()';
@@ -3313,7 +3319,7 @@ App.directiveSave=function(mid,did,confirmed){
   coassignees:co,due:val('dr-due'),priority:val('dr-pr'),criteria:val('dr-crit'),source:val('dr-src')};
  if(confirmed)payload.confirm=true;
  rpc('meeting.decision.toTask',payload).then(r=>{
-  if(r){ App.closeModal(true); App.f.meetTab='dec'; openMeeting(mid); return; }
+  if(r){ App.closeModal(true); if(App.f.meetTab!=='run')App.f.meetTab='dec'; openMeeting(mid); return; }
   const e=App.lastRpcError||{};
   if(e.code==='NEED_CONFIRM'&&!confirmed&&confirm(e.message+'\n\nСоздать ещё одно поручение по этому решению?'))
    App.directiveSave(mid,did,true);
@@ -3874,6 +3880,408 @@ function meetStatusBadge(s){
  return badge(s, s==='Запланировано'?'#2563eb':s==='Проведено'?'#d97706':s===MEET_CANC?'#dc2626':'#16a34a',
   s==='Запланировано'?'#dbeafe':s==='Проведено'?'#fef3c7':s===MEET_CANC?'#fee2e2':'#dcfce7');
 }
+/* ---------- MTG-07. Материалы совещания (ТЗ M16, экранные требования §10) ---------- */
+const MAT_TYPES=['Доклад','Презентация','Технический отчёт','Расчёт','Проект решения','Справка',
+ 'Протокол предыдущего совещания','Фотография','Схема','Иной документ'];
+const MAT_ST=['Актуален','Требует обновления','Устарел'];
+const MAT_KINDS={doc:'Документ M09',file:'Загруженный файл',link:'Ссылка ЛВС'};
+function matStBadge(s){
+ return badge(s, s==='Актуален'?'#16a34a':s==='Требует обновления'?'#d97706':'#dc2626',
+  s==='Актуален'?'#dcfce7':s==='Требует обновления'?'#fef3c7':'#fee2e2');
+}
+function matKind(x){ return x.kind||(x.docId?'doc':'link'); }
+function matType(x){ return MAT_TYPES.includes(x.type)?x.type:'Иной документ'; }
+function matStatus(x){ return MAT_ST.includes(x.status)?x.status:'Актуален'; }
+function matLatest(x){
+ if(matKind(x)!=='doc'||!x.docId)return null;
+ const d=DB.docs.find(y=>y.id===x.docId); if(!d)return null;
+ const vs=(d.versions||[]).map(v=>v.v); return vs.length?Math.max.apply(null,vs):1;
+}
+function matActual(x){
+ const k=matKind(x);
+ if(k==='doc'){ const l=matLatest(x); return !!DB.docs.find(y=>y.id===x.docId)&&(x.docV==null||l==null||x.docV>=l); }
+ if(k==='file')return !!x.stored;
+ return true;
+}
+function matVerText(x){
+ const k=matKind(x);
+ if(k==='doc')return x.docV!=null?('v'+x.docV+' (M09)'):'версия не зафиксирована';
+ return 'v'+(x.v||1);
+}
+function matItemOf(m,x){ return (m.agenda||[]).find(a=>a.id===x.itemId)||null; }
+function matURL(mid,x){
+ const k=matKind(x);
+ if(k==='doc')return '/api/files/'+x.docId+'/'+(x.docV||matLatest(x)||1);
+ if(k==='file')return '/api/mfiles/'+mid+'/'+x.id+'/'+(x.v||1);
+ return x.url||'';
+}
+function meetMaterialsBlock(m){
+ const mid=m.id, editable=can('meetings','edit',m)&&m.status!==MEET_CANC;
+ const f=App.f.mat||(App.f.mat={type:'',st:'',kind:'',item:'',q:''});
+ let rows=matsOf(m).slice();
+ const all=rows.length;
+ if(f.type)rows=rows.filter(x=>matType(x)===f.type);
+ if(f.st)rows=rows.filter(x=>matStatus(x)===f.st);
+ if(f.kind)rows=rows.filter(x=>matKind(x)===f.kind);
+ if(f.item)rows=rows.filter(x=>x.itemId===f.item);
+ if(f.q){const q=f.q.toLowerCase();rows=rows.filter(x=>((x.name||'')+' '+(x.note||'')).toLowerCase().includes(q));}
+ const outdated=matsOf(m).filter(x=>!matActual(x)).length;
+ const nostored=matsOf(m).filter(x=>matKind(x)==='file'&&!x.stored).length;
+ let h='<div class="card mb14" id="mat-card"><div class="ch">'+ic('file')+'Материалы совещания (MTG-07)'+
+  '<span class="r small mut">всего: '+all+' · связаны с вопросами: '+matsOf(m).filter(x=>x.itemId).length+'</span></div><div class="cb">'+
+  '<div class="flexw mb8">'+
+   (editable?'<button class="btn sm pri" id="mat-add" onclick="App.matAdd(\''+mid+'\')">'+ic('plus')+' Материал</button>':'')+
+   '<button class="btn sm" id="mat-check" onclick="App.matCheck(\''+mid+'\')">'+ic('refresh')+' Проверить актуальность</button>'+
+   '<span class="spacer"></span>'+
+   '<span class="chip" id="mat-stat-total">всего '+all+'</span>'+
+   '<span class="chip" id="mat-stat-outdated">требуют обновления '+outdated+'</span>'+
+   (nostored?'<span class="chip" id="mat-stat-nostored">файл не загружен '+nostored+'</span>':'')+
+  '</div>'+
+  '<div class="filters mb8">'+
+   sel('matf-type',[['','Все типы'],...MAT_TYPES.map(t=>[t,t])],f.type,'onchange="App.f.mat.type=this.value;openMeeting(\''+mid+'\')"')+
+   sel('matf-status',[['','Все статусы'],...MAT_ST.map(t=>[t,t])],f.st,'onchange="App.f.mat.st=this.value;openMeeting(\''+mid+'\')"')+
+   sel('matf-kind',[['','Все источники'],['doc','Документ M09'],['file','Загруженный файл'],['link','Ссылка ЛВС']],f.kind,'onchange="App.f.mat.kind=this.value;openMeeting(\''+mid+'\')"')+
+   sel('matf-item',[['','Все вопросы'],...(m.agenda||[]).map(a=>[a.id,'№'+a.n+' · '+a.title])],f.item,'onchange="App.f.mat.item=this.value;openMeeting(\''+mid+'\')"')+
+   inp('matf-q',f.q,'text','placeholder="поиск по названию" oninput="App.matSearch(this.value,\''+mid+'\')"')+
+  '</div>'+
+  (rows.length?'<div class="tbl-wrap"><table class="tbl" id="mat-table"><thead><tr>'+
+   '<th>ID</th><th>Название</th><th>Тип</th><th>Автор</th><th>Добавлен</th><th>Версия</th><th>Вопрос</th><th>Статус</th><th>Источник</th><th></th>'+
+   '</tr></thead><tbody>'+rows.map(x=>{
+    const a=matItemOf(m,x), k=matKind(x), act=matActual(x), url=matURL(mid,x);
+    const src=k==='doc'?('<span class="link" onclick="openDoc(\''+x.docId+'\')">'+esc((DB.docs.find(d=>d.id===x.docId)||{}).code||'M09')+'</span>'):
+      k==='file'?('<span class="small">'+esc(x.fileName||'файл')+(x.stored?'':' · не загружен')+'</span>'):
+      ('<span class="small mut">'+esc((x.url||'').slice(0,40))+'</span>');
+    return '<tr id="mat-row-'+x.id+'"><td class="small mut nowrap">'+esc(x.id)+'</td>'+
+     '<td><b class="small">'+esc(x.name||'')+'</b>'+(x.note?'<div class="small mut">'+esc(x.note)+'</div>':'')+'</td>'+
+     '<td class="small">'+esc(matType(x))+'</td>'+
+     '<td class="small">'+esc(U(x.author||x.addedBy).name)+'</td>'+
+     '<td class="small nowrap">'+(x.addedAt?fmtDT(x.addedAt):'—')+'</td>'+
+     '<td class="small nowrap">'+esc(matVerText(x))+(!act&&k==='doc'?' <span class="chip">в M09 v'+matLatest(x)+'</span>':'')+'</td>'+
+     '<td class="small">'+(a?('№'+a.n+' · '+esc(a.title)):'<span class="mut">не связан</span>')+'</td>'+
+     '<td>'+matStBadge(matStatus(x))+'</td><td>'+src+'</td>'+
+     '<td class="nowrap">'+
+      '<button class="btn sm mat-view" title="Просмотр" onclick="App.matView(\''+mid+'\',\''+x.id+'\')">'+ic('eye')+'</button> '+
+      (k==='link'?'':'<button class="btn sm mat-dl" title="Скачать" onclick="App.matDownload(\''+mid+'\',\''+x.id+'\')">'+ic('download')+'</button> ')+
+      (editable?'<button class="btn sm mat-link" title="Связать с вопросом" onclick="App.matLink(\''+mid+'\',\''+x.id+'\')">'+ic('link')+'</button> '+
+       '<button class="btn sm mat-edit" title="Изменить" onclick="App.matEdit(\''+mid+'\',\''+x.id+'\')">'+ic('edit')+'</button> '+
+       (k==='doc'&&!act?'<button class="btn sm pri mat-refresh" title="Обновить версию" onclick="App.matRefresh(\''+mid+'\',\''+x.id+'\')">'+ic('refresh')+'</button> ':'')+
+       '<button class="btn sm danger mat-del" title="Открепить" onclick="App.matDel(\''+mid+'\',\''+x.id+'\')">'+ic('trash')+'</button>':'')+
+     '</td></tr>';
+   }).join('')+'</tbody></table></div>':
+   emptyBlock(all?'Материалы не найдены':'Материалов нет',all?'Измените фильтры':'Добавьте документ M09, загрузите файл или укажите ссылку ЛВС','file'))+
+  '<div class="small mut mt8">При добавлении из M09 фиксируется конкретная версия документа: обновление исходного документа не меняет комплект незаметно (§10.3).</div>'+
+ '</div></div>';
+ return h;
+}
+App.matSearch=function(v,mid){
+ App.f.mat.q=v; clearTimeout(App._matT);
+ App._matT=setTimeout(()=>{ openMeeting(mid);
+  const el=document.getElementById('matf-q'); if(el){el.focus(); el.setSelectionRange(el.value.length,el.value.length);} },350);
+};
+App.matAdd=function(mid){
+ if(!guard('meetings','edit'))return;
+ const m=MEET(mid); if(!m)return;
+ App.matKind='doc';
+ openModal(mh('Материал совещания','file')+'<div class="mb form">'+
+  field('Источник материала','<div class="flexw">'+
+   '<label class="checkline"><input type="radio" name="ma-kind" id="ma-kind-doc" value="doc" checked onchange="App.matKindSet(\'doc\')"> Документ M09</label>'+
+   '<label class="checkline"><input type="radio" name="ma-kind" id="ma-kind-file" value="file" onchange="App.matKindSet(\'file\')"> Загрузить файл</label>'+
+   '<label class="checkline"><input type="radio" name="ma-kind" id="ma-kind-link" value="link" onchange="App.matKindSet(\'link\')"> Ссылка ЛВС</label></div>')+
+  '<div id="ma-box-doc">'+field('Документ M09',sel('ma-doc',DB.docs.map(d=>[d.id,d.code+' · '+d.title]),(DB.docs[0]||{}).id),true)+
+   field('Фиксируемая версия',inp('ma-docv','','number','min="1"'),false,'пусто — последняя версия документа')+'</div>'+
+  '<div id="ma-box-file" style="display:none">'+field('Файл материала','<input type="file" id="ma-file">',true,'до 25 МБ; файл хранится на сервере в data/files')+'</div>'+
+  '<div id="ma-box-link" style="display:none">'+field('Название',inp('ma-name',''),true)+field('Ссылка (URL ЛВС)',inp('ma-url',''),true)+'</div>'+
+  '<div class="row">'+field('Тип материала',sel('ma-type',MAT_TYPES,'Доклад'),true)+
+   field('Автор',sel('ma-author',DB.users.filter(u=>!u.blocked).map(u=>[u.id,u.name]),(App.user||{}).id))+'</div>'+
+  field('Связанный вопрос повестки',sel('ma-item',[['','не связан'],...(m.agenda||[]).map(a=>[a.id,'№'+a.n+' · '+a.title])],''))+
+  field('Примечание',ta('ma-note','',2))+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button>'+
+  '<button class="btn pri" id="ma-save" onclick="App.matSaveAdd(\''+mid+'\')">'+ic('save')+' Добавить</button></div>');
+};
+App.matKindSet=function(k){
+ App.matKind=k;
+ ['doc','file','link'].forEach(x=>{const el=document.getElementById('ma-box-'+x); if(el)el.style.display=(x===k?'':'none');});
+};
+App.matSaveAdd=async function(mid){
+ const k=App.matKind||'doc';
+ const base={id:mid,type:val('ma-type'),author:val('ma-author'),itemId:val('ma-item'),note:val('ma-note')};
+ if(k==='doc'){
+  if(!requireFields(['ma-doc']))return;
+  const dv=val('ma-docv');
+  const r=await rpc('meeting.materials.add',Object.assign(base,{docId:val('ma-doc'),docV:dv?parseInt(dv,10):null}));
+  if(r){App.closeModal(true);openMeeting(mid);}
+  return;
+ }
+ if(k==='link'){
+  if(!requireFields(['ma-name','ma-url']))return;
+  const r=await rpc('meeting.materials.add',Object.assign(base,{name:val('ma-name'),url:val('ma-url')}));
+  if(r){App.closeModal(true);openMeeting(mid);}
+  return;
+ }
+ const el=document.getElementById('ma-file'), f=el&&el.files&&el.files[0];
+ if(!f){toast('err','Файл не выбран','Выберите файл материала (до 25 МБ)');return;}
+ const r=await rpc('meeting.materials.add',Object.assign(base,{fileName:f.name,name:f.name}));
+ if(!r)return;
+ const item=(r.materials||[])[(r.materials||[]).length-1];
+ if(!item){toast('err','Материал не создан','Повторите операцию');return;}
+ try{
+  const resp=await fetch('/api/mfiles/'+mid+'/'+item.id+'/'+(item.v||1)+'?name='+encodeURIComponent(f.name),
+   {method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f});
+  const j=await resp.json();
+  if(!j.ok){toast('err','Файл не загружен',(j.error||{}).message||'');return;}
+  DB=j.state; dbSave(); toast('ok','Материал загружен',f.name+' · '+Math.round(f.size/1024)+' КБ');
+  App.closeModal(true); openMeeting(mid);
+ }catch(e){ toast('err','Сервер недоступен',e.message); }
+};
+App.matEdit=function(mid,xid){
+ if(!guard('meetings','edit'))return;
+ const m=MEET(mid), x=matsOf(m).find(y=>y.id===xid); if(!x)return;
+ openModal(mh('Материал: '+esc(x.name),'edit')+'<div class="mb form">'+
+  field('Название',inp('me-name',x.name),true)+
+  '<div class="row">'+field('Тип',sel('me-type',MAT_TYPES,matType(x)))+field('Статус',sel('me-status',MAT_ST,matStatus(x)))+'</div>'+
+  '<div class="row">'+field('Автор',sel('me-author',DB.users.map(u=>[u.id,u.name]),x.author||x.addedBy))+
+   field('Вопрос повестки',sel('me-item',[['','не связан'],...(m.agenda||[]).map(a=>[a.id,'№'+a.n+' · '+a.title])],x.itemId||''))+'</div>'+
+  field('Примечание',ta('me-note',x.note||'',2))+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button>'+
+  '<button class="btn pri" id="me-save" onclick="App.matSaveEdit(\''+mid+'\',\''+xid+'\')">'+ic('save')+' Сохранить</button></div>');
+};
+App.matSaveEdit=function(mid,xid){
+ if(!requireFields(['me-name']))return;
+ rpc('meeting.materials.update',{id:mid,materialId:xid,name:val('me-name'),type:val('me-type'),
+  status:val('me-status'),author:val('me-author'),itemId:val('me-item'),note:val('me-note')})
+  .then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.matLink=function(mid,xid){
+ if(!guard('meetings','edit'))return;
+ const m=MEET(mid), x=matsOf(m).find(y=>y.id===xid); if(!x)return;
+ openModal(mh('Связать материал с вопросом','link')+'<div class="mb form">'+
+  '<div class="small mut mb8">'+esc(x.name)+'</div>'+
+  field('Вопрос повестки',sel('ml-item',[['','не связан'],...(m.agenda||[]).map(a=>[a.id,'№'+a.n+' · '+a.title])],x.itemId||''))+
+  '</div><div class="mf"><button class="btn" onclick="App.closeModal()">Отмена</button>'+
+  '<button class="btn pri" id="ml-save" onclick="App.matSaveLink(\''+mid+'\',\''+xid+'\')">Связать</button></div>');
+};
+App.matSaveLink=function(mid,xid){
+ rpc('meeting.materials.link',{id:mid,materialId:xid,itemId:val('ml-item')})
+  .then(r=>{if(r){App.closeModal(true);openMeeting(mid);}});
+};
+App.matCheck=function(mid){
+ rpc('meeting.materials.check',{id:mid}).then(r=>{if(r)openMeeting(mid);});
+};
+App.matRefresh=function(mid,xid){
+ if(!guard('meetings','edit'))return;
+ const m=MEET(mid), x=matsOf(m).find(y=>y.id===xid); if(!x)return;
+ const l=matLatest(x);
+ if(!confirm('Обновить зафиксированную версию материала до v'+l+'? Комплект материалов изменится осознанно.'))return;
+ rpc('meeting.materials.refresh',{id:mid,materialId:xid}).then(r=>{if(r)openMeeting(mid);});
+};
+App.matDel=function(mid,xid){
+ if(!guard('meetings','edit'))return;
+ const x=matsOf(MEET(mid)).find(y=>y.id===xid); if(!x)return;
+ if(!confirm('Открепить материал «'+x.name+'» от совещания?'))return;
+ rpc('meeting.materials.remove',{id:mid,materialId:xid}).then(r=>{if(r)openMeeting(mid);});
+};
+App.matDownload=function(mid,xid){
+ const x=matsOf(MEET(mid)).find(y=>y.id===xid); if(!x)return;
+ const a=document.createElement('a'); a.href=matURL(mid,x); a.download='';
+ document.body.appendChild(a); a.click(); a.remove();
+};
+App.matView=function(mid,xid){
+ const m=MEET(mid), x=matsOf(m).find(y=>y.id===xid); if(!x)return;
+ const k=matKind(x), a=matItemOf(m,x), url=matURL(mid,x);
+ let body='<div class="stat-line"><span>Тип</span><b>'+esc(matType(x))+'</b></div>'+
+  '<div class="stat-line"><span>Источник</span><b>'+esc(MAT_KINDS[k])+'</b></div>'+
+  '<div class="stat-line"><span>Версия</span><b>'+esc(matVerText(x))+'</b></div>'+
+  '<div class="stat-line"><span>Автор</span><b>'+esc(U(x.author||x.addedBy).name)+'</b></div>'+
+  '<div class="stat-line"><span>Добавлен</span><b>'+(x.addedAt?fmtDT(x.addedAt):'—')+'</b></div>'+
+  '<div class="stat-line"><span>Вопрос</span><b>'+(a?('№'+a.n+' · '+esc(a.title)):'не связан')+'</b></div>'+
+  '<div class="stat-line"><span>Статус</span>'+matStBadge(matStatus(x))+'</div>';
+ if(k==='doc'){
+  const d=DB.docs.find(y=>y.id===x.docId)||{};
+  body+='<div class="stat-line"><span>Документ M09</span><b class="link" onclick="App.closeModal(true);openDoc(\''+x.docId+'\')">'+esc(d.code||'')+' · '+esc(d.title||'')+'</b></div>';
+ }
+ if(k==='file')body+='<div class="stat-line"><span>Файл</span><b>'+esc(x.fileName||'')+' · '+Math.round((x.size||0)/1024)+' КБ</b></div>';
+ if(k==='link')body+='<div class="stat-line"><span>Ссылка</span><b class="small">'+esc(x.url||'')+'</b></div>';
+ if(x.note)body+='<div class="small mut mt8">'+esc(x.note)+'</div>';
+ openModal(mh('Просмотр материала','eye')+'<div class="mb" id="mv-body">'+body+'</div>'+
+  '<div class="mf"><button class="btn" onclick="App.closeModal()">Закрыть</button>'+
+  (k==='link'?'<a class="btn pri" id="mv-open" href="'+esc(url)+'" target="_blank" rel="noopener">Открыть ссылку</a>':
+   '<button class="btn pri" id="mv-open" onclick="App.matDownload(\''+mid+'\',\''+xid+'\')">'+ic('download')+' Скачать</button>')+'</div>');
+};
+/* ---------- MTG-08. Рабочая форма проведения совещания (экранные требования §11) ---------- */
+const RUN_FIELDS=[['summary','Краткое содержание доклада',4000,2],['positions','Основные позиции',4000,2],
+ ['discussion','Обсуждение',4000,3],['remarks','Замечания',2000,2],['proposals','Предложения',2000,2],
+ ['dissent','Разногласия',2000,2],['problems','Выявленные проблемы',2000,2],['outcome','Итог рассмотрения',2000,2]];
+function runOf(m){
+ const r=(m&&m.run)||{};
+ return {status:r.status||'Не начато',startedAt:r.startedAt||null,finishedAt:r.finishedAt||null,
+  startedBy:r.startedBy||'',finishedBy:r.finishedBy||'',current:r.current||'',log:Array.isArray(r.log)?r.log:[]};
+}
+function runFields(a){ const o={}; RUN_FIELDS.forEach(([k])=>{o[k]=(a&&a[k])||'';}); return o; }
+function runDraft(a){ const d=(a&&a.draft)||{}; return {fields:d.fields||{},ts:d.ts||null,by:d.by||''}; }
+function runSec(a){ return (a&&a.startedAt&&a.finishedAt&&a.finishedAt>=a.startedAt)?Math.round((a.finishedAt-a.startedAt)/1000):null; }
+function runOpen(m){ return (m.agenda||[]).filter(a=>['Подготовлен','Включён в повестку','Рассматривается'].includes(a.status)); }
+function runCur(m){
+ const st=App._run||{}, items=m.agenda||[];
+ let a=items.find(x=>x.id===st.itemId);
+ if(!a)a=items.find(x=>x.id===runOf(m).current);
+ if(!a)a=runOpen(m)[0]||items[0];
+ return a||null;
+}
+function runTa(k,v,rows){
+ return '<textarea id="run-f-'+k+'" rows="'+(rows||2)+'" oninput="App.runEdit(\''+k+'\')" onblur="App.runSave()">'+esc(v||'')+'</textarea>';
+}
+function meetRunBlock(m){
+ const mid=m.id, r=runOf(m), editable=can('meetings','edit',m)&&!['Проведено','Протокол утверждён',MEET_CANC].includes(m.status);
+ const items=m.agenda||[], a=runCur(m);
+ if(!App._run||App._run.mid!==mid||(a&&App._run.itemId!==a.id)){
+  App._run={mid:mid,itemId:a?a.id:'',fields:a?Object.assign(runFields(a),runDraft(a).fields):{},dirty:false,savedAt:(a?runDraft(a).ts:null)};
+ }
+ const st=App._run;
+ const done=items.filter(x=>x.status==='Рассмотрен').length, open=runOpen(m).length;
+ const drafts=items.filter(x=>Object.keys(runDraft(x).fields).length).length;
+ const decs=a?(m.decisions||[]).filter(d=>d.agendaN===a.n):[];
+ const tasks=[]; decs.forEach(d=>decTasks(d).forEach(t=>tasks.push(t)));
+ const mats=a?matsOf(m).filter(x=>x.itemId===a.id):[];
+ let h='<div class="card mb14" id="run-card"><div class="ch">'+ic('meeting')+'Рабочая форма проведения (MTG-08)'+
+  '<span class="r small mut" id="run-timer">'+(r.startedAt?('начато '+fmtDT(r.startedAt)):'не начато')+
+  (r.finishedAt?(' · завершено '+fmtDT(r.finishedAt)):'')+'</span></div><div class="cb">'+
+  '<div class="flexw mb8">'+
+   (editable&&r.status!=='Идёт'&&m.status==='Запланировано'?'<button class="btn sm pri" id="run-start" onclick="App.runStart(\''+mid+'\')">'+ic('play')+' Начать</button>':'')+
+   (editable&&r.status==='Идёт'?'<button class="btn sm" id="run-prev" onclick="App.runGoto(\''+mid+'\',\'prev\')">← Предыдущий вопрос</button>'+
+    '<button class="btn sm" id="run-next" onclick="App.runGoto(\''+mid+'\',\'next\')">Следующий вопрос →</button>':'')+
+   (editable&&r.status==='Идёт'?'<button class="btn sm pri" id="run-finish" onclick="App.runFinish(\''+mid+'\')">'+ic('check')+' Завершить</button>':'')+
+   '<span class="spacer"></span>'+
+   '<span class="chip" id="run-stat-done">рассмотрено '+done+' из '+items.length+'</span>'+
+   '<span class="chip" id="run-stat-open">открыто '+open+'</span>'+
+   '<span class="chip" id="run-stat-drafts">черновиков '+drafts+'</span>'+
+   '<span class="chip">'+esc(r.status)+'</span>'+
+  '</div>';
+ if(!items.length){
+  h+=emptyBlock('Повестка пуста','Добавьте вопросы на вкладке «Повестка» (MTG-06), затем начните проведение','meeting')+'</div></div>';
+  return h;
+ }
+ h+='<div style="display:grid;grid-template-columns:230px minmax(0,1fr) 280px;gap:12px" id="run-layout">'+
+  /* слева: вопросы и статусы рассмотрения */
+  '<div id="run-list"><div class="small mut mb8">Вопросы повестки</div><div class="list-rows">'+
+   items.map(x=>'<div class="lr" style="'+(a&&x.id===a.id?'background:var(--acc-bg);font-weight:600':'')+'" id="run-item-'+x.id+'" onclick="App.runPick(\''+mid+'\',\''+x.id+'\')">'+
+    '<span class="chip">№'+x.n+'</span><div class="lt"><b class="small">'+esc(x.title)+'</b>'+
+    '<small>'+esc(x.status)+(runSec(x)!=null?(' · '+runSec(x)+' с'):'')+(Object.keys(runDraft(x).fields).length?' · черновик':'')+'</small></div></div>').join('')+
+  '</div></div>'+
+  /* центр: текущий вопрос и фиксация обсуждения */
+  '<div id="run-current">'+(a?('<div class="card"><div class="cb">'+
+    '<div class="flex" style="align-items:flex-start"><span class="chip">№'+a.n+'</span><div style="flex:1">'+
+     '<b>'+esc(a.title)+'</b><div class="small mut">Докладчик: '+esc(U(a.reporter).name)+
+     (a.durationMin?(' · план '+a.durationMin+' мин'):'')+'</div></div>'+agBadge(a.status||'Включён в повестку')+'</div>'+
+    (a.content?'<div class="small mt8">'+esc(a.content)+'</div>':'')+
+    (a.expected?'<div class="small mut mt8">Ожидаемый результат: '+esc(a.expected)+'</div>':'')+
+    '<div class="mt8" id="run-mats"><div class="small mut">Материалы вопроса ('+mats.length+')</div>'+
+     (mats.length?mats.map(x=>'<div class="small link" onclick="App.matView(\''+mid+'\',\''+x.id+'\')">'+esc(x.name)+' · '+esc(matVerText(x))+'</div>').join(''):
+      '<div class="small mut">материалы не связаны с вопросом (вкладка «Материалы»)</div>')+'</div>'+
+    '<div class="form mt8">'+RUN_FIELDS.map(([k,lbl,lim,rows])=>
+      field(lbl,runTa(k,st.fields[k],rows),false,'до '+lim+' символов')).join('')+'</div>'+
+    '<div class="flexw mt8">'+
+     (editable?'<button class="btn sm pri" id="run-commit" onclick="App.runCommit(\''+mid+'\')">'+ic('save')+' Зафиксировать рассмотрение</button>'+
+      '<button class="btn sm" id="run-done" onclick="App.runDone(\''+mid+'\')">'+ic('check')+' Отметить рассмотренным</button>':'')+
+     '<span class="spacer"></span><span class="small mut" id="run-autosave">'+
+      (st.dirty?'черновик не сохранён…':(st.savedAt?('черновик сохранён '+fmtDT(st.savedAt)):'черновик пуст'))+'</span>'+
+    '</div>'+
+    (a.startedAt?'<div class="small mut mt8">Начало рассмотрения: '+fmtDT(a.startedAt)+
+      (a.finishedAt?(' · завершение: '+fmtDT(a.finishedAt)+' · '+runSec(a)+' с'):'')+'</div>':'')+
+   '</div></div>'):'')+'</div>'+
+  /* справа: решения, поручения, ответственные и сроки */
+  '<div id="run-right"><div class="card"><div class="cb">'+
+   '<div class="small mut mb8">Решения по вопросу ('+decs.length+')</div>'+
+   '<div id="run-decs">'+(decs.length?decs.map((d,i)=>'<div class="small mb8"><b>№'+((m.decisions||[]).indexOf(d)+1)+'</b> '+esc(d.text)+
+     '<div class="small mut">'+esc(U(d.resp).name)+' · срок '+fmtD(d.due)+'</div></div>').join(''):
+     '<div class="small mut">решений нет</div>')+'</div>'+
+   '<div class="small mut mb8 mt8">Поручения ('+tasks.length+')</div>'+
+   '<div id="run-tasks">'+(tasks.length?tasks.map(t=>'<div class="small link mb8" onclick="openTask(\''+t.id+'\')">'+t.code+' · '+esc(t.title)+
+     '<div class="small mut">'+esc(U(t.assignee).name)+' · '+fmtD(t.end)+'</div></div>').join(''):
+     '<div class="small mut">поручений нет</div>')+'</div>'+
+   (editable&&a?'<div class="flexw mt8"><button class="btn sm pri" id="run-dec" onclick="App.runDecision(\''+mid+'\')">'+ic('plus')+' Создать решение</button>'+
+    (decs.length&&can('tasks','create')?'<button class="btn sm" id="run-task" onclick="App.runTask(\''+mid+'\')">'+ic('tasks')+' Создать поручение</button>':'')+'</div>':'')+
+   '<div class="small mut mt8">Комментарии и критерии результата фиксируются в карточке поручения (M02).</div>'+
+  '</div></div></div>'+
+ '</div></div></div>';
+ return h;
+}
+App.runEdit=function(k){
+ const st=App._run; if(!st)return;
+ const el=document.getElementById('run-f-'+k); if(!el)return;
+ st.fields[k]=el.value; st.dirty=true;
+ const ind=document.getElementById('run-autosave'); if(ind)ind.textContent='черновик не сохранён…';
+ clearTimeout(App._runT); App._runT=setTimeout(()=>App.runSave(),1200);
+};
+App.runSave=async function(){
+ const st=App._run; if(!st||!st.dirty||!st.itemId)return;
+ clearTimeout(App._runT);
+ const fields={}; RUN_FIELDS.forEach(([k])=>{fields[k]=st.fields[k]||'';});
+ st.dirty=false;
+ const r=await rpc('meeting.run.draft',{id:st.mid,itemId:st.itemId,fields:fields});
+ const ind=document.getElementById('run-autosave');
+ if(r){ st.savedAt=(r.draft||{}).ts||Date.now(); if(ind)ind.textContent='черновик сохранён '+fmtDT(st.savedAt); }
+ else { st.dirty=true; if(ind)ind.textContent='черновик не сохранён — повтор'; }
+};
+App.runStart=function(mid){
+ if(!guard('meetings','edit'))return;
+ App._run=null;
+ rpc('meeting.run.start',{id:mid}).then(r=>{if(r){App._run=null;openMeeting(mid);}});
+};
+App.runPick=async function(mid,xid){
+ const m=MEET(mid), r=runOf(m);
+ await App.runSave();
+ if(r.status==='Идёт'&&can('meetings','edit',m)){
+  const res=await rpc('meeting.run.goto',{id:mid,itemId:xid});
+  if(!res)return;
+ }
+ App._run={mid:mid,itemId:xid,fields:null,dirty:false,savedAt:null};
+ const a=(MEET(mid).agenda||[]).find(x=>x.id===xid);
+ App._run.fields=a?Object.assign(runFields(a),runDraft(a).fields):{};
+ App._run.savedAt=a?runDraft(a).ts:null;
+ openMeeting(mid);
+};
+App.runGoto=async function(mid,dir){
+ if(!guard('meetings','edit'))return;
+ await App.runSave();
+ const r=await rpc('meeting.run.goto',{id:mid,dir:dir});
+ if(r){ App._run=null; openMeeting(mid); }
+};
+App.runCommit=async function(mid){
+ if(!guard('meetings','edit'))return;
+ const st=App._run; if(!st||!st.itemId)return;
+ clearTimeout(App._runT); st.dirty=false;
+ const fields={}; RUN_FIELDS.forEach(([k])=>{fields[k]=st.fields[k]||'';});
+ const r=await rpc('meeting.run.commit',{id:mid,itemId:st.itemId,fields:fields});
+ if(r){ App._run=null; openMeeting(mid); }
+};
+App.runDone=async function(mid){
+ if(!guard('meetings','edit'))return;
+ const st=App._run; if(!st||!st.itemId)return;
+ clearTimeout(App._runT); st.dirty=false;
+ const fields={}; RUN_FIELDS.forEach(([k])=>{fields[k]=st.fields[k]||'';});
+ const r=await rpc('meeting.run.item.done',{id:mid,itemId:st.itemId,fields:fields});
+ if(r){ App._run=null; openMeeting(mid); }
+};
+App.runFinish=async function(mid){
+ if(!guard('meetings','edit'))return;
+ await App.runSave();
+ let r=await rpc('meeting.run.finish',{id:mid});
+ if(!r&&App.lastRpcError&&App.lastRpcError.code==='NEED_CONFIRM'){
+  if(!confirm(App.lastRpcError.message+'\n\nЗавершить совещание?'))return;
+  r=await rpc('meeting.run.finish',{id:mid,confirm:true});
+ }
+ if(r){ App._run=null; openMeeting(mid); }
+};
+App.runDecision=function(mid){
+ const a=runCur(MEET(mid));
+ App.decisionAdd(mid,a?a.n:null);
+};
+App.runTask=function(mid){
+ const m=MEET(mid), a=runCur(m); if(!a)return;
+ const d=(m.decisions||[]).find(x=>x.agendaN===a.n); if(!d)return;
+ App.directiveModal(mid,d.id);
+};
+
 /* ---------- MTG-05. Участники совещания (ТЗ §2.7, экранные требования 8.1–8.4) ---------- */
 const PART_ROLES=['Председатель','Секретарь','Докладчик','Участник','Эксперт','Наблюдатель','Контролирующее лицо'];
 const PART_FIXED=['Председатель','Секретарь'];
@@ -4621,6 +5029,8 @@ function openMeeting(mid){
  if(tab==='part'){ body=meetPartsBlock(m); }
  if(tab==='plan'){ body=meetPlanBlock(m); }
  if(tab==='agenda'){ body=meetAgendaBlock(m); }
+ if(tab==='mat'){ body=meetMaterialsBlock(m); }
+ if(tab==='run'){ body=meetRunBlock(m); }
  if(tab==='dec'){
   body=(editable?'<div class="flexw mb8"><span class="small mut">Решение фиксируется с ответственным и сроком; поручение создаётся в M02.</span><span class="spacer"></span><button class="btn sm pri" onclick="App.decisionAdd(\''+mid+'\')">'+ic('plus')+' Решение</button></div>':'')+
   (m.decisions.length?m.decisions.map((d,i)=>{
@@ -4648,7 +5058,7 @@ function openMeeting(mid){
   pdBlock(m)+protBlock(m)+
   '<div class="card"><div class="cb report-doc">'+meetMinutes(m)+'</div></div>';
  }
- const tabs=[['info','Информация'],['part','Участники ('+partsOf(m).length+')'],['plan','Планирование'],['agenda','Повестка ('+m.agenda.length+')'],['dec','Решения ('+m.decisions.length+')'],['dir','Поручения ('+dirs.length+')'],['prot','Протокол'+(protOf(m).version?' (ред. '+protOf(m).version+')':'')]];
+ const tabs=[['info','Информация'],['part','Участники ('+partsOf(m).length+')'],['plan','Планирование'],['agenda','Повестка ('+m.agenda.length+')'],['mat','Материалы ('+matsOf(m).length+')'],['run','Проведение'],['dec','Решения ('+m.decisions.length+')'],['dir','Поручения ('+dirs.length+')'],['prot','Протокол'+(protOf(m).version?' (ред. '+protOf(m).version+')':'')]];
  openDrawer(dh(m.code+' · '+m.type,m.title,meetStatusBadge(m.status)+' <span class="chip">'+fmtD(m.date)+' '+esc(m.time)+'</span>'+prBadge(protOf(m).status))+
  '<div class="db"><div class="tabs">'+tabs.map(([k,n])=>'<button id="mt-tab-'+k+'" class="'+(tab===k?'on':'')+'" onclick="App.f.meetTab=\''+k+'\';openMeeting(\''+mid+'\')">'+n+'</button>').join('')+'</div>'+body+'</div>'+
  '<div class="df">'+

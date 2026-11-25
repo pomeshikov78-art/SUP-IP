@@ -39,7 +39,7 @@ except ImportError:
     docgen = None
 
 APP_NAME = "СУП-ИП"
-VERSION = "1.14.2"
+VERSION = "1.15.0"
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "static")
 MAX_USERS_ONLINE = 10
@@ -289,7 +289,8 @@ CREATE TABLE IF NOT EXISTS meetings(
   projects JSONB NOT NULL DEFAULT '[]', recurrence JSONB NOT NULL DEFAULT '{}',
   plan_log JSONB NOT NULL DEFAULT '[]', series_id TEXT NOT NULL DEFAULT '',
   participants JSONB NOT NULL DEFAULT '[]', actual_composition JSONB NOT NULL DEFAULT '{}',
-  requisites JSONB NOT NULL DEFAULT '{}', protocol_draft JSONB NOT NULL DEFAULT '{}');
+  requisites JSONB NOT NULL DEFAULT '{}', protocol_draft JSONB NOT NULL DEFAULT '{}',
+  run JSONB NOT NULL DEFAULT '{}');
 CREATE INDEX IF NOT EXISTS ix_meetings_series ON meetings(series_id) WHERE series_id <> '';
 CREATE INDEX IF NOT EXISTS ix_meetings_date ON meetings(date);
 CREATE TABLE IF NOT EXISTS templates(
@@ -395,7 +396,7 @@ ENT = {
    ("materials","materials","j"),("projects","projects","j"),("recurrence","recurrence","j"),
    ("planLog","plan_log","j"),("seriesId","series_id","t"),
    ("participants","participants","j"),("actual","actual_composition","j"),
-   ("requisites","requisites","j"),("draft","protocol_draft","j")]),
+   ("requisites","requisites","j"),("draft","protocol_draft","j"),("run","run","j")]),
  "template": ("templates", [("id","id","t"),("code","code","t"),("name","name","t"),("kind","kind","t"),
    ("meetTypes","meet_types","j"),("version","version","i"),("status","status","t"),("isDefault","is_default","b"),
    ("org","org","t"),("note","note","t"),("blocks","blocks","j"),("history","history","j"),
@@ -2674,11 +2675,33 @@ def h_meeting_material_add(db, cur, u, p):
     if len(mats) >= MEET_MATERIALS_MAX:
         raise RpcError("Материалов к совещанию — не более %d" % MEET_MATERIALS_MAX)
     note = (p.get("note") or "").strip()[:300]
+    mat_type = _mat_check_type(p.get("type") or "Иной документ")
+    author = _mat_check_user(db, cur, p.get("author")) or u["id"]
+    item_id = _mat_check_item(m, p.get("itemId") or "")
     if p.get("docId"):
         d = get_req(db, cur, "doc", p["docId"])
         if any(x.get("docId") == d["id"] for x in mats):
             raise RpcError("Этот документ уже прикреплён к совещанию")
-        item = {"id": uid("mm"), "kind": "doc", "docId": d["id"], "name": "%s · %s" % (d["code"], d["title"]),
+        # MTG-07 §10.3: фиксируется КОНКРЕТНАЯ версия документа M09
+        vs = [v["v"] for v in (d.get("versions") or [])]
+        latest = max(vs) if vs else 1
+        doc_v = p.get("docV")
+        if doc_v is not None:
+            try: doc_v = int(doc_v)
+            except (TypeError, ValueError): raise RpcError("Версия документа — целое число")
+            if doc_v not in vs:
+                raise RpcError("Версия документа не найдена: %s" % doc_v, "Материалы", 404, "NOT_FOUND")
+        else:
+            doc_v = latest
+        item = {"id": uid("mm"), "kind": "doc", "docId": d["id"], "docV": doc_v,
+                "name": "%s · %s" % (d["code"], d["title"]),
+                "url": "", "note": note, "addedAt": now_ms(), "addedBy": u["id"]}
+    elif p.get("fileName"):
+        # MTG-07 §10.3 «загрузить новый файл»: материал создаётся, затем файл грузится на сервер
+        fn = str(p["fileName"]).strip()[:200]
+        if not fn: raise RpcError("Не указано имя файла материала")
+        item = {"id": uid("mm"), "kind": "file", "docId": None, "docV": None,
+                "name": (p.get("name") or fn).strip()[:200], "fileName": fn, "stored": False, "size": 0,
                 "url": "", "note": note, "addedAt": now_ms(), "addedBy": u["id"]}
     else:
         req(p, "name", "url")
@@ -2687,13 +2710,18 @@ def h_meeting_material_add(db, cur, u, p):
             raise RpcError("Недопустимая схема ссылки")
         if any(x.get("url") == url for x in mats):
             raise RpcError("Эта ссылка уже прикреплена к совещанию")
-        item = {"id": uid("mm"), "kind": "link", "docId": None, "name": p["name"].strip()[:200],
+        item = {"id": uid("mm"), "kind": "link", "docId": None, "docV": None,
+                "name": p["name"].strip()[:200],
                 "url": url, "note": note, "addedAt": now_ms(), "addedBy": u["id"]}
+    item.update({"type": mat_type, "author": author, "itemId": item_id, "status": "Актуален",
+                 "v": 1, "history": []})
+    _mat_hist(item, u["id"], "add", note="Материал добавлен: %s" % item["name"])
     mats.append(item); m["materials"] = mats
     db.save_ent(cur, "meeting", m)
     db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Прикреплён материал к совещанию",
              "Совещание", m["id"], {"code": m["code"], "material": item["name"], "kind": item["kind"],
-                                    "event": "MEETING_MATERIAL_ADDED"})
+                                    "materialId": item["id"], "type": item["type"], "docV": item.get("docV"),
+                                    "itemId": item_id, "event": "MEETING_MATERIAL_ADDED"})
     invite = list(dict.fromkeys([m["chair"], m["secretary"]] + (m.get("attendees") or [])))
     notify_many(db, cur, [x for x in invite if x != u["id"]], "meeting.materials",
                 "Материалы к совещанию: %s" % m["title"],
@@ -2705,7 +2733,7 @@ def h_meeting_material_add(db, cur, u, p):
 def h_meeting_material_remove(db, cur, u, p):
     m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
     req(p, "materialId")
-    mats = materials_of(m)
+    mats = mat_norm(m)
     keep = [x for x in mats if x.get("id") != p["materialId"]]
     if len(keep) == len(mats): raise RpcError("Материал не найден в списке совещания")
     m["materials"] = keep
@@ -2733,6 +2761,8 @@ def h_meeting_projects_set(db, cur, u, p):
 def h_meeting_reschedule(db, cur, u, p):
     """Перенос совещания с основанием, историей и пересчётом напоминаний (§2.5, M12 §8.2)."""
     m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    if run_of(m)["status"] == "Идёт":
+        raise RpcError("Совещание проводится — завершите рассмотрение (MTG-08), затем переносите")
     req(p, "date", "reason")
     if m["status"] != "Запланировано":
         raise RpcError("Переносить можно только запланированное совещание")
@@ -2764,6 +2794,8 @@ def h_meeting_reschedule(db, cur, u, p):
 def h_meeting_cancel(db, cur, u, p):
     """Отмена совещания с основанием: статус, снятие напоминаний, оповещение (§2.5)."""
     m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m)
+    if run_of(m)["status"] == "Идёт":
+        raise RpcError("Совещание проводится — завершите рассмотрение (MTG-08), затем отменяйте")
     req(p, "reason")
     reason = p["reason"].strip()[:500]
     if len(reason) < 3: raise RpcError("Укажите основание отмены (не менее 3 символов)")
@@ -4417,9 +4449,19 @@ def _pr_sec_discussion(d, db, cur, u, m, ctx):
                     % (a["carryFrom"].get("code", ""), _fd(a["carryFrom"].get("date")),
                        a["carryFrom"].get("n", ""), a["carryFrom"].get("reason", "")))
             if a.get("comment"): d.p("Комментарий: %s" % a["comment"])
+            if a.get("summary"): d.p("Краткое содержание доклада: %s" % a["summary"])
+            if a.get("positions"): d.p("Основные позиции: %s" % a["positions"])
             d.p("Обсуждение: %s" % (a.get("discussion") or "зафиксировано в решениях по вопросу."))
             if a.get("remarks"): d.p("Основные замечания и предложения: %s" % a["remarks"])
+            if a.get("proposals"): d.p("Предложения: %s" % a["proposals"])
+            if a.get("dissent"): d.p("Разногласия: %s" % a["dissent"])
             if a.get("problems"): d.p("Выявленные проблемы: %s" % a["problems"])
+            if a.get("outcome"): d.p("Итог рассмотрения: %s" % a["outcome"])
+            if a.get("startedAt") and a.get("finishedAt"):
+                d.p("Время рассмотрения: %s — %s (%d с)."
+                    % (datetime.datetime.fromtimestamp(a["startedAt"] / 1000).strftime("%H:%M:%S"),
+                       datetime.datetime.fromtimestamp(a["finishedAt"] / 1000).strftime("%H:%M:%S"),
+                       int((a["finishedAt"] - a["startedAt"]) / 1000)))
             qdecs = [x for x in decs if x.get("agendaN") == a.get("n") or x.get("itemId") == a.get("id")]
             if qdecs:
                 d.p("Решения по вопросу: " + "; ".join(x.get("text", "") for x in qdecs))
@@ -5161,9 +5203,14 @@ def _section_plain(db, cur, m, s, rq):
         out = []
         for a in ag:
             out.append("Вопрос %s. %s: %s" % (a.get("n", ""), a.get("title", ""),
-                       a.get("discussion") or a.get("fact") or "обсуждение не зафиксировано"))
+                       a.get("discussion") or a.get("summary") or a.get("fact") or "обсуждение не зафиксировано"))
+            if a.get("summary"): out.append("Краткое содержание доклада: %s" % a["summary"])
+            if a.get("positions"): out.append("Основные позиции: %s" % a["positions"])
             if a.get("remarks"): out.append("Замечания и предложения: %s" % a["remarks"])
+            if a.get("proposals"): out.append("Предложения: %s" % a["proposals"])
+            if a.get("dissent"): out.append("Разногласия: %s" % a["dissent"])
             if a.get("problems"): out.append("Выявленные проблемы: %s" % a["problems"])
+            if a.get("outcome"): out.append("Итог рассмотрения: %s" % a["outcome"])
         return "\n".join(out) or "Материалы обсуждения не зарегистрированы."
     if t == "decisions":
         decs = m.get("decisions") or []
@@ -5668,6 +5715,647 @@ def h_agenda_discussion(db, cur, u, p):
     db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Зафиксировано обсуждение вопроса", "Совещание", m["id"],
              {"code": m["code"], "n": a.get("n"), "event": "MEETING_AGENDA_DISCUSSION"})
     return {"meeting": m, "item": a}, msg("Рассмотрение вопроса зафиксировано", "Вопрос %s. %s" % (a.get("n"), a.get("title")))
+
+# ---------------- M16 MTG-07: материалы совещания (экранные требования §10) ----------------
+# Комплект материалов к вопросам повестки: документ M09 с ФИКСАЦИЕЙ версии, загруженный файл
+# или ссылка ЛВС. Тип, автор, дата добавления, версия, связанный вопрос и статус — по §10.1.
+MEET_MAT_TYPES = ("Доклад", "Презентация", "Технический отчёт", "Расчёт", "Проект решения", "Справка",
+                  "Протокол предыдущего совещания", "Фотография", "Схема", "Иной документ")
+MEET_MAT_ST = ("Актуален", "Требует обновления", "Устарел")
+MEET_MAT_KINDS = {"doc": "Документ M09", "file": "Загруженный файл", "link": "Ссылка ЛВС"}
+
+
+def mat_norm(m):
+    """Приводит материалы к структуре MTG-07 §10.1 (записи прежних версий дополняются полями)."""
+    mats = materials_of(m)
+    for x in mats:
+        if not x.get("id"): x["id"] = uid("mm")
+        if x.get("kind") not in MEET_MAT_KINDS: x["kind"] = "doc" if x.get("docId") else "link"
+        for k, v in (("name", ""), ("url", ""), ("note", ""), ("type", "Иной документ"),
+                     ("status", "Актуален"), ("itemId", ""), ("fileName", "")):
+            if not isinstance(x.get(k), str): x[k] = v
+        if x["type"] not in MEET_MAT_TYPES: x["type"] = "Иной документ"
+        if x["status"] not in MEET_MAT_ST: x["status"] = "Актуален"
+        if not x.get("author"): x["author"] = x.get("addedBy")
+        for k, v in (("addedAt", now_ms()), ("v", 1), ("size", 0)):
+            if not isinstance(x.get(k), int): x[k] = v
+        if not isinstance(x.get("docV"), int): x["docV"] = None
+        if not isinstance(x.get("docId"), str): x["docId"] = None
+        if not isinstance(x.get("stored"), bool): x["stored"] = False
+        if not isinstance(x.get("history"), list): x["history"] = []
+    m["materials"] = mats
+    return mats
+
+
+def _mat_hist(x, by, action, **kw):
+    h = x.get("history") if isinstance(x.get("history"), list) else []
+    rec = {"ts": now_ms(), "by": by, "action": action}
+    rec.update(kw)
+    x["history"] = (h + [rec])[-30:]
+
+
+def _mat_find(m, p):
+    mats = mat_norm(m)
+    mid = p.get("materialId") or p.get("mid")
+    if not mid: raise RpcError("Не указан материал (materialId)")
+    x = next((y for y in mats if y["id"] == mid), None)
+    if not x: raise RpcError("Материал не найден: %s" % mid, "Материалы", 404, "NOT_FOUND")
+    return mats, x
+
+
+def _mat_doc_latest(db, cur, doc_id):
+    d = db.get_ent(cur, "doc", doc_id) if doc_id else None
+    if not d: return None, None
+    vs = [v["v"] for v in (d.get("versions") or [])]
+    return d, (max(vs) if vs else 1)
+
+
+def _mat_check_type(v):
+    if v not in MEET_MAT_TYPES:
+        raise RpcError("Неизвестный тип материала: %s. Допустимые: %s" % (v, ", ".join(MEET_MAT_TYPES)))
+    return v
+
+
+def _mat_check_user(db, cur, uid_):
+    if not uid_: return None
+    cur.execute("SELECT 1 FROM users WHERE id=%s", (uid_,))
+    if not cur.fetchone(): raise RpcError("Автор материала не найден в справочнике сотрудников")
+    return uid_
+
+
+def _mat_check_item(m, item_id):
+    if not item_id: return ""
+    if not any(a["id"] == item_id for a in agenda_norm(m)):
+        raise RpcError("Вопрос повестки не найден: %s" % item_id, "Повестка", 404, "NOT_FOUND")
+    return item_id
+
+
+def mat_view(db, cur, m, x):
+    """Строка таблицы материалов §10.1 + фактическая актуальность зафиксированной версии."""
+    d, latest = _mat_doc_latest(db, cur, x.get("docId")) if x["kind"] == "doc" else (None, None)
+    fixed = x.get("docV")
+    if x["kind"] == "doc":
+        actual = bool(d) and (fixed is None or latest is None or fixed >= latest)
+    elif x["kind"] == "file":
+        actual = bool(x.get("stored"))
+    else:
+        actual = True
+    a = next((y for y in agenda_of(m) if y.get("id") == x.get("itemId")), None)
+    return dict(x, authorName=_uname(db, cur, x.get("author")), addedByName=_uname(db, cur, x.get("addedBy")),
+                kindName=MEET_MAT_KINDS[x["kind"]], docCode=(d or {}).get("code", ""),
+                docTitle=(d or {}).get("title", ""), latestV=latest, actual=actual,
+                itemN=(a or {}).get("n"), itemTitle=(a or {}).get("title", ""),
+                missing=(x["kind"] == "doc" and not d))
+
+
+def _mat_stats(db, cur, m):
+    mats = mat_norm(m)
+    views = [mat_view(db, cur, m, x) for x in mats]
+    return {"total": len(mats),
+            "docs": len([x for x in mats if x["kind"] == "doc"]),
+            "files": len([x for x in mats if x["kind"] == "file"]),
+            "links": len([x for x in mats if x["kind"] == "link"]),
+            "linked": len([x for x in mats if x.get("itemId")]),
+            "outdated": len([x for x in views if not x["actual"]]),
+            "nostored": len([x for x in mats if x["kind"] == "file" and not x["stored"]])}
+
+
+@reg("meeting.materials.list")
+def h_meeting_material_list(db, cur, u, p):
+    """Таблица материалов MTG-07 §10.1 с фильтрами по типу, статусу, источнику и вопросу."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "view", m)
+    mats = mat_norm(m)
+    rows = [mat_view(db, cur, m, x) for x in mats]
+    if p.get("type"):
+        _mat_check_type(p["type"]); rows = [x for x in rows if x["type"] == p["type"]]
+    if p.get("status"):
+        if p["status"] not in MEET_MAT_ST: raise RpcError("Неизвестный статус материала: %s" % p["status"])
+        rows = [x for x in rows if x["status"] == p["status"]]
+    if p.get("kind"):
+        if p["kind"] not in MEET_MAT_KINDS: raise RpcError("Неизвестный источник материала: %s" % p["kind"])
+        rows = [x for x in rows if x["kind"] == p["kind"]]
+    if p.get("itemId"): rows = [x for x in rows if x.get("itemId") == p["itemId"]]
+    if p.get("unlinked"): rows = [x for x in rows if not x.get("itemId")]
+    if p.get("outdated"): rows = [x for x in rows if not x["actual"]]
+    if p.get("q"):
+        q = str(p["q"]).strip().lower()
+        rows = [x for x in rows if q in (x["name"] + " " + x.get("note", "") + " " + x.get("docCode", "")).lower()]
+    return {"meetingId": m["id"], "code": m["code"], "items": rows, "types": list(MEET_MAT_TYPES),
+            "statuses": list(MEET_MAT_ST), "kinds": MEET_MAT_KINDS, "stats": _mat_stats(db, cur, m),
+            "agenda": [{"id": a["id"], "n": a["n"], "title": a["title"]} for a in agenda_norm(m)]}, None
+
+
+@reg("meeting.materials.update")
+def h_meeting_material_update(db, cur, u, p):
+    """Изменение реквизитов материала §10.1: название, тип, автор, статус, примечание, вопрос."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    mats, x = _mat_find(m, p)
+    was = {k: x.get(k) for k in ("name", "type", "author", "status", "note", "itemId")}
+    if "name" in p:
+        name = str(p["name"] or "").strip()[:200]
+        if not name: raise RpcError("Не заполнено название материала")
+        x["name"] = name
+    if "type" in p: x["type"] = _mat_check_type(p["type"])
+    if "status" in p:
+        if p["status"] not in MEET_MAT_ST: raise RpcError("Неизвестный статус материала: %s" % p["status"])
+        x["status"] = p["status"]
+    if "author" in p: x["author"] = _mat_check_user(db, cur, p["author"])
+    if "itemId" in p: x["itemId"] = _mat_check_item(m, p["itemId"])
+    if "note" in p: x["note"] = str(p["note"] or "").strip()[:300]
+    changed = [k for k in was if was[k] != x.get(k)]
+    if not changed: raise RpcError("Реквизиты материала не изменились")
+    _mat_hist(x, u["id"], "edit", note="Изменены поля: " + ", ".join(changed))
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Изменён материал совещания", "Совещание", m["id"],
+             {"code": m["code"], "materialId": x["id"], "material": x["name"], "fields": changed,
+              "event": "MEETING_MATERIAL_UPDATED"})
+    return {"meeting": m, "material": mat_view(db, cur, m, x)}, \
+        msg("Материал изменён", "Поля: %s" % ", ".join(changed))
+
+
+@reg("meeting.materials.link")
+def h_meeting_material_link(db, cur, u, p):
+    """Связывание материала с вопросом повестки (§10.3). Пустой itemId — снятие связи."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    mats, x = _mat_find(m, p)
+    item_id = _mat_check_item(m, p.get("itemId") or "")
+    if x.get("itemId") == item_id:
+        raise RpcError("Материал уже связан с этим вопросом" if item_id else "Материал не связан с вопросом")
+    was = x.get("itemId")
+    x["itemId"] = item_id
+    a = next((y for y in agenda_of(m) if y.get("id") == item_id), None)
+    _mat_hist(x, u["id"], "link", note=("Вопрос %s" % a["n"]) if a else "Связь снята")
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Материал связан с вопросом повестки",
+             "Совещание", m["id"], {"code": m["code"], "materialId": x["id"], "material": x["name"],
+                                    "itemId": item_id, "was": was, "n": (a or {}).get("n"),
+                                    "event": "MEETING_MATERIAL_LINKED"})
+    return {"meeting": m, "material": mat_view(db, cur, m, x)}, \
+        msg("Материал связан с вопросом" if a else "Связь с вопросом снята",
+            ("№%s · %s" % (a["n"], a["title"])) if a else x["name"])
+
+
+@reg("meeting.materials.check")
+def h_meeting_material_check(db, cur, u, p):
+    """Проверка актуальности версий (§10.3): обновление исходного документа не меняет комплект незаметно."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "view", m)
+    mats = mat_norm(m)
+    report, changed = [], []
+    for x in mats:
+        v = mat_view(db, cur, m, x)
+        if x["kind"] == "doc" and x.get("docV") is None and v["latestV"]:
+            x["docV"] = v["latestV"]          # записи прежних версий: фиксируем текущую версию M09
+            _mat_hist(x, u["id"], "fix", note="Зафиксирована версия %s" % x["docV"])
+            v = mat_view(db, cur, m, x)
+        st = "Актуален" if v["actual"] else "Требует обновления"
+        if x["status"] == "Устарел": st = "Устарел"
+        if x["status"] != st:
+            x["status"] = st; changed.append(x["id"])
+            _mat_hist(x, u["id"], "check", note="Статус: %s" % st)
+        report.append({"id": x["id"], "name": x["name"], "kind": x["kind"], "docCode": v["docCode"],
+                       "docV": x.get("docV"), "latestV": v["latestV"], "actual": v["actual"],
+                       "status": x["status"], "stored": x["stored"], "missing": v["missing"]})
+    if changed: db.save_ent(cur, "meeting", m)
+    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Проверена актуальность материалов совещания",
+             "Совещание", m["id"], {"code": m["code"], "total": len(mats),
+                                    "outdated": len([x for x in report if not x["actual"]]),
+                                    "changed": changed, "event": "MEETING_MATERIAL_VERSION_CHECKED"})
+    outdated = [x for x in report if not x["actual"]]
+    return {"meetingId": m["id"], "items": report, "outdated": len(outdated), "changed": changed,
+            "stats": _mat_stats(db, cur, m)}, \
+        msg("Актуальность проверена", "Материалов: %d · требуют обновления: %d" % (len(report), len(outdated)))
+
+
+@reg("meeting.materials.refresh")
+def h_meeting_material_refresh(db, cur, u, p):
+    """Явное обновление зафиксированной версии документа M09 (§10.3) — комплект меняется осознанно."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    mats, x = _mat_find(m, p)
+    if x["kind"] != "doc": raise RpcError("Обновление версии доступно для материала из M09")
+    d, latest = _mat_doc_latest(db, cur, x.get("docId"))
+    if not d: raise RpcError("Исходный документ M09 не найден", "Материалы", 404, "NOT_FOUND")
+    want = p.get("version")
+    if want is not None:
+        try: want = int(want)
+        except (TypeError, ValueError): raise RpcError("Версия документа — целое число")
+        if not any(v["v"] == want for v in (d.get("versions") or [])):
+            raise RpcError("Версия документа не найдена: %s" % want, "Материалы", 404, "NOT_FOUND")
+    else:
+        want = latest
+    if x.get("docV") == want: raise RpcError("Материал уже зафиксирован на версии %s" % want)
+    was = x.get("docV")
+    x["docV"] = want; x["v"] = x.get("v", 1) + 1; x["status"] = "Актуален"
+    x["name"] = "%s · %s" % (d["code"], d["title"])
+    _mat_hist(x, u["id"], "refresh", note="Версия %s → %s" % (was, want))
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Обновлена версия материала совещания",
+             "Совещание", m["id"], {"code": m["code"], "materialId": x["id"], "doc": d["code"],
+                                    "from": was, "to": want, "event": "MEETING_MATERIAL_VERSION_REFRESHED"})
+    invite = list(dict.fromkeys([m["chair"], m["secretary"]] + (m.get("attendees") or [])))
+    notify_many(db, cur, [y for y in invite if y != u["id"]], "meeting.materials",
+                "Обновлён материал: %s" % m["title"],
+                "%s · %s · версия %s" % (m["code"], x["name"], want), "Совещание", m["id"],
+                dedupe_suffix="refresh:%s:%s" % (x["id"], want))
+    return {"meeting": m, "material": mat_view(db, cur, m, x)}, \
+        msg("Версия материала обновлена", "%s · версия %s → %s" % (d["code"], was, want))
+
+
+def store_material_file(db, user, mid, mat_id, v, name, body):
+    """Загрузка файла материала (MTG-07 §10.3 «загрузить новый файл»): хранилище data/files."""
+    with db.wlock:
+        conn = db.get()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                m = get_req(db, cur, "meeting", mid)
+                guard(db, cur, user, "meetings", "edit", m); meet_active(m)
+                mats, x = _mat_find(m, {"materialId": mat_id})
+                if x["kind"] != "file": raise RpcError("Файл загружается только для материала вида «Загруженный файл»")
+                if int(v) != x.get("v", 1): raise RpcError("Версия материала не найдена: %s" % v, "Материалы", 404, "NOT_FOUND")
+                if len(body) > MAX_FILE: raise RpcError("Файл больше 25 МБ", "Файл", 413, "FILE_TOO_BIG")
+                if not body: raise RpcError("Пустой файл не загружается")
+                with open(file_path(x["id"], x["v"]), "wb") as f: f.write(body)
+                x["fileName"] = (name or x["fileName"] or "material.bin")[:200]
+                x["size"] = len(body); x["stored"] = True; x["status"] = "Актуален"
+                if not x.get("name"): x["name"] = x["fileName"]
+                _mat_hist(x, user["id"], "upload", note="Файл %s (%d Б)" % (x["fileName"], len(body)))
+                db.save_ent(cur, "meeting", m)
+                db.audit(cur, "BUSINESS", "info", user["id"], "meetings", "Загружен файл материала совещания",
+                         "Совещание", m["id"], {"code": m["code"], "materialId": x["id"], "name": x["fileName"],
+                                                "size": len(body), "v": x["v"],
+                                                "event": "MEETING_MATERIAL_FILE_UPLOADED"})
+                state = db.state(cur, user["id"])
+                conn.commit()
+                return state
+        except Exception:
+            conn.rollback(); raise
+        finally:
+            db.put(conn)
+
+
+def read_material_file(db, cur, user, mid, mat_id, v):
+    """Скачивание/просмотр файла материала (§10.3): право просмотра совещаний."""
+    m = get_req(db, cur, "meeting", mid)
+    guard(db, cur, user, "meetings", "view", m)
+    mats, x = _mat_find(m, {"materialId": mat_id})
+    if x["kind"] != "file": raise RpcError("У материала нет загруженного файла")
+    if int(v) != x.get("v", 1): raise RpcError("Версия материала не найдена: %s" % v, "Материалы", 404, "NOT_FOUND")
+    pth = file_path(x["id"], x["v"])
+    if not x.get("stored") or not os.path.isfile(pth):
+        raise RpcError("Файл материала не загружен на сервер", "Материалы", 404, "NOT_FOUND")
+    with open(pth, "rb") as f: data = f.read()
+    return data, x.get("fileName") or "material.bin"
+
+
+# ---------------- M16 MTG-08: рабочая форма проведения совещания ----------------
+# Экран секретаря и председателя: слева вопросы, в центре рассмотрение, справа решения и поручения.
+# Черновик по каждому вопросу хранится на сервере — потеря связи не теряет введённый текст (§11.3).
+RUN_ST = ("Не начато", "Идёт", "Завершено")
+RUN_FIELDS = (("summary", 4000, "Краткое содержание доклада"),
+              ("positions", 4000, "Основные позиции"),
+              ("discussion", 4000, "Обсуждение"),
+              ("remarks", 2000, "Замечания"),
+              ("proposals", 2000, "Предложения"),
+              ("dissent", 2000, "Разногласия"),
+              ("problems", 2000, "Выявленные проблемы"),
+              ("outcome", 2000, "Итог рассмотрения"))
+RUN_FIELD_KEYS = tuple(k for k, _, _ in RUN_FIELDS)
+RUN_ACT = {"start": "Совещание начато", "goto": "Переход к вопросу", "draft": "Черновик рассмотрения",
+           "commit": "Рассмотрение зафиксировано", "done": "Вопрос рассмотрен", "finish": "Совещание завершено"}
+
+
+def run_of(m):
+    """Состояние хода совещания (для записей прежних версий — значения по умолчанию)."""
+    r = m.get("run") if isinstance(m.get("run"), dict) else {}
+    if r.get("status") not in RUN_ST: r["status"] = "Не начато"
+    for k in ("startedAt", "finishedAt"):
+        if not isinstance(r.get(k), int): r[k] = None
+    for k in ("startedBy", "finishedBy", "current"):
+        if not isinstance(r.get(k), str): r[k] = ""
+    if not isinstance(r.get("log"), list): r["log"] = []
+    m["run"] = r
+    return r
+
+
+def run_item_norm(a):
+    """Поля рассмотрения вопроса: черновик, время начала и завершения (§11.3, §11.4)."""
+    for k in RUN_FIELD_KEYS:
+        if not isinstance(a.get(k), str): a[k] = ""
+    d = a.get("draft") if isinstance(a.get("draft"), dict) else {}
+    if not isinstance(d.get("fields"), dict): d["fields"] = {}
+    lims = {k: lim for k, lim, _ in RUN_FIELDS}
+    d["fields"] = {k: str(v)[:lims[k]] for k, v in d["fields"].items() if k in lims}
+    if not isinstance(d.get("ts"), int): d["ts"] = None
+    if not isinstance(d.get("by"), str): d["by"] = ""
+    a["draft"] = d
+    for k in ("startedAt", "finishedAt"):
+        if not isinstance(a.get(k), int): a[k] = None
+    if not isinstance(a.get("consideredBy"), str): a["consideredBy"] = ""
+    return a
+
+
+def _run_log(m, by, action, **kw):
+    r = run_of(m)
+    rec = {"ts": now_ms(), "by": by, "action": action}
+    rec.update(kw)
+    r["log"] = (r["log"] + [rec])[-100:]
+    return r
+
+
+def _run_open_items(m):
+    return [a for a in agenda_norm(m) if a["status"] in AGENDA_OPEN]
+
+
+def _run_item_fields(a):
+    return {k: a.get(k) or "" for k in RUN_FIELD_KEYS}
+
+
+def _run_sec(a):
+    if a.get("startedAt") and a.get("finishedAt") and a["finishedAt"] >= a["startedAt"]:
+        return int((a["finishedAt"] - a["startedAt"]) / 1000)
+    return None
+
+
+def _run_status(db, cur, m, a, st, by, reason=""):
+    """Переход статуса рассмотрения по правилам §2.6 (единый контур с MTG-06)."""
+    if a["status"] == st: return False
+    if st not in AGENDA_TRANS.get(a["status"], ()):
+        raise RpcError("Переход «%s» → «%s» недопустим для вопроса №%s" % (a["status"], st, a["n"]),
+                       "Ход совещания")
+    was = a["status"]
+    a["status"] = st; a["statusAt"] = now_ms(); a["statusBy"] = by
+    _agenda_hist(a, by, "status", **{"from": was, "to": st, "reason": reason})
+    return True
+
+
+def _run_item_view(db, cur, m, a):
+    run_item_norm(a)
+    mats = [mat_view(db, cur, m, x) for x in mat_norm(m) if x.get("itemId") == a["id"]]
+    mats += [{"id": y.get("id"), "name": y.get("name", ""), "kind": y.get("kind", "doc"),
+              "type": "Материал вопроса", "docV": y.get("docV"), "docId": y.get("docId"),
+              "url": y.get("url", ""), "note": y.get("note", ""), "fromAgenda": True}
+             for y in (a.get("materials") or [])]
+    decs = _agenda_decisions(m, a)
+    tasks = []
+    for d in decs:
+        for tid in dec_task_ids(d):
+            t = db.get_ent(cur, "task", tid)
+            if t: tasks.append({"id": t["id"], "code": t["code"], "title": t["title"], "status": t["status"],
+                                "assignee": t["assignee"], "assigneeName": _uname(db, cur, t["assignee"]),
+                                "due": t["end"], "decisionId": d["id"]})
+    return {"id": a["id"], "n": a["n"], "title": a["title"], "status": a["status"],
+            "reporter": a.get("reporter"), "reporterName": _uname(db, cur, a.get("reporter")),
+            "prep": a.get("prep"), "prepName": _uname(db, cur, a.get("prep")) if a.get("prep") else "",
+            "content": a.get("content") or "", "expected": a.get("expected") or "",
+            "durationMin": a.get("durationMin") or 0, "fact": a.get("fact") or "",
+            "fields": _run_item_fields(a), "draft": a["draft"],
+            "startedAt": a["startedAt"], "finishedAt": a["finishedAt"], "sec": _run_sec(a),
+            "consideredBy": a["consideredBy"], "consideredByName": _uname(db, cur, a.get("consideredBy")),
+            "materials": mats,
+            "decisions": [{"id": d["id"], "n": (m["decisions"].index(d) + 1), "text": d["text"],
+                           "resp": d.get("resp"), "respName": _uname(db, cur, d.get("resp")),
+                           "due": d.get("due"), "taskIds": dec_task_ids(d)} for d in decs],
+            "tasks": tasks}
+
+
+def _run_view(db, cur, m):
+    r = run_of(m)
+    items = [_run_item_view(db, cur, m, a) for a in agenda_norm(m)]
+    cur_item = next((x for x in items if x["id"] == r.get("current")), None)
+    done = [x for x in items if x["status"] == "Рассмотрен"]
+    return {"meetingId": m["id"], "code": m["code"], "title": m["title"], "date": m["date"],
+            "time": m.get("time", ""), "status": m["status"], "run": r,
+            "current": cur_item, "items": items,
+            "fields": [{"key": k, "label": lbl, "max": lim} for k, lim, lbl in RUN_FIELDS],
+            "stats": {"total": len(items), "done": len(done), "open": len(_run_open_items(m)),
+                      "drafts": len([x for x in items if x["draft"]["fields"]]),
+                      "decisions": len(m.get("decisions") or []),
+                      "tasks": len({t["id"] for x in items for t in x["tasks"]}),
+                      "sec": sum(x["sec"] or 0 for x in items),
+                      "plannedMin": sum(x["durationMin"] for x in items)},
+            "editable": m["status"] not in ("Проведено", "Протокол утверждён", MEET_CANCELLED)}
+
+
+def _run_guard_edit(db, cur, u, m):
+    guard(db, cur, u, "meetings", "edit", m); meet_active(m)
+    if m["status"] in ("Проведено", "Протокол утверждён"):
+        raise RpcError("Совещание уже проведено — ход рассмотрения не изменяется", "Ход совещания")
+    return m
+
+
+@reg("meeting.run.state")
+def h_meeting_run_state(db, cur, u, p):
+    """Рабочая форма проведения MTG-08: вопросы, рассмотрение, материалы, решения и поручения."""
+    m = get_req(db, cur, "meeting", p["id"]); guard(db, cur, u, "meetings", "view", m)
+    return _run_view(db, cur, m), None
+
+
+@reg("meeting.run.start")
+def h_meeting_run_start(db, cur, u, p):
+    """«Начать» (§11.4): фиксируется время начала, первый вопрос переводится в рассмотрение."""
+    m = get_req(db, cur, "meeting", p["id"]); _run_guard_edit(db, cur, u, m)
+    r = run_of(m)
+    if r["status"] == "Идёт": raise RpcError("Совещание уже проводится")
+    if m["date"] > D(0):
+        raise RpcError("Нельзя начать совещание раньше его даты (%s)" % _fd(m["date"]))
+    items = agenda_norm(m)
+    if not items: raise RpcError("Повестка пуста — добавьте вопросы перед проведением (MTG-06)")
+    open_items = _run_open_items(m)
+    if not open_items: raise RpcError("Все вопросы уже рассмотрены или сняты — начинать рассмотрение не требуется")
+    r["status"] = "Идёт"; r["startedAt"] = now_ms(); r["startedBy"] = u["id"]
+    r["finishedAt"] = None; r["finishedBy"] = ""
+    a = open_items[0]
+    run_item_norm(a)
+    _run_status(db, cur, m, a, "Рассматривается", u["id"], "Начато рассмотрение")
+    if not a["startedAt"]: a["startedAt"] = now_ms()
+    a["consideredBy"] = u["id"]
+    r["current"] = a["id"]
+    _run_log(m, u["id"], "start", note="Вопросов к рассмотрению: %d" % len(open_items))
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Совещание начато (рабочая форма MTG-08)",
+             "Совещание", m["id"], {"code": m["code"], "items": len(open_items), "current": a["id"],
+                                    "event": "MEETING_RUN_STARTED"})
+    return _run_view(db, cur, m), msg("Совещание начато", "Вопрос №%s · %s" % (a["n"], a["title"]))
+
+
+@reg("meeting.run.goto")
+def h_meeting_run_goto(db, cur, u, p):
+    """«Следующий вопрос» / «Предыдущий вопрос» (§11.4) либо выбор вопроса в списке слева."""
+    m = get_req(db, cur, "meeting", p["id"]); _run_guard_edit(db, cur, u, m)
+    r = run_of(m)
+    if r["status"] != "Идёт": raise RpcError("Совещание не начато — нажмите «Начать»")
+    items = agenda_norm(m)
+    open_items = _run_open_items(m)
+    direction = (p.get("dir") or "").lower()
+    if direction in ("next", "prev"):
+        if not open_items: raise RpcError("Открытых вопросов не осталось")
+        cur_n = next((x["n"] for x in items if x["id"] == r.get("current")), 0)
+        if direction == "next":
+            cand = [x for x in open_items if x["n"] > cur_n]
+            if not cand: raise RpcError("Это последний вопрос повестки")
+            a = cand[0]
+        else:
+            cand = [x for x in open_items if x["n"] < cur_n]
+            if not cand: raise RpcError("Это первый вопрос повестки")
+            a = cand[-1]
+    else:
+        items, a = agenda_find(m, p)
+        if a["status"] not in AGENDA_OPEN:
+            raise RpcError("Вопрос №%s в статусе «%s» — рассмотрение не открывается" % (a["n"], a["status"]))
+    run_item_norm(a)
+    started = _run_status(db, cur, m, a, "Рассматривается", u["id"], "Переход к вопросу")
+    if not a["startedAt"]: a["startedAt"] = now_ms()
+    a["consideredBy"] = a["consideredBy"] or u["id"]
+    r["current"] = a["id"]
+    _run_log(m, u["id"], "goto", n=a["n"], itemId=a["id"], dir=direction or "pick")
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Рабочая форма: переход к вопросу",
+             "Совещание", m["id"], {"code": m["code"], "n": a["n"], "itemId": a["id"], "started": started,
+                                    "event": "MEETING_RUN_ITEM_STARTED" if started else "MEETING_RUN_GOTO"})
+    return _run_view(db, cur, m), msg("Вопрос №%s" % a["n"], a["title"])
+
+
+def _run_draft_set(db, cur, u, m, a, fields):
+    """Запись текста в черновик вопроса (§11.3). Совещание изменяется в памяти, сохраняет вызывающий."""
+    run_item_norm(a)
+    saved = []
+    for k, lim, label in RUN_FIELDS:
+        if k in fields:
+            v = str(fields[k] if fields[k] is not None else "")
+            if len(v) > lim: raise RpcError("Поле «%s» — не более %d символов" % (label, lim))
+            if a["draft"]["fields"].get(k, "") != v:
+                a["draft"]["fields"][k] = v; saved.append(k)
+    if saved:
+        a["draft"]["ts"] = now_ms(); a["draft"]["by"] = u["id"]
+    return saved
+
+
+def _run_commit(db, cur, u, m, a, fields=None, strict=True):
+    """Перенос черновика в поля рассмотрения вопроса. Работает с тем же объектом совещания,
+       что и вызывающий обработчик (повторное чтение из БД потеряло бы внесённые изменения)."""
+    run_item_norm(a)
+    if fields: _run_draft_set(db, cur, u, m, a, fields)
+    draft = a["draft"]["fields"]
+    if not draft:
+        if strict: raise RpcError("Черновик пуст — заполните хотя бы одно поле рассмотрения")
+        return []
+    changed = []
+    for k, lim, label in RUN_FIELDS:
+        if k in draft and (a.get(k) or "") != draft[k]:
+            a[k] = draft[k]; changed.append(k)
+    a["draft"] = {"fields": {}, "ts": now_ms(), "by": u["id"]}
+    if not changed:
+        if strict: raise RpcError("Поля рассмотрения не изменились")
+        return []
+    a["consideredBy"] = u["id"]
+    _agenda_hist(a, u["id"], "discussion", note="Зафиксировано рассмотрение (MTG-08): " + ", ".join(changed))
+    _run_log(m, u["id"], "commit", n=a["n"], itemId=a["id"], fields=changed)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Зафиксировано рассмотрение вопроса",
+             "Совещание", m["id"], {"code": m["code"], "n": a["n"], "itemId": a["id"], "fields": changed,
+                                    "event": "MEETING_AGENDA_DISCUSSION",
+                                    "events": ["MEETING_AGENDA_DISCUSSION", "MEETING_RUN_ITEM_SAVED"]})
+    return changed
+
+
+@reg("meeting.run.draft")
+def h_meeting_run_draft(db, cur, u, p):
+    """Автосохранение черновика рассмотрения по вопросу (§11.3): текст не теряется при обрыве связи."""
+    m = get_req(db, cur, "meeting", p["id"]); _run_guard_edit(db, cur, u, m)
+    items, a = agenda_find(m, p)
+    fields = p.get("fields") if isinstance(p.get("fields"), dict) else {k: p[k] for k in RUN_FIELD_KEYS if k in p}
+    if not fields: raise RpcError("Не переданы поля рассмотрения")
+    saved = _run_draft_set(db, cur, u, m, a, fields)
+    if not saved:
+        return {"meetingId": m["id"], "itemId": a["id"], "draft": a["draft"], "saved": []}, None
+    db.save_ent(cur, "meeting", m)
+    LOG.debug("Черновик рассмотрения %s вопрос %s: %s", m["code"], a["n"], ", ".join(saved))
+    # без всплывающего сообщения: автосохранение выполняется часто, статус показывает клиент
+    return {"meetingId": m["id"], "itemId": a["id"], "draft": a["draft"], "saved": saved,
+            "meeting": m}, None
+
+
+@reg("meeting.run.commit")
+def h_meeting_run_commit(db, cur, u, p):
+    """Фиксация рассмотрения: черновик переносится в поля вопроса с записью в историю."""
+    m = get_req(db, cur, "meeting", p["id"]); _run_guard_edit(db, cur, u, m)
+    items, a = agenda_find(m, p)
+    fields = p.get("fields") if isinstance(p.get("fields"), dict) else None
+    changed = _run_commit(db, cur, u, m, a, fields)
+    db.save_ent(cur, "meeting", m)
+    return _run_view(db, cur, m), msg("Рассмотрение зафиксировано", "Вопрос №%s · полей: %d" % (a["n"], len(changed)))
+
+
+@reg("meeting.run.item.done")
+def h_meeting_run_item_done(db, cur, u, p):
+    """«Отметить рассмотренным» (§11.4): статус, время завершения, фактический результат."""
+    m = get_req(db, cur, "meeting", p["id"]); _run_guard_edit(db, cur, u, m)
+    items, a = agenda_find(m, p)
+    run_item_norm(a)
+    fields = p.get("fields") if isinstance(p.get("fields"), dict) else None
+    if fields or a["draft"]["fields"]:
+        _run_commit(db, cur, u, m, a, fields, strict=False)
+    filled = [k for k in RUN_FIELD_KEYS if (a.get(k) or "").strip()]
+    decs = _agenda_decisions(m, a)
+    if not filled and not decs:
+        raise RpcError("Зафиксируйте итог рассмотрения или решение по вопросу №%s" % a["n"],
+                       "Ход совещания")
+    if m["date"] > D(0):
+        raise RpcError("Рассмотрение отмечается не раньше даты совещания (%s)" % _fd(m["date"]))
+    if not (a.get("fact") or "").strip():
+        a["fact"] = (a.get("outcome") or a.get("summary") or
+                     ("Рассмотрен: зарегистрировано решений — %d" % len(decs)))[:2000]
+    _run_status(db, cur, m, a, "Рассмотрен", u["id"], "Отмечен рассмотренным (MTG-08)")
+    a["finishedAt"] = now_ms(); a["consideredBy"] = a["consideredBy"] or u["id"]
+    if not a["startedAt"]: a["startedAt"] = a["finishedAt"]
+    r = run_of(m)
+    _run_log(m, u["id"], "done", n=a["n"], itemId=a["id"], sec=_run_sec(a))
+    # фокус остаётся на рассмотренном вопросе: «Следующий вопрос» переводит к следующему открытому
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Вопрос отмечен рассмотренным",
+             "Совещание", m["id"], {"code": m["code"], "n": a["n"], "itemId": a["id"], "sec": _run_sec(a),
+                                    "event": "MEETING_RUN_ITEM_DONE",
+                                    "events": ["MEETING_RUN_ITEM_DONE", "AGENDA_UPDATED"]})
+    return _run_view(db, cur, m), \
+        msg("Вопрос №%s рассмотрен" % a["n"],
+            ("Время рассмотрения: %d с" % _run_sec(a)) if _run_sec(a) is not None else a["title"])
+
+
+@reg("meeting.run.finish")
+def h_meeting_run_finish(db, cur, u, p):
+    """«Завершить» (§11.4): нерассмотренные вопросы требуют подтверждения, статус «Проведено»."""
+    m = get_req(db, cur, "meeting", p["id"]); _run_guard_edit(db, cur, u, m)
+    r = run_of(m)
+    if r["status"] != "Идёт": raise RpcError("Совещание не начато — завершать нечего")
+    open_items = _run_open_items(m)
+    drafts = [a for a in agenda_norm(m) if run_item_norm(a)["draft"]["fields"]]
+    if (drafts or open_items) and not p.get("confirm"):
+        reasons = []
+        if open_items:
+            reasons.append("Не рассмотрены вопросы: %s"
+                           % ", ".join("№%s %s" % (a["n"], a["title"]) for a in open_items))
+        if drafts:
+            reasons.append("Не зафиксированы черновики рассмотрения (вопросы %s)"
+                           % ", ".join(str(a["n"]) for a in drafts))
+        raise RpcError(". ".join(reasons) + ". Подтвердите завершение совещания"
+                       + (" с фиксацией черновиков." if drafts else "."),
+                       "409 · Требуется подтверждение", 409, "NEED_CONFIRM")
+    if p.get("commitDrafts"):
+        for a in drafts: _run_commit(db, cur, u, m, a, strict=False)
+    r["status"] = "Завершено"; r["finishedAt"] = now_ms(); r["finishedBy"] = u["id"]; r["current"] = ""
+    m["status"] = "Проведено"
+    pr = prot_of(m)
+    if pr["status"] == "Подготовка": pr["status"] = "Черновик"
+    m["protocol"] = pr
+    _run_log(m, u["id"], "finish", note="Не рассмотрено: %d" % len(open_items),
+             sec=int((r["finishedAt"] - (r["startedAt"] or r["finishedAt"])) / 1000))
+    db.save_ent(cur, "meeting", m)
+    db.audit(cur, "BUSINESS", "info", u["id"], "meetings", "Совещание завершено (рабочая форма MTG-08)",
+             "Совещание", m["id"], {"code": m["code"], "done": len([a for a in m["agenda"] if a["status"] == "Рассмотрен"]),
+                                    "open": len(open_items), "event": "MEETING_COMPLETED",
+                                    "events": ["MEETING_COMPLETED", "MEETING_RUN_FINISHED"]})
+    LOG.info("Совещание %s завершено: рассмотрено вопросов %d, не рассмотрено %d",
+             m["code"], len([a for a in m["agenda"] if a["status"] == "Рассмотрен"]), len(open_items))
+    return _run_view(db, cur, m), \
+        msg("Совещание завершено", "Статус «Проведено» · черновик протокола готов (MTG-09)")
 
 # ---------------- Центр уведомлений и напоминаний (ТЗ M12 §8, M16 §2.11.1) ----------------
 # Единый контур доставки: уведомления хранятся на сервере (кому, тип, дата, канал, статус,
@@ -6440,6 +7128,15 @@ class App(http.server.BaseHTTPRequestHandler):
                 except Exception: pass
                 state = store_file(db, u, m.group(1), int(m.group(2)), name, self.body())
                 return self.send_json({"ok": True, "state": state, "msg": msg("Файл загружен на сервер", "Версия сохранена в хранилище data/files")})
+            m = re.match(r"^/api/mfiles/([A-Za-z0-9_\-]+)/([A-Za-z0-9_\-]+)/(\d+)$", path)
+            if m:
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                name = (q.get("name") or [self.headers.get("X-File-Name", "material.bin")])[0]
+                try: name = urllib.parse.unquote(name)
+                except Exception: pass
+                state = store_material_file(db, u, m.group(1), m.group(2), int(m.group(3)), name, self.body())
+                return self.send_json({"ok": True, "state": state,
+                                       "msg": msg("Файл материала загружен", "Хранилище data/files · версия зафиксирована")})
             if path == "/api/restore":
                 res = restore_backup(db, u, self.body_json(), self.token())
                 return self.send_json({"ok": True, "relogin": res["relogin"],
@@ -6577,6 +7274,21 @@ class App(http.server.BaseHTTPRequestHandler):
                         db.audit(cur, "AUDIT", "info", u["id"], "docs", "Скачан файл документа", "Документ", m.group(1), {"v": int(m.group(2)), "name": name})
                         conn.commit()
                     else: conn.commit()
+            finally: db.put(conn)
+            ctype = MIME.get(os.path.splitext(name)[1].lower(), "application/octet-stream")
+            quoted = urllib.parse.quote(name)
+            self._headers(200, ctype, len(data), {"Content-Disposition": "attachment; filename*=UTF-8''" + quoted})
+            return self.wfile.write(data)
+        m = re.match(r"^/api/mfiles/([A-Za-z0-9_\-]+)/([A-Za-z0-9_\-]+)/(\d+)$", path)
+        if m:
+            u = self.need_user()
+            conn = db.get()
+            try:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    data, name = read_material_file(db, cur, u, m.group(1), m.group(2), int(m.group(3)))
+                    db.audit(cur, "AUDIT", "info", u["id"], "meetings", "Скачан файл материала совещания",
+                             "Совещание", m.group(1), {"materialId": m.group(2), "v": int(m.group(3)), "name": name})
+                    conn.commit()
             finally: db.put(conn)
             ctype = MIME.get(os.path.splitext(name)[1].lower(), "application/octet-stream")
             quoted = urllib.parse.quote(name)
@@ -6757,7 +7469,7 @@ def main():
 
 # ================= Установка и настройка через EXE (ТЗ §7) =================
 CONFIG_PATH = os.path.join(BASE_DIR, "supip.ini")
-SCHEMA_VERSION = 7   # 2 — уведомления (v1.4.0), 3 — маршрут протокола (v1.5.0), 4 — поручения (v1.6.0), 5 — планирование совещаний (v1.10.0), 6 — участники совещания (v1.13.0), 7 — шаблоны протокола (v1.14.0)
+SCHEMA_VERSION = 8   # 2 — уведомления (v1.4.0), 3 — маршрут протокола (v1.5.0), 4 — поручения (v1.6.0), 5 — планирование совещаний (v1.10.0), 6 — участники совещания (v1.13.0), 7 — шаблоны протокола (v1.14.0), 8 — ход проведения (v1.15.0)
 MIGRATIONS = {   # {версия: [SQL, ...]} — применяется по порядку при старте/обновлении
     2: [  # v1.4.0: центр уведомлений и напоминаний
         """CREATE TABLE IF NOT EXISTS notifications(
@@ -6811,6 +7523,9 @@ MIGRATIONS = {   # {версия: [SQL, ...]} — применяется по п
         "CREATE INDEX IF NOT EXISTS ix_templates_status ON templates(status)",
         "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS requisites JSONB NOT NULL DEFAULT '{}'",
         "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS protocol_draft JSONB NOT NULL DEFAULT '{}'",
+    ],
+    8: [  # v1.15.0: рабочая форма проведения совещания (MTG-08) и материалы (MTG-07)
+        "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS run JSONB NOT NULL DEFAULT '{}'",
     ],
 }
 

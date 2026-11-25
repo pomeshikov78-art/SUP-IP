@@ -628,7 +628,7 @@ def main():
     check("реквизиты восстановлены значениями по умолчанию", d["requisites"]["number"].startswith("П-"), d["requisites"])
     check("черновик восстановлен по шаблону", len(d["sections"]) >= 10, len(d["sections"]))
     check("библиотека шаблонов воссоздана", len(tpls(adm)) >= 6, len(tpls(adm)))
-    check("версия схемы БД — 7", srv.SCHEMA_VERSION == 7, srv.SCHEMA_VERSION)
+    check("версия схемы БД — 8", srv.SCHEMA_VERSION == 8, srv.SCHEMA_VERSION)
     check("миграция 7 создаёт таблицу шаблонов",
           any("CREATE TABLE IF NOT EXISTS templates" in s for s in srv.MIGRATIONS[7]))
     check("миграция 7 добавляет реквизиты и черновик",
